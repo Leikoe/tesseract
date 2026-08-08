@@ -1763,6 +1763,7 @@ dependencies = [
  "cuda-async",
  "cuda-core",
  "cutile",
+ "cutile-compiler",
  "futures-util",
  "http",
  "http-body-util",

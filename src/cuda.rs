@@ -5,12 +5,7 @@
 
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
-use cutile::{
-    api,
-    core::bf16,
-    tensor::{PartitionMut, ToHostVec},
-    tile_kernel::ToHostVecOp,
-};
+use cutile::{api, core::bf16, tensor::PartitionMut, tile_kernel::ToHostVecOp};
 use thiserror::Error;
 
 #[cutile::module]
@@ -33,7 +28,7 @@ mod kernels {
 use kernels::add_bf16;
 
 const SMOKE_ELEMENTS: usize = 4096;
-const SMOKE_BLOCK: i32 = 128;
+const SMOKE_BLOCK: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bf16SmokeReport {
