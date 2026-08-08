@@ -32,3 +32,7 @@ tempfile = "3"
 [features]
 default = []
 test-backend = []
+
+[[bin]]
+name = "model-check"
+path = "src/bin/model-check.rs"

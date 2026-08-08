@@ -3,3 +3,7 @@
 /references/
 *.nsys-rep
 *.sqlite
+
+# Override developer-global `bin/` ignores for Rust auxiliary binaries.
+!/src/bin/
+!/src/bin/*.rs
