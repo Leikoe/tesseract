@@ -447,3 +447,7 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 ```text
 could we design the cleanest abstractions (and thus traits) to have the cleanest engine of all ?
 ```
+
+```text
+I want you to send subagents to compare this to vllm and sglang by going inside their references/<repo> and comparing how they do it
+```
