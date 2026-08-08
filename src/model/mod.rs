@@ -40,6 +40,15 @@ pub struct CudaModelReport {
     pub bytes: usize,
 }
 
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaForwardReport {
+    pub model_id: String,
+    pub prompt_tokens: usize,
+    pub next_token_id: u32,
+    pub next_token_text: String,
+}
+
 pub trait IncrementalDecoder: Send {
     fn push(&mut self, token_id: u32) -> Result<String, ModelError>;
 }
@@ -71,6 +80,19 @@ pub fn validate_cuda_model(
 ) -> Result<CudaModelReport, ModelError> {
     if llama_3_2::supports(model_id) {
         return llama_3_2::validate_cuda(model_id, model_dir, device_id);
+    }
+    Err(ModelError::UnsupportedModel(model_id.into()))
+}
+
+#[cfg(feature = "cuda")]
+pub fn validate_cuda_next_token(
+    model_id: &str,
+    model_dir: &Path,
+    device_id: usize,
+    prompt: &str,
+) -> Result<CudaForwardReport, ModelError> {
+    if llama_3_2::supports(model_id) {
+        return llama_3_2::validate_cuda_next_token(model_id, model_dir, device_id, prompt);
     }
     Err(ModelError::UnsupportedModel(model_id.into()))
 }

@@ -1,5 +1,8 @@
 //! Model-neutral BF16 transformer primitives implemented with cuTile.
 
+#![allow(clippy::too_many_arguments)]
+
+#[allow(clippy::too_many_arguments)]
 #[cutile::module]
 mod tile {
     use cutile::core::*;
@@ -152,6 +155,7 @@ mod tile {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[cutile::entry()]
     unsafe fn rope_kv_write_bf16<const D: i32, const HALF: i32, const KV_HEADS: i32>(
         key: &Tensor<bf16, { [-1, KV_HEADS, D] }>,
@@ -162,7 +166,6 @@ mod tile {
         sin: &Tensor<f32, { [-1, HALF] }>,
         key_cache_ptr: *mut bf16,
         value_cache_ptr: *mut bf16,
-        capacity: i32,
         key_out: &mut Tensor<bf16, { [1, 1, D] }>,
     ) {
         let pid = get_tile_block_id();
@@ -192,37 +195,61 @@ mod tile {
             key_out.store(key_hi.reshape(const_shape![1, 1, HALF]), [0i32, 0i32, 1i32]);
         }
 
-        let cache_shape = Shape::<{ [-1, KV_HEADS, D] }> { dims: &[capacity] };
-        let cache_strides = Array::<{ [-1, D, 1] }> {
-            dims: &[KV_HEADS * D],
-        };
-        let token = new_token_unordered();
-        let mut key_cache = unsafe {
-            make_tensor_view(
-                pointer_to_tile(key_cache_ptr),
-                cache_shape,
-                cache_strides,
-                token,
-            )
-        };
-        let mut value_cache = unsafe {
-            make_tensor_view(
-                pointer_to_tile(value_cache_ptr),
-                cache_shape,
-                cache_strides,
-                token,
-            )
-        };
-        let mut key_cache = unsafe { key_cache.partition_mut(const_shape![1, 1, HALF]) };
-        let mut value_cache = unsafe { value_cache.partition_mut(const_shape![1, 1, D]) };
-        let value = value
+        let base: i32 = (slot * KV_HEADS + head) * D;
+        let half_offsets: Tile<i32, { [HALF] }> = iota(const_shape![HALF]);
+        let half_offsets: Tile<i32, { [1, HALF] }> = half_offsets.reshape(const_shape![1, HALF]);
+        let key_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(key_cache_ptr);
+        let key_base: PointerTile<*mut bf16, { [1, 1] }> = key_base.reshape(const_shape![1, 1]);
+        let key_base: PointerTile<*mut bf16, { [1, HALF] }> =
+            key_base.broadcast(const_shape![1, HALF]);
+        let base_offsets: Tile<i32, { [1, HALF] }> =
+            base.broadcast(const_shape![1, HALF]) + half_offsets;
+        let high_half: Tile<i32, { [1, HALF] }> = HALF.broadcast(const_shape![1, HALF]);
+        let key_lo_ptr: PointerTile<*mut bf16, { [1, HALF] }> = key_base.offset_tile(base_offsets);
+        let _key_lo_store: Token = store_ptr_tko(
+            key_lo_ptr,
+            key_lo,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            Latency::<0>,
+        );
+        let key_hi_ptr: PointerTile<*mut bf16, { [1, HALF] }> =
+            key_base.offset_tile(base_offsets + high_half);
+        let _key_hi_store: Token = store_ptr_tko(
+            key_hi_ptr,
+            key_hi,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            Latency::<0>,
+        );
+
+        let value: Tile<bf16, { [1, 1, D] }> = value
             .partition(const_shape![1, 1, D])
             .load([row, head, 0i32]);
-        unsafe {
-            key_cache.store(key_lo.reshape(const_shape![1, 1, HALF]), [slot, head, 0i32]);
-            key_cache.store(key_hi.reshape(const_shape![1, 1, HALF]), [slot, head, 1i32]);
-            value_cache.store(value, [slot, head, 0i32]);
-        }
+        let value_offsets: Tile<i32, { [D] }> = iota(const_shape![D]);
+        let value_offsets: Tile<i32, { [1, 1, D] }> = value_offsets.reshape(const_shape![1, 1, D]);
+        let value_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(value_cache_ptr);
+        let value_base: PointerTile<*mut bf16, { [1, 1, 1] }> =
+            value_base.reshape(const_shape![1, 1, 1]);
+        let value_base: PointerTile<*mut bf16, { [1, 1, D] }> =
+            value_base.broadcast(const_shape![1, 1, D]);
+        let value_base_offset: Tile<i32, { [1, 1, D] }> =
+            base.broadcast(const_shape![1, 1, D]) + value_offsets;
+        let value_ptr: PointerTile<*mut bf16, { [1, 1, D] }> =
+            value_base.offset_tile(value_base_offset);
+        let _value_store: Token = store_ptr_tko(
+            value_ptr,
+            value,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            Latency::<0>,
+        );
     }
 
     #[cutile::entry()]
@@ -241,6 +268,18 @@ mod tile {
         out.store(cache.load([slot, head, 0i32]));
     }
 
+    #[cutile::entry()]
+    fn gather_row_bf16<const BLOCK: i32>(
+        input: &Tensor<bf16, { [-1, -1] }>,
+        out: &mut Tensor<bf16, { [BLOCK] }>,
+        row: i32,
+    ) {
+        let block = get_tile_block_id().0;
+        let input = input.partition(const_shape![1, BLOCK]);
+        out.store(input.load([row, block]).reshape(const_shape![BLOCK]));
+    }
+
+    #[allow(clippy::too_many_arguments)]
     #[cutile::entry()]
     unsafe fn causal_attention_bf16<const BM: i32, const BN: i32, const D: i32>(
         query: &Tensor<bf16, { [-1, -1, D] }>,
@@ -323,6 +362,6 @@ mod tile {
 
 #[allow(unused_imports)]
 pub(crate) use tile::{
-    add_rms_norm_bf16, causal_attention_bf16, embedding_bf16, gather_flat_kv_bf16, rms_norm_bf16,
-    rope_kv_write_bf16, rope_q_bf16, silu_mul_bf16,
+    add_rms_norm_bf16, causal_attention_bf16, embedding_bf16, gather_flat_kv_bf16, gather_row_bf16,
+    rms_norm_bf16, rope_kv_write_bf16, rope_q_bf16, silu_mul_bf16,
 };

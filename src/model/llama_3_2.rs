@@ -8,7 +8,7 @@ use super::{
 };
 
 #[cfg(feature = "cuda")]
-use super::CudaModelReport;
+use super::{CudaForwardReport, CudaModelReport};
 
 const MODEL_ID: &str = "meta-llama/Llama-3.2-1B-Instruct";
 
@@ -26,56 +26,17 @@ pub(super) fn validate_cuda(
     model_dir: &Path,
     device_id: usize,
 ) -> Result<CudaModelReport, ModelError> {
-    use cuda_async::device_operation::DeviceOp;
-    use cuda_core::Device;
-    use cutile::tensor::ToHostVec;
+    cuda_impl::validate(model_id, model_dir, device_id)
+}
 
-    let model = Llama32::load(model_id, model_dir)?;
-    let device = Device::new(device_id)
-        .map_err(|error| ModelError::Cuda(format!("initialize device {device_id}: {error:?}")))?;
-    let stream = device
-        .new_stream()
-        .map_err(|error| ModelError::Cuda(format!("create stream: {error:?}")))?;
-
-    let names = model.weights.names();
-    let mut device_weights = std::collections::HashMap::with_capacity(names.len());
-    let mut bytes = 0usize;
-    for name in names {
-        let tensor = model.weights.load_device_bf16(&name, &stream)?;
-        bytes = bytes
-            .checked_add(tensor.num_bytes())
-            .ok_or_else(|| ModelError::Cuda("device weight byte count overflowed".into()))?;
-        device_weights.insert(name, std::sync::Arc::new(tensor));
-    }
-
-    // Verify one architecture-owned tensor bit-for-bit after its H2D/D2H
-    // round trip. The remaining tensors went through the same typed path and
-    // remain resident until this function returns.
-    let name = "model.norm.weight";
-    let expected = model.weights.tensor(name)?;
-    let actual: Vec<cutile::core::bf16> = device_weights
-        .get(name)
-        .ok_or_else(|| ModelError::MissingTensor(name.into()))?
-        .clone()
-        .to_host_vec()
-        .sync_on(&stream)
-        .map_err(|error| ModelError::Cuda(format!("verify `{name}`: {error:?}")))?;
-    let matches = actual
-        .iter()
-        .zip(expected.data().chunks_exact(2))
-        .all(|(actual, bytes)| actual.to_bits() == u16::from_le_bytes([bytes[0], bytes[1]]));
-    if !matches || actual.len() * 2 != expected.data().len() {
-        return Err(ModelError::Cuda(format!(
-            "BF16 round-trip mismatch for `{name}`"
-        )));
-    }
-
-    Ok(CudaModelReport {
-        model_id: model.id,
-        device_id,
-        tensors: device_weights.len(),
-        bytes,
-    })
+#[cfg(feature = "cuda")]
+pub(super) fn validate_cuda_next_token(
+    model_id: &str,
+    model_dir: &Path,
+    device_id: usize,
+    prompt: &str,
+) -> Result<CudaForwardReport, ModelError> {
+    cuda_impl::validate_next_token(model_id, model_dir, device_id, prompt)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -295,6 +256,652 @@ impl Model for Llama32 {
             vocab_size: self.config.vocab_size,
             tensors: self.weights.tensor_count(),
         }
+    }
+}
+
+#[cfg(feature = "cuda")]
+mod cuda_impl {
+    use std::{collections::HashMap, f32::consts::TAU, path::Path, sync::Arc};
+
+    use cuda_async::device_operation::DeviceOp;
+    use cuda_core::{Device, Stream};
+    use cutile::{
+        api,
+        core::bf16,
+        tensor::{Reshape, Tensor, ToHostVec},
+        tile_kernel::{PartitionOp, TileKernel},
+    };
+
+    use crate::cuda::{cublas, kernels};
+
+    use super::{CudaForwardReport, CudaModelReport, Llama32, ModelError, WeightStore};
+
+    const HIDDEN_BLOCK: usize = 512;
+    const MLP_BLOCK: usize = 512;
+    const ATTENTION_QUERY_BLOCK: usize = 1;
+    const ATTENTION_KEY_BLOCK: usize = 16;
+
+    type Bf16Tensor = Arc<Tensor<bf16>>;
+    type F32Tensor = Arc<Tensor<f32>>;
+    type RopeTables = (F32Tensor, F32Tensor);
+
+    struct DeviceWeights {
+        tensors: HashMap<String, Bf16Tensor>,
+        bytes: usize,
+    }
+
+    impl DeviceWeights {
+        fn load(store: &WeightStore, stream: &Arc<Stream>) -> Result<Self, ModelError> {
+            let names = store.names();
+            let mut tensors = HashMap::with_capacity(names.len());
+            let mut bytes = 0usize;
+            for name in names {
+                let tensor = store.load_device_bf16(&name, stream)?;
+                bytes = bytes.checked_add(tensor.num_bytes()).ok_or_else(|| {
+                    ModelError::Cuda("device weight byte count overflowed".into())
+                })?;
+                tensors.insert(name, Arc::new(tensor));
+            }
+            Ok(Self { tensors, bytes })
+        }
+
+        fn get(&self, name: &str) -> Result<Bf16Tensor, ModelError> {
+            self.tensors
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ModelError::MissingTensor(name.into()))
+        }
+    }
+
+    struct LayerWeights {
+        input_norm: Bf16Tensor,
+        post_norm: Bf16Tensor,
+        query: Bf16Tensor,
+        key: Bf16Tensor,
+        value: Bf16Tensor,
+        output: Bf16Tensor,
+        gate: Bf16Tensor,
+        up: Bf16Tensor,
+        down: Bf16Tensor,
+    }
+
+    struct RuntimeWeights {
+        embedding: Bf16Tensor,
+        final_norm: Bf16Tensor,
+        lm_head: Bf16Tensor,
+        layers: Vec<LayerWeights>,
+    }
+
+    impl RuntimeWeights {
+        fn load(model: &Llama32, stream: &Arc<Stream>) -> Result<Self, ModelError> {
+            let all = DeviceWeights::load(&model.weights, stream)?;
+            let embedding = all.get("model.embed_tokens.weight")?;
+            let final_norm = all.get("model.norm.weight")?;
+            let lm_head = if model.config.tie_word_embeddings {
+                embedding.clone()
+            } else {
+                all.get("lm_head.weight")?
+            };
+            let mut layers = Vec::with_capacity(model.config.num_hidden_layers);
+            for layer in 0..model.config.num_hidden_layers {
+                let prefix = format!("model.layers.{layer}");
+                layers.push(LayerWeights {
+                    input_norm: all.get(&format!("{prefix}.input_layernorm.weight"))?,
+                    post_norm: all.get(&format!("{prefix}.post_attention_layernorm.weight"))?,
+                    query: all.get(&format!("{prefix}.self_attn.q_proj.weight"))?,
+                    key: all.get(&format!("{prefix}.self_attn.k_proj.weight"))?,
+                    value: all.get(&format!("{prefix}.self_attn.v_proj.weight"))?,
+                    output: all.get(&format!("{prefix}.self_attn.o_proj.weight"))?,
+                    gate: all.get(&format!("{prefix}.mlp.gate_proj.weight"))?,
+                    up: all.get(&format!("{prefix}.mlp.up_proj.weight"))?,
+                    down: all.get(&format!("{prefix}.mlp.down_proj.weight"))?,
+                });
+            }
+            Ok(Self {
+                embedding,
+                final_norm,
+                lm_head,
+                layers,
+            })
+        }
+    }
+
+    struct CudaLlama {
+        model: Llama32,
+        stream: Arc<Stream>,
+        weights: RuntimeWeights,
+        cosine: Arc<Tensor<f32>>,
+        sine: Arc<Tensor<f32>>,
+        key_cache: Vec<Bf16Tensor>,
+        value_cache: Vec<Bf16Tensor>,
+        capacity: usize,
+    }
+
+    impl CudaLlama {
+        fn load(model: Llama32, device_id: usize, capacity: usize) -> Result<Self, ModelError> {
+            let device = Device::new(device_id).map_err(|error| {
+                ModelError::Cuda(format!("initialize device {device_id}: {error:?}"))
+            })?;
+            let stream = device
+                .new_stream()
+                .map_err(|error| ModelError::Cuda(format!("create stream: {error:?}")))?;
+            let weights = RuntimeWeights::load(&model, &stream)?;
+            let (cosine, sine) = rope_tables(&model.config, &stream)?;
+            let mut key_cache = Vec::with_capacity(model.config.num_hidden_layers);
+            let mut value_cache = Vec::with_capacity(model.config.num_hidden_layers);
+            let cache_shape = [
+                capacity,
+                model.config.num_key_value_heads,
+                model.config.head_dim,
+            ];
+            for layer in 0..model.config.num_hidden_layers {
+                let key = api::zeros::<bf16>(&cache_shape)
+                    .sync_on(&stream)
+                    .map_err(|error| {
+                        ModelError::Cuda(format!("allocate layer {layer} key cache: {error:?}"))
+                    })?;
+                let value = api::zeros::<bf16>(&cache_shape)
+                    .sync_on(&stream)
+                    .map_err(|error| {
+                        ModelError::Cuda(format!("allocate layer {layer} value cache: {error:?}"))
+                    })?;
+                key_cache.push(Arc::new(key));
+                value_cache.push(Arc::new(value));
+            }
+            Ok(Self {
+                model,
+                stream,
+                weights,
+                cosine,
+                sine,
+                key_cache,
+                value_cache,
+                capacity,
+            })
+        }
+
+        fn next_token(
+            &self,
+            token_ids: &[u32],
+            positions: &[u32],
+            current_slots: &[u32],
+            context_slots: &[u32],
+        ) -> Result<u32, ModelError> {
+            let rows = token_ids.len();
+            if rows == 0
+                || positions.len() != rows
+                || current_slots.len() != rows
+                || context_slots.is_empty()
+                || context_slots
+                    .iter()
+                    .chain(current_slots)
+                    .any(|slot| *slot as usize >= self.capacity)
+            {
+                return Err(ModelError::Cuda("invalid forward batch metadata".into()));
+            }
+            let cfg = &self.model.config;
+            let stream = &self.stream;
+            let query_start = positions[0] as i32;
+            let token_ids = copy_u32(token_ids, stream, "token IDs")?;
+            let positions = copy_u32(positions, stream, "positions")?;
+            let current_slots = copy_u32(current_slots, stream, "current KV slots")?;
+            let context_slots = copy_u32(context_slots, stream, "context KV slots")?;
+
+            let hidden = api::zeros::<bf16>(&[rows, cfg.hidden_size])
+                .partition([1, HIDDEN_BLOCK])
+                .sync_on(stream)
+                .map_err(|error| cuda_error("allocate embedding output", error))?;
+            let (_, _, hidden) =
+                kernels::embedding_bf16(&token_ids, &*self.weights.embedding, hidden)
+                    .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("embedding", error))?;
+            let hidden = Arc::new(hidden.unpartition());
+
+            let mut pending: Option<(Bf16Tensor, Bf16Tensor)> = None;
+            for (layer_index, layer) in self.weights.layers.iter().enumerate() {
+                let (attention_input, residual) = match pending.take() {
+                    None => (
+                        self.rms_norm(hidden.clone(), layer.input_norm.clone(), rows)?,
+                        hidden.clone(),
+                    ),
+                    Some((residual, update)) => {
+                        let (normalized, combined) =
+                            self.add_rms_norm(residual, update, layer.input_norm.clone(), rows)?;
+                        (normalized, combined)
+                    }
+                };
+
+                let query = self.gemm(
+                    layer.query.clone(),
+                    attention_input.clone(),
+                    cfg.q_width(),
+                    rows,
+                    cfg.hidden_size,
+                    "query projection",
+                )?;
+                let key = self.gemm(
+                    layer.key.clone(),
+                    attention_input.clone(),
+                    cfg.kv_width(),
+                    rows,
+                    cfg.hidden_size,
+                    "key projection",
+                )?;
+                let value = self.gemm(
+                    layer.value.clone(),
+                    attention_input,
+                    cfg.kv_width(),
+                    rows,
+                    cfg.hidden_size,
+                    "value projection",
+                )?;
+                let query = query
+                    .view(&[rows, cfg.num_attention_heads, cfg.head_dim])
+                    .map_err(|error| cuda_error("view query heads", error))?;
+                let key = key
+                    .view(&[rows, cfg.num_key_value_heads, cfg.head_dim])
+                    .map_err(|error| cuda_error("view key heads", error))?;
+                let value = value
+                    .view(&[rows, cfg.num_key_value_heads, cfg.head_dim])
+                    .map_err(|error| cuda_error("view value heads", error))?;
+
+                let rotated_query =
+                    api::zeros::<bf16>(&[rows, cfg.num_attention_heads, cfg.head_dim])
+                        .partition([1, 1, cfg.head_dim])
+                        .sync_on(stream)
+                        .map_err(|error| cuda_error("allocate rotated query", error))?;
+                let (_, _, _, _, rotated_query) = kernels::rope_q_bf16(
+                    &query,
+                    &positions,
+                    &self.cosine,
+                    &self.sine,
+                    rotated_query,
+                )
+                .generics(vec![
+                    cfg.head_dim.to_string(),
+                    (cfg.head_dim / 2).to_string(),
+                ])
+                .sync_on(stream)
+                .map_err(|error| cuda_error("query RoPE", error))?;
+                let rotated_query = Arc::new(rotated_query.unpartition());
+
+                let rotated_key =
+                    api::zeros::<bf16>(&[rows, cfg.num_key_value_heads, cfg.head_dim])
+                        .partition([1, 1, cfg.head_dim])
+                        .sync_on(stream)
+                        .map_err(|error| cuda_error("allocate rotated key", error))?;
+                let (_, _, _, _, _, _, _, _, rotated_key) = unsafe {
+                    kernels::rope_kv_write_bf16(
+                        &key,
+                        &value,
+                        &positions,
+                        &current_slots,
+                        &self.cosine,
+                        &self.sine,
+                        self.key_cache[layer_index].device_pointer(),
+                        self.value_cache[layer_index].device_pointer(),
+                        rotated_key,
+                    )
+                }
+                .generics(vec![
+                    cfg.head_dim.to_string(),
+                    (cfg.head_dim / 2).to_string(),
+                    cfg.num_key_value_heads.to_string(),
+                ])
+                .sync_on(stream)
+                .map_err(|error| cuda_error("key RoPE and flat KV write", error))?;
+                drop(rotated_key);
+
+                let context_len = context_slots.shape()[0] as usize;
+                let gathered_key =
+                    api::zeros::<bf16>(&[cfg.num_key_value_heads, context_len, cfg.head_dim])
+                        .partition([1, 1, cfg.head_dim])
+                        .sync_on(stream)
+                        .map_err(|error| cuda_error("allocate gathered key", error))?;
+                let gathered_value =
+                    api::zeros::<bf16>(&[cfg.num_key_value_heads, context_len, cfg.head_dim])
+                        .partition([1, 1, cfg.head_dim])
+                        .sync_on(stream)
+                        .map_err(|error| cuda_error("allocate gathered value", error))?;
+                let (_, _, gathered_key) = kernels::gather_flat_kv_bf16(
+                    &context_slots,
+                    &self.key_cache[layer_index],
+                    gathered_key,
+                )
+                .generics(vec![cfg.head_dim.to_string()])
+                .sync_on(stream)
+                .map_err(|error| cuda_error("gather key cache", error))?;
+                let (_, _, gathered_value) = kernels::gather_flat_kv_bf16(
+                    &context_slots,
+                    &self.value_cache[layer_index],
+                    gathered_value,
+                )
+                .generics(vec![cfg.head_dim.to_string()])
+                .sync_on(stream)
+                .map_err(|error| cuda_error("gather value cache", error))?;
+                let gathered_key = gathered_key.unpartition();
+                let gathered_value = gathered_value.unpartition();
+
+                let attention = api::zeros::<bf16>(&[rows, cfg.num_attention_heads, cfg.head_dim])
+                    .partition([ATTENTION_QUERY_BLOCK, 1, cfg.head_dim])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("allocate attention output", error))?;
+                let (_, _, _, attention, _, _, _, _) = unsafe {
+                    kernels::causal_attention_bf16(
+                        &rotated_query,
+                        &gathered_key,
+                        &gathered_value,
+                        attention,
+                        1.0 / (cfg.head_dim as f32).sqrt(),
+                        (cfg.num_attention_heads / cfg.num_key_value_heads) as i32,
+                        context_len as i32,
+                        query_start,
+                    )
+                }
+                .generics(vec![
+                    ATTENTION_QUERY_BLOCK.to_string(),
+                    ATTENTION_KEY_BLOCK.to_string(),
+                    cfg.head_dim.to_string(),
+                ])
+                .sync_on(stream)
+                .map_err(|error| cuda_error("causal attention", error))?;
+                let attention = Arc::new(
+                    attention
+                        .unpartition()
+                        .reshape(&[rows, cfg.hidden_size])
+                        .map_err(|error| cuda_error("reshape attention output", error))?,
+                );
+                let attention_output = self.gemm(
+                    layer.output.clone(),
+                    attention,
+                    cfg.hidden_size,
+                    rows,
+                    cfg.hidden_size,
+                    "attention output projection",
+                )?;
+                let (mlp_input, hidden_after_attention) =
+                    self.add_rms_norm(residual, attention_output, layer.post_norm.clone(), rows)?;
+                let gate = self.gemm(
+                    layer.gate.clone(),
+                    mlp_input.clone(),
+                    cfg.intermediate_size,
+                    rows,
+                    cfg.hidden_size,
+                    "MLP gate projection",
+                )?;
+                let up = self.gemm(
+                    layer.up.clone(),
+                    mlp_input,
+                    cfg.intermediate_size,
+                    rows,
+                    cfg.hidden_size,
+                    "MLP up projection",
+                )?;
+                let activated = api::zeros::<bf16>(&[rows, cfg.intermediate_size])
+                    .partition([1, MLP_BLOCK])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("allocate MLP activation", error))?;
+                let (_, _, activated) = kernels::silu_mul_bf16(&gate, &up, activated)
+                    .generics(vec![MLP_BLOCK.to_string()])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("SiLU gated activation", error))?;
+                let activated = Arc::new(activated.unpartition());
+                let down = self.gemm(
+                    layer.down.clone(),
+                    activated,
+                    cfg.hidden_size,
+                    rows,
+                    cfg.intermediate_size,
+                    "MLP down projection",
+                )?;
+                pending = Some((hidden_after_attention, down));
+            }
+
+            let (residual, update) = pending
+                .ok_or_else(|| ModelError::Cuda("model has no transformer layers".into()))?;
+            let (final_hidden, _) =
+                self.add_rms_norm(residual, update, self.weights.final_norm.clone(), rows)?;
+            let last = api::zeros::<bf16>(&[cfg.hidden_size])
+                .partition([HIDDEN_BLOCK])
+                .sync_on(stream)
+                .map_err(|error| cuda_error("allocate final token hidden state", error))?;
+            let (_, last, _) = kernels::gather_row_bf16(&final_hidden, last, (rows - 1) as i32)
+                .generics(vec![HIDDEN_BLOCK.to_string()])
+                .sync_on(stream)
+                .map_err(|error| cuda_error("gather final token hidden state", error))?;
+            let last = last.unpartition();
+            let logits = self.gemm(
+                self.weights.lm_head.clone(),
+                Arc::new(last),
+                cfg.vocab_size,
+                1,
+                cfg.hidden_size,
+                "language-model head",
+            )?;
+            let logits: Vec<bf16> = logits
+                .clone()
+                .to_host_vec()
+                .sync_on(stream)
+                .map_err(|error| cuda_error("copy logits to host", error))?;
+            logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.to_f32().total_cmp(&right.to_f32()))
+                .map(|(token, _)| token as u32)
+                .ok_or_else(|| ModelError::Cuda("language-model head returned no logits".into()))
+        }
+
+        fn gemm(
+            &self,
+            weight: Bf16Tensor,
+            input: Bf16Tensor,
+            output_size: usize,
+            rows: usize,
+            input_size: usize,
+            operation: &'static str,
+        ) -> Result<Bf16Tensor, ModelError> {
+            let output = api::zeros::<bf16>(&[rows, output_size])
+                .sync_on(&self.stream)
+                .map_err(|error| cuda_error("allocate GEMM output", error))?;
+            let output = cublas::gemm_bf16(weight, input, output, output_size, rows, input_size)
+                .map_err(|error| ModelError::Cuda(format!("{operation}: {error}")))?
+                .sync_on(&self.stream)
+                .map_err(|error| cuda_error(operation, error))?
+                .map_err(|error| ModelError::Cuda(format!("{operation}: {error}")))?;
+            Ok(Arc::new(output))
+        }
+
+        fn rms_norm(
+            &self,
+            input: Bf16Tensor,
+            weight: Bf16Tensor,
+            rows: usize,
+        ) -> Result<Bf16Tensor, ModelError> {
+            let output = api::zeros::<bf16>(&[rows, self.model.config.hidden_size])
+                .partition([1, self.model.config.hidden_size])
+                .sync_on(&self.stream)
+                .map_err(|error| cuda_error("allocate RMSNorm output", error))?;
+            let (_, _, output, _) = unsafe {
+                kernels::rms_norm_bf16(&input, &weight, output, self.model.config.rms_norm_eps)
+            }
+            .generics(vec![
+                self.model.config.hidden_size.to_string(),
+                HIDDEN_BLOCK.to_string(),
+            ])
+            .sync_on(&self.stream)
+            .map_err(|error| cuda_error("RMSNorm", error))?;
+            Ok(Arc::new(output.unpartition()))
+        }
+
+        fn add_rms_norm(
+            &self,
+            residual: Bf16Tensor,
+            update: Bf16Tensor,
+            weight: Bf16Tensor,
+            rows: usize,
+        ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
+            let normalized = api::zeros::<bf16>(&[rows, self.model.config.hidden_size])
+                .partition([1, self.model.config.hidden_size])
+                .sync_on(&self.stream)
+                .map_err(|error| cuda_error("allocate fused RMSNorm output", error))?;
+            let combined = api::zeros::<bf16>(&[rows, self.model.config.hidden_size])
+                .partition([1, self.model.config.hidden_size])
+                .sync_on(&self.stream)
+                .map_err(|error| cuda_error("allocate residual output", error))?;
+            let (_, _, _, normalized, combined, _) = unsafe {
+                kernels::add_rms_norm_bf16(
+                    &residual,
+                    &update,
+                    &weight,
+                    normalized,
+                    combined,
+                    self.model.config.rms_norm_eps,
+                )
+            }
+            .generics(vec![
+                self.model.config.hidden_size.to_string(),
+                HIDDEN_BLOCK.to_string(),
+            ])
+            .sync_on(&self.stream)
+            .map_err(|error| cuda_error("fused residual RMSNorm", error))?;
+            Ok((
+                Arc::new(normalized.unpartition()),
+                Arc::new(combined.unpartition()),
+            ))
+        }
+    }
+
+    pub(super) fn validate(
+        model_id: &str,
+        model_dir: &Path,
+        device_id: usize,
+    ) -> Result<CudaModelReport, ModelError> {
+        let model = Llama32::load(model_id, model_dir)?;
+        let device = Device::new(device_id).map_err(|error| {
+            ModelError::Cuda(format!("initialize device {device_id}: {error:?}"))
+        })?;
+        let stream = device
+            .new_stream()
+            .map_err(|error| ModelError::Cuda(format!("create stream: {error:?}")))?;
+        let weights = DeviceWeights::load(&model.weights, &stream)?;
+
+        let name = "model.norm.weight";
+        let expected = model.weights.tensor(name)?;
+        let actual: Vec<bf16> = weights
+            .get(name)?
+            .to_host_vec()
+            .sync_on(&stream)
+            .map_err(|error| ModelError::Cuda(format!("verify `{name}`: {error:?}")))?;
+        let matches = actual
+            .iter()
+            .zip(expected.data().chunks_exact(2))
+            .all(|(actual, bytes)| actual.to_bits() == u16::from_le_bytes([bytes[0], bytes[1]]));
+        if !matches || actual.len() * 2 != expected.data().len() {
+            return Err(ModelError::Cuda(format!(
+                "BF16 round-trip mismatch for `{name}`"
+            )));
+        }
+        Ok(CudaModelReport {
+            model_id: model.id,
+            device_id,
+            tensors: weights.tensors.len(),
+            bytes: weights.bytes,
+        })
+    }
+
+    pub(super) fn validate_next_token(
+        model_id: &str,
+        model_dir: &Path,
+        device_id: usize,
+        prompt: &str,
+    ) -> Result<CudaForwardReport, ModelError> {
+        let model = Llama32::load(model_id, model_dir)?;
+        let token_ids = model.tokenizer.encode(prompt)?;
+        if token_ids.is_empty() {
+            return Err(ModelError::InvalidInput(
+                "prompt must encode to at least one token".into(),
+            ));
+        }
+        let capacity = token_ids.len() + 1;
+        let positions: Vec<u32> = (0..token_ids.len() as u32).collect();
+        let slots: Vec<u32> = (0..token_ids.len())
+            .map(|index| (capacity - 1 - index) as u32)
+            .collect();
+        let runtime = CudaLlama::load(model, device_id, capacity)?;
+        let next_token_id = runtime.next_token(&token_ids, &positions, &slots, &slots)?;
+        let next_token_text = runtime.model.tokenizer.decode(&[next_token_id])?;
+        Ok(CudaForwardReport {
+            model_id: runtime.model.id.clone(),
+            prompt_tokens: token_ids.len(),
+            next_token_id,
+            next_token_text,
+        })
+    }
+
+    fn rope_tables(config: &super::Config, stream: &Arc<Stream>) -> Result<RopeTables, ModelError> {
+        let half = config.head_dim / 2;
+        let mut inverse_frequency = Vec::with_capacity(half);
+        for index in 0..half {
+            let exponent = (2 * index) as f32 / config.head_dim as f32;
+            let base_frequency = 1.0 / config.rope_theta.powf(exponent);
+            let wavelength = TAU / base_frequency;
+            let low_wavelength = config.rope_scaling.original_max_position_embeddings as f32
+                / config.rope_scaling.low_freq_factor;
+            let high_wavelength = config.rope_scaling.original_max_position_embeddings as f32
+                / config.rope_scaling.high_freq_factor;
+            let frequency = if wavelength < high_wavelength {
+                base_frequency
+            } else if wavelength > low_wavelength {
+                base_frequency / config.rope_scaling.factor
+            } else {
+                let smooth = (config.rope_scaling.original_max_position_embeddings as f32
+                    / wavelength
+                    - config.rope_scaling.low_freq_factor)
+                    / (config.rope_scaling.high_freq_factor - config.rope_scaling.low_freq_factor);
+                (1.0 - smooth) * base_frequency / config.rope_scaling.factor
+                    + smooth * base_frequency
+            };
+            inverse_frequency.push(frequency);
+        }
+        let elements = config
+            .max_position_embeddings
+            .checked_mul(half)
+            .ok_or_else(|| ModelError::Cuda("RoPE table size overflowed".into()))?;
+        let mut cosine = Vec::with_capacity(elements);
+        let mut sine = Vec::with_capacity(elements);
+        for position in 0..config.max_position_embeddings {
+            for frequency in &inverse_frequency {
+                let angle = position as f32 * frequency;
+                cosine.push(angle.cos());
+                sine.push(angle.sin());
+            }
+        }
+        let cosine = api::copy_host_vec_to_device(&Arc::new(cosine))
+            .sync_on(stream)
+            .map_err(|error| cuda_error("upload RoPE cosine table", error))?
+            .reshape(&[config.max_position_embeddings, half])
+            .map_err(|error| cuda_error("reshape RoPE cosine table", error))?;
+        let sine = api::copy_host_vec_to_device(&Arc::new(sine))
+            .sync_on(stream)
+            .map_err(|error| cuda_error("upload RoPE sine table", error))?
+            .reshape(&[config.max_position_embeddings, half])
+            .map_err(|error| cuda_error("reshape RoPE sine table", error))?;
+        Ok((Arc::new(cosine), Arc::new(sine)))
+    }
+
+    fn copy_u32(
+        values: &[u32],
+        stream: &Arc<Stream>,
+        operation: &'static str,
+    ) -> Result<Tensor<u32>, ModelError> {
+        api::copy_host_vec_to_device(&Arc::new(values.to_vec()))
+            .sync_on(stream)
+            .map_err(|error| cuda_error(operation, error))
+    }
+
+    fn cuda_error(operation: &'static str, error: impl std::fmt::Debug) -> ModelError {
+        ModelError::Cuda(format!("{operation}: {error:?}"))
     }
 }
 

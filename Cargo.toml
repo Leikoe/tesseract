@@ -59,3 +59,8 @@ required-features = ["cuda"]
 name = "model-cuda-check"
 path = "src/bin/model-cuda-check.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "next-token-check"
+path = "src/bin/next-token-check.rs"
+required-features = ["cuda"]
