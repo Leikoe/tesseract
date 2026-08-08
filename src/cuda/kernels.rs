@@ -35,7 +35,8 @@ mod tile {
             let values: Tile<f32, { [1, BLOCK] }> = convert_tile(input.load([row, block]));
             squares = squares + values * values;
         }
-        let sum = reduce_sum(squares, 1i32).reshape(const_shape![]);
+        let sum: Tile<f32, { [1] }> = reduce_sum(squares, 1i32);
+        let sum: Tile<f32, { [] }> = sum.reshape(const_shape![]);
         let sum: f32 = tile_to_scalar(sum);
         let n: f32 = convert_scalar(N);
         let inverse = rsqrt(scalar_to_tile(sum / n + epsilon), ftz::Disabled);
@@ -72,7 +73,8 @@ mod tile {
             let combined = residual + update;
             squares = squares + combined * combined;
         }
-        let sum = reduce_sum(squares, 1i32).reshape(const_shape![]);
+        let sum: Tile<f32, { [1] }> = reduce_sum(squares, 1i32);
+        let sum: Tile<f32, { [] }> = sum.reshape(const_shape![]);
         let sum: f32 = tile_to_scalar(sum);
         let n: f32 = convert_scalar(N);
         let inverse = rsqrt(scalar_to_tile(sum / n + epsilon), ftz::Disabled);
@@ -136,8 +138,14 @@ mod tile {
             sin.partition(const_shape![1, HALF]).load([position, 0i32]);
         let mut out = unsafe { out.partition_mut(const_shape![1, 1, HALF]) };
         unsafe {
-            out.store(convert_tile(lo * cos - hi * sin), [0i32, 0i32, 0i32]);
-            out.store(convert_tile(hi * cos + lo * sin), [0i32, 0i32, 1i32]);
+            out.store(
+                convert_tile((lo * cos - hi * sin).reshape(const_shape![1, 1, HALF])),
+                [0i32, 0i32, 0i32],
+            );
+            out.store(
+                convert_tile((hi * cos + lo * sin).reshape(const_shape![1, 1, HALF])),
+                [0i32, 0i32, 1i32],
+            );
         }
     }
 
@@ -275,6 +283,7 @@ mod tile {
             let key_position = (block * BN).broadcast(const_shape![BM, BN]) + lane;
             let valid = lt_tile(key_position, context_len.broadcast(const_shape![BM, BN]))
                 & ge_tile(query_position, key_position);
+            let scale: Tile<f32, { [BM, BN] }> = scale.broadcast(const_shape![BM, BN]);
             let scores = select(
                 valid,
                 scores * scale,
@@ -301,6 +310,7 @@ mod tile {
     }
 }
 
+#[allow(unused_imports)]
 pub(crate) use tile::{
     add_rms_norm_bf16, causal_attention_bf16, embedding_bf16, gather_flat_kv_bf16, rms_norm_bf16,
     rope_kv_write_bf16, rope_q_bf16, silu_mul_bf16,
