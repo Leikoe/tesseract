@@ -48,22 +48,22 @@ tesseract_eager_forwards_total 46
 tesseract_cuda_graph_replays_total 183
 # HELP tesseract_cuda_graph_captures_total Full-model CUDA decode graphs captured
 # TYPE tesseract_cuda_graph_captures_total counter
-tesseract_cuda_graph_captures_total 22
+tesseract_cuda_graph_captures_total 21
 # HELP tesseract_packed_decode_forwards_total Packed multi-request decode forwards executed
 # TYPE tesseract_packed_decode_forwards_total counter
-tesseract_packed_decode_forwards_total 65
+tesseract_packed_decode_forwards_total 64
 # HELP tesseract_packed_decode_requests_total Request rows executed by packed multi-request decode
 # TYPE tesseract_packed_decode_requests_total counter
-tesseract_packed_decode_requests_total 390
+tesseract_packed_decode_requests_total 389
 # HELP tesseract_time_to_first_token_seconds Time from admission to first generated token
 # TYPE tesseract_time_to_first_token_seconds summary
-tesseract_time_to_first_token_seconds_sum 7.185261
+tesseract_time_to_first_token_seconds_sum 6.536921
 tesseract_time_to_first_token_seconds_count 46
 # HELP tesseract_inter_token_seconds Time between generated tokens
 # TYPE tesseract_inter_token_seconds summary
-tesseract_inter_token_seconds_sum 24.623346
+tesseract_inter_token_seconds_sum 13.864121
 tesseract_inter_token_seconds_count 508
 # HELP tesseract_request_duration_seconds End-to-end request lifetime
 # TYPE tesseract_request_duration_seconds summary
-tesseract_request_duration_seconds_sum 31.809261
+tesseract_request_duration_seconds_sum 20.402216
 tesseract_request_duration_seconds_count 46

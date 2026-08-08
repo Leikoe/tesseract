@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "timestamp_utc": "2026-08-08T07:39:29.206217+00:00",
+  "timestamp_utc": "2026-08-08T07:57:07.111196+00:00",
   "hardware": "NVIDIA A100-SXM4-80GB, 8.0, 580.126.09, 81920 MiB",
   "cuda": "Build cuda_13.3.r13.3/compiler.38244171_0",
   "rust": "rustc 1.89.0 (29483883e 2025-08-04)",
-  "git_revision": "9ebb36ba26e7c606bcd6e6976bb8023f9482a6be",
+  "git_revision": "9404e47a6c4bdd0881727a81a68793a34f2dc831",
   "model": "meta-llama/Llama-3.2-1B-Instruct",
   "model_revision": "9213176726f574b556790deb65791e0c5aa438b6",
   "model_config_sha256": "2febf68cea25bf4611be02b7536f2488a5ba523bb1134986e3610152abe74fdb",
-  "server_args": "--listen 127.0.0.1:8000 (all other production defaults)",
+  "server_args": "--listen 127.0.0.1:8000",
   "workload": {
     "concurrency": 1,
     "requests": 8,
@@ -28,33 +28,33 @@
   "summary": {
     "requests": 8,
     "completion_tokens": 106,
-    "wall_seconds": 3.7898987110002054,
-    "completion_tokens_per_second": 27.96908521389617,
+    "wall_seconds": 3.2690870289989107,
+    "completion_tokens_per_second": 32.424955059229575,
     "request_latency_seconds": {
-      "mean": 0.47330248325056345,
-      "p50": 0.09445590150062344,
-      "p90": 1.5372075586008576,
-      "p99": 1.8383112844606149
+      "mean": 0.40818934300000365,
+      "p50": 0.0757357634993241,
+      "p90": 1.4103451799004687,
+      "p99": 1.4275737854903492
     },
     "ttft_seconds": {
-      "mean": 0.4372820438748022,
-      "p50": 0.05119835549976415,
-      "p90": 1.494949295599872,
-      "p99": 1.7931597653603237
+      "mean": 0.37221468912457567,
+      "p50": 0.05022255049971136,
+      "p90": 1.3680823475999204,
+      "p99": 1.3823499714602074
     },
     "inter_token_seconds": {
-      "mean": 0.0029467331285992432,
-      "p50": 0.0030294769333219546,
-      "p90": 0.0030411989600300634,
-      "p99": 0.0030414311960460815
+      "mean": 0.0029399763428695483,
+      "p50": 0.003021082066698,
+      "p90": 0.0030383667733015806,
+      "p99": 0.003043443097330358
     }
   },
   "results": [
     {
       "prompt": "What is the capital of France? Answer briefly.",
-      "latency_seconds": 0.036665708999862545,
-      "ttft_seconds": 0.015450850998604437,
-      "mean_inter_token_seconds": 0.0030260941666711005,
+      "latency_seconds": 0.03643936700063932,
+      "ttft_seconds": 0.015236155999446055,
+      "mean_inter_token_seconds": 0.0030256590001348136,
       "token_events": 7,
       "prompt_tokens": 21,
       "completion_tokens": 8,
@@ -62,9 +62,9 @@
     },
     {
       "prompt": "Count from one to ten, one number per line.",
-      "latency_seconds": 0.060960472999795456,
-      "ttft_seconds": 0.01529764099905151,
-      "mean_inter_token_seconds": 0.003041457000047861,
+      "latency_seconds": 0.060351043999617104,
+      "ttft_seconds": 0.01465492899842502,
+      "mean_inter_token_seconds": 0.0030440071333335556,
       "token_events": 16,
       "prompt_tokens": 22,
       "completion_tokens": 16,
@@ -72,9 +72,9 @@
     },
     {
       "prompt": "In two sentences, explain why the sky appears blue.",
-      "latency_seconds": 0.06004160600059549,
-      "ttft_seconds": 0.014395353999134386,
-      "mean_inter_token_seconds": 0.0030410269333515315,
+      "latency_seconds": 0.05924899700039532,
+      "ttft_seconds": 0.014315583001007326,
+      "mean_inter_token_seconds": 0.0029933193333514887,
       "token_events": 16,
       "prompt_tokens": 22,
       "completion_tokens": 16,
@@ -82,9 +82,9 @@
     },
     {
       "prompt": "Write a short Rust function that adds two i32 values.",
-      "latency_seconds": 0.12795133000145142,
-      "ttft_seconds": 0.08694586000092386,
-      "mean_inter_token_seconds": 0.0027310216000235718,
+      "latency_seconds": 0.12640922799982945,
+      "ttft_seconds": 0.08520894499997667,
+      "mean_inter_token_seconds": 0.0027399767333311804,
       "token_events": 16,
       "prompt_tokens": 23,
       "completion_tokens": 16,
@@ -92,9 +92,9 @@
     },
     {
       "prompt": "Name three practical uses for a priority queue.",
-      "latency_seconds": 1.3938248320009734,
-      "ttft_seconds": 1.352944309999657,
-      "mean_inter_token_seconds": 0.0027232160666850786,
+      "latency_seconds": 1.4021410820005258,
+      "ttft_seconds": 1.3612882409997837,
+      "mean_inter_token_seconds": 0.0027211835999575366,
       "token_events": 16,
       "prompt_tokens": 20,
       "completion_tokens": 16,
@@ -102,9 +102,9 @@
     },
     {
       "prompt": "Summarize the difference between TCP and UDP in one paragraph.",
-      "latency_seconds": 1.8717672540005879,
-      "ttft_seconds": 1.8262942620003741,
-      "mean_inter_token_seconds": 0.0030294769333219546,
+      "latency_seconds": 1.4294880750003358,
+      "ttft_seconds": 1.3839352630002395,
+      "mean_inter_token_seconds": 0.0030346065332802633,
       "token_events": 16,
       "prompt_tokens": 24,
       "completion_tokens": 16,
@@ -112,9 +112,9 @@
     },
     {
       "prompt": "Give four tips for debugging a production service.",
-      "latency_seconds": 0.060330074000376044,
-      "ttft_seconds": 0.01477865299966652,
-      "mean_inter_token_seconds": 0.003034839200093605,
+      "latency_seconds": 0.06031646799965529,
+      "ttft_seconds": 0.014962985998863587,
+      "mean_inter_token_seconds": 0.003021082066698,
       "token_events": 16,
       "prompt_tokens": 20,
       "completion_tokens": 16,
@@ -122,8 +122,8 @@
     },
     {
       "prompt": "What is 17 multiplied by 23? Show the result only.",
-      "latency_seconds": 0.17487858800086542,
-      "ttft_seconds": 0.17214942000100564,
+      "latency_seconds": 0.09112048299903108,
+      "ttft_seconds": 0.08811540999886347,
       "mean_inter_token_seconds": 0.0,
       "token_events": 1,
       "prompt_tokens": 25,

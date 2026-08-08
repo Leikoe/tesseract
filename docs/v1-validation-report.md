@@ -11,18 +11,15 @@ revision used for the final clean-checkout gate.
 Tesseract v1 satisfies the acceptance contract for one A100 80 GB serving
 `meta-llama/Llama-3.2-1B-Instruct` in BF16.
 
-- Final implementation revision: `8df163f9944db43916d54131c3527c8fc23d52ed`
+- Final implementation revision: `9404e47a6c4bdd0881727a81a68793a34f2dc831`
 - Final A100 verifier: `scripts/node/verify-a100.sh`
 - Final verifier result: `a100_node_validation=ok`
-- Local and A100 unit/integration result: 21 passed, 0 failed
+- Local and A100 unit/integration result: 22 passed, 0 failed
 - A100 checkout after verification and HTTP probes: clean and aligned with
   `origin/main`
 
-The retained benchmark was run on implementation revision `9ebb36b`. Changes
-between that revision and the final implementation revision only retain the raw
-benchmark evidence, add acceptance tests and request lifecycle logging, improve
-documentation, and extend the verifier with strict CUDA Clippy. They do not
-change model execution or scheduling.
+The retained benchmark was rerun on the exact final implementation revision
+after its clean-checkout verifier passed.
 
 ## Supported deployment
 
@@ -81,9 +78,9 @@ artifacts to exist.
 
 | Requirement | Direct evidence | Result |
 | --- | --- | --- |
-| Local tests | `cargo test --all-targets`: 21 passed, 0 failed. Strict local Clippy also passed. | Pass |
+| Local tests | `cargo test --all-targets`: 22 passed, 0 failed. Strict local Clippy also passed. | Pass |
 | API/SSE/overload/cancel/shutdown tests | Named integration tests directly cover every listed behavior. | Pass |
-| Scheduler properties | Exhaustive small-domain tests cover total token budget, chunk cap, decode priority, physical-slot non-aliasing, exact slot count, reservation, and reuse. Cancellation paths are independently exercised. | Pass |
+| Scheduler properties | Exhaustive small-domain tests cover total token budget, chunk cap, decode priority, round-robin fairness between equal-phase peers, physical-slot non-aliasing, exact slot count, reservation, and reuse. Cancellation paths are independently exercised. | Pass |
 | SafeTensors/config validation before GPU allocation | `Llama32::load` parses and validates architecture, BF16 dtype, dimensions, tokenizer, tensor names, shapes, and dtypes before `CudaLlama::load` allocates device state. `model-check` is the host-only gate. | Pass |
 | Pinned independent logits reference | PyTorch 2.8.0 / Transformers 4.55.0 BF16 eager reference matched all three next-token IDs. Shared top-logit maximum absolute differences were 0.125, 0.4375, and 0.125 under the documented 0.5 tolerance. | Pass |
 | Generated-text edge cases | Empty input: API plus Llama-template tests and final A100 HTTP 400. One token: real `Paris` response. EOS: real count-to-three stream. Maximum length and stop: scheduler tests plus real stop probe. Concurrent requests: real France/Germany packed decode and concurrency-8 benchmark. | Pass |
@@ -96,7 +93,7 @@ The detailed correctness and sanitizer transcript is retained in
 
 | Requirement | Direct evidence | Result |
 | --- | --- | --- |
-| Release from clean checkout | The A100 fast-forwarded to exact revision `8df163f`, passed the verifier's clean-tracked-worktree guard, built release CUDA binaries, and remained clean after probes. | Pass |
+| Release from clean checkout | The A100 fast-forwarded to exact revision `9404e47`, passed the verifier's clean-tracked-worktree guard, built release CUDA binaries, and remained clean after validation. | Pass |
 | Readiness after load/warmup | Backend initialization loads model state and captures all configured batch-1 graph buckets before returning. The worker sets readiness afterward. A100 logs show graph warmup before the ready log; default capacity warmed 12 buckets. | Pass |
 | Safe lifecycle logs | Admission and finish logs carry request IDs; finish/failure logs include lifecycle latency. Default logs contain no prompt, generated text, token IDs, or credentials. | Pass |
 | Required metrics | Prometheus output includes queue/running/KV gauges; request outcome, prompt/generated token, engine/batch, graph/eager, and packed-decode counters; and TTFT, inter-token, and request-duration summaries. | Pass |
@@ -108,9 +105,9 @@ Measured A100 results from the retained benchmark:
 
 | Workload | Output tok/s | Mean TTFT | TTFT p99 | Mean inter-token | Request p99 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Batch 1 | 27.97 | 437.28 ms | 1,793.16 ms | 2.95 ms | 1,838.31 ms |
-| Concurrency 8, first shape pass | 47.37 | 320.70 ms | 845.97 ms | 114.50 ms | 2,577.64 ms |
-| Concurrency 8, warm shapes | 584.46 | 76.27 ms | 117.67 ms | 7.48 ms | 210.66 ms |
+| Batch 1 | 32.42 | 372.21 ms | 1,382.35 ms | 2.94 ms | 1,427.57 ms |
+| Concurrency 8, first shape pass | 79.30 | 316.89 ms | 838.45 ms | 61.22 ms | 1,668.46 ms |
+| Concurrency 8, warm shapes | 610.04 | 74.24 ms | 115.46 ms | 7.36 ms | 207.80 ms |
 
 The raw files and fuller interpretation are in
 [`benchmarks/2026-08-08-a100/`](benchmarks/2026-08-08-a100/README.md).
