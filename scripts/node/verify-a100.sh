@@ -8,6 +8,7 @@ TESSERACT_CUDA_PATH="${TESSERACT_CUDA_PATH:-/usr/local/cuda-13.3}"
 TESSERACT_MODEL_PATH="${TESSERACT_MODEL_PATH:-/home/ubuntu/models/Llama-3.2-1B-Instruct}"
 TESSERACT_CUTILE_COMMIT="${TESSERACT_CUTILE_COMMIT:-9fe5756f861bc40f098e6981ac2dff6cf5d3d0e4}"
 TESSERACT_CUTILE_PATH="${TESSERACT_CUTILE_PATH:-${HOME}/.cache/tesseract/cutile-rs}"
+TESSERACT_CUBIN_CACHE_PATH="${XDG_CACHE_HOME:-${HOME}/.cache}/cutile/kernels"
 
 # shellcheck source=/dev/null
 . "${HOME}/.cargo/env"
@@ -33,6 +34,12 @@ cargo +"${TESSERACT_RUST_TOOLCHAIN}" run --release --features cuda \
   --bin cuda-check
 cargo +"${TESSERACT_RUST_TOOLCHAIN}" run --release --features cuda \
   --bin model-cuda-check -- --model-path "${TESSERACT_MODEL_PATH}"
+cargo +"${TESSERACT_RUST_TOOLCHAIN}" run --release --features cuda \
+  --bin next-token-check -- --model-path "${TESSERACT_MODEL_PATH}" \
+  --prompt "The capital of France is"
+
+test -d "${TESSERACT_CUBIN_CACHE_PATH}"
+test -n "$(find "${TESSERACT_CUBIN_CACHE_PATH}" -type f -name '*.cubin' -print -quit)"
 
 mkdir -p "$(dirname -- "${TESSERACT_CUTILE_PATH}")"
 if [[ ! -d "${TESSERACT_CUTILE_PATH}/.git" ]]; then

@@ -78,6 +78,7 @@ pub fn validate_cuda_model(
     model_dir: &Path,
     device_id: usize,
 ) -> Result<CudaModelReport, ModelError> {
+    crate::cuda::enable_persistent_cubin_cache()?;
     if llama_3_2::supports(model_id) {
         return llama_3_2::validate_cuda(model_id, model_dir, device_id);
     }
@@ -91,6 +92,7 @@ pub fn validate_cuda_next_token(
     device_id: usize,
     prompt: &str,
 ) -> Result<CudaForwardReport, ModelError> {
+    crate::cuda::enable_persistent_cubin_cache()?;
     if llama_3_2::supports(model_id) {
         return llama_3_2::validate_cuda_next_token(model_id, model_dir, device_id, prompt);
     }
@@ -136,6 +138,9 @@ pub enum ModelError {
     },
     #[error("CUDA model operation failed: {0}")]
     Cuda(String),
+    #[cfg(feature = "cuda")]
+    #[error(transparent)]
+    CudaInfrastructure(#[from] crate::cuda::CudaError),
 }
 
 pub(crate) fn read_file(path: &Path) -> Result<String, ModelError> {

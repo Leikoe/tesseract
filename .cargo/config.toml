@@ -1,0 +1,4 @@
+[env]
+# Persist cuda-tile + LLVM build artifacts across `cargo clean`. Runtime cuTile
+# kernel CUBIN persistence is enabled separately by `src/cuda.rs`.
+CUDA_TILE_RS_CACHE = "1"

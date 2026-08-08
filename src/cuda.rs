@@ -47,6 +47,8 @@ pub struct Bf16SmokeReport {
 
 #[derive(Debug, Error)]
 pub enum CudaError {
+    #[error("failed to enable the persistent cuTile CUBIN cache: {0}")]
+    CubinCache(#[source] std::io::Error),
     #[error("failed to initialize CUDA device {device_id}: {message}")]
     Device { device_id: usize, message: String },
     #[error("BF16 cuTile validation failed during {operation}: {message}")]
@@ -60,9 +62,21 @@ pub enum CudaError {
     Cublas(#[from] cublas::CublasError),
 }
 
+/// Enables cuTile's process-wide persistent CUBIN cache.
+///
+/// The cache contains executable device code, so cuTile deliberately uses a
+/// private per-user directory (`$XDG_CACHE_HOME/cutile/kernels`, falling back
+/// to `~/.cache/cutile/kernels`) and rejects unsafe permissions. Calling this
+/// before any kernel launch lets a replacement spot worker reuse warmed
+/// kernels when its home cache is restored or mounted persistently.
+pub fn enable_persistent_cubin_cache() -> Result<(), CudaError> {
+    cutile::jit_cache::enable_default().map_err(CudaError::CubinCache)
+}
+
 /// Compile and execute a Tesseract-owned BF16 cuTile kernel on the requested
 /// CUDA device, then copy FP32-converted results back for validation.
 pub fn validate_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaError> {
+    enable_persistent_cubin_cache()?;
     let device = Device::new(device_id).map_err(|error| CudaError::Device {
         device_id,
         message: format!("{error:?}"),

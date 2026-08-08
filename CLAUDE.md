@@ -114,6 +114,10 @@ you should save everything needed for the node setup somewhere, the next nodes w
 ```
 
 ```text
+we might want to opt-in the persistent CUBIN cache.
+```
+
+```text
 <codex_internal_context source="goal">
 Continue working toward the active thread goal.
 

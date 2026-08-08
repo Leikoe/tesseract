@@ -40,6 +40,17 @@ Verification compiles and executes both Tesseract's own BF16 cuTile kernel and
 the pinned upstream cuTile hello-world kernel. This distinguishes an upstream
 toolchain installation check from a project-owned BF16 execution check.
 
+Tesseract explicitly enables cuTile's persistent runtime CUBIN cache before
+launching kernels. The cache defaults to
+`$XDG_CACHE_HOME/cutile/kernels` or `~/.cache/cutile/kernels`, is private to the
+node user, and has a 2 GiB soft capacity. The verifier requires at least one
+cached CUBIN after the project validation runs. Preserve or mount this directory
+on future nodes when cold-start latency matters; its content is derived and
+must never replace Git as the source of truth.
+
+The separate cuda-tile/LLVM build cache is enabled in `.cargo/config.toml` so
+`cargo clean` does not force the expensive toolchain build to start over.
+
 Run all host/model/cuTile gates afterward:
 
 ```bash
