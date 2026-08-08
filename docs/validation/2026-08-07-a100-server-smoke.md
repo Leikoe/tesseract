@@ -96,13 +96,24 @@ six-token completion, metrics directly reported one eager prefill, one graph
 capture, and five graph replays; output remained `One\nTwo\nThree` and stopped
 on EOS. That run measured 1.557 s TTFT and 1.285 s total inter-token time across
 five intervals (about 257 ms/interval). These are unoptimized measurements, not
-targets: request metadata still uses allocating host-to-device updates, logits
-are copied to the host, and scheduled requests are executed serially.
+targets: request metadata still uses allocating host-to-device updates,
+stochastic sampling still copies logits to the host, and scheduled requests are
+executed serially.
 
 Startup warmup was subsequently enabled for every power-of-two context bucket.
 With a 256-token test capacity, the backend logged five warmed graph buckets
 before the server's ready log. Before any request, metrics showed readiness 1,
 five graph captures, zero eager forwards, and zero graph replays.
+
+Greedy graph replay was then extended with a two-stage BF16 cuTile argmax. The
+argmax is part of the captured graph, so steady-state greedy decode copies one
+`u32` token ID to the host instead of 128,256 BF16 logits. On the real model,
+the same 22-token chat prompt was run for eight completion tokens through both
+the temperature-zero GPU-token path and the nonzero-temperature host-logits
+path (`temperature=0.000001`, which makes the distribution effectively
+greedy). Both produced exactly `Here is the count from one to three`. Metrics
+reported two eager prefills, 14 graph replays, and 16 generated tokens. Startup
+still warmed five graph buckets and reported ready only after capture.
 
 ## Independent BF16 logits reference
 

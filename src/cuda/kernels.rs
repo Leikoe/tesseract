@@ -360,10 +360,78 @@ mod tile {
             convert_tile(true_div(accumulator, denominator).reshape(const_shape![BM, 1, D]));
         out.store(output);
     }
+
+    #[cutile::entry()]
+    fn argmax_blocks_bf16<const BLOCK: i32>(
+        logits: &Tensor<bf16, { [-1] }>,
+        block_max: &mut Tensor<f32, { [1] }>,
+        block_index: &mut Tensor<u32, { [1] }>,
+        length: i32,
+    ) {
+        let block: i32 = get_tile_block_id().0;
+        let logits = logits.partition(const_shape![BLOCK]);
+        let values_bf16: Tile<bf16, { [BLOCK] }> = logits.load([block]);
+        let values: Tile<f32, { [BLOCK] }> = convert_tile(values_bf16);
+        let base: i32 = block * BLOCK;
+        let base: Tile<i32, { [BLOCK] }> = base.broadcast(const_shape![BLOCK]);
+        let offsets: Tile<i32, { [BLOCK] }> = iota(const_shape![BLOCK]);
+        let indices: Tile<i32, { [BLOCK] }> = base + offsets;
+        let length: Tile<i32, { [BLOCK] }> = length.broadcast(const_shape![BLOCK]);
+        let valid: Tile<bool, { [BLOCK] }> = lt_tile(indices, length);
+        let magnitude: Tile<f32, { [BLOCK] }> = constant(1.0e30f32, const_shape![BLOCK]);
+        let zero: Tile<f32, { [BLOCK] }> = constant(0.0f32, const_shape![BLOCK]);
+        let negative_infinity: Tile<f32, { [BLOCK] }> = zero - magnitude;
+        let values: Tile<f32, { [BLOCK] }> = select(valid, values, negative_infinity);
+        let maximum: Tile<f32, { [1] }> = reduce_max(values, 0i32);
+        let maximum_scalar: f32 = tile_to_scalar(maximum.reshape(const_shape![]));
+        let maximum: Tile<f32, { [BLOCK] }> = maximum_scalar.broadcast(const_shape![BLOCK]);
+        let is_maximum: Tile<bool, { [BLOCK] }> = eq_tile(values, maximum);
+        let invalid_index: Tile<i32, { [BLOCK] }> = constant(2147483647i32, const_shape![BLOCK]);
+        let candidates: Tile<i32, { [BLOCK] }> = select(is_maximum, indices, invalid_index);
+        let winner: Tile<i32, { [1] }> = reduce_min(candidates, 0i32);
+        let winner: i32 = tile_to_scalar(winner.reshape(const_shape![]));
+        let maximum: Tile<f32, { [1] }> = scalar_to_tile(maximum_scalar).reshape(const_shape![1]);
+        let winner: Tile<i32, { [1] }> = scalar_to_tile(winner).reshape(const_shape![1]);
+        let winner: Tile<u32, { [1] }> = bitcast(winner);
+        block_max.store(maximum);
+        block_index.store(winner);
+    }
+
+    #[cutile::entry()]
+    fn argmax_reduce_bf16<const BLOCK: i32>(
+        block_max: &Tensor<f32, { [-1] }>,
+        block_index: &Tensor<u32, { [-1] }>,
+        out: &mut Tensor<u32, { [1] }>,
+        num_blocks: i32,
+    ) {
+        let maxima: Tile<f32, { [BLOCK] }> = block_max.partition(const_shape![BLOCK]).load([0i32]);
+        let indices: Tile<u32, { [BLOCK] }> =
+            block_index.partition(const_shape![BLOCK]).load([0i32]);
+        let indices: Tile<i32, { [BLOCK] }> = bitcast(indices);
+        let offsets: Tile<i32, { [BLOCK] }> = iota(const_shape![BLOCK]);
+        let num_blocks: Tile<i32, { [BLOCK] }> = num_blocks.broadcast(const_shape![BLOCK]);
+        let valid: Tile<bool, { [BLOCK] }> = lt_tile(offsets, num_blocks);
+        let magnitude: Tile<f32, { [BLOCK] }> = constant(1.0e30f32, const_shape![BLOCK]);
+        let zero: Tile<f32, { [BLOCK] }> = constant(0.0f32, const_shape![BLOCK]);
+        let negative_infinity: Tile<f32, { [BLOCK] }> = zero - magnitude;
+        let masked: Tile<f32, { [BLOCK] }> = select(valid, maxima, negative_infinity);
+        let maximum: Tile<f32, { [1] }> = reduce_max(masked, 0i32);
+        let maximum_scalar: f32 = tile_to_scalar(maximum.reshape(const_shape![]));
+        let maximum: Tile<f32, { [BLOCK] }> = maximum_scalar.broadcast(const_shape![BLOCK]);
+        let is_maximum: Tile<bool, { [BLOCK] }> = eq_tile(masked, maximum);
+        let invalid_index: Tile<i32, { [BLOCK] }> = constant(2147483647i32, const_shape![BLOCK]);
+        let candidates: Tile<i32, { [BLOCK] }> = select(is_maximum, indices, invalid_index);
+        let winner: Tile<i32, { [1] }> = reduce_min(candidates, 0i32);
+        let winner: i32 = tile_to_scalar(winner.reshape(const_shape![]));
+        let winner: Tile<i32, { [1] }> = scalar_to_tile(winner).reshape(const_shape![1]);
+        let winner: Tile<u32, { [1] }> = bitcast(winner);
+        out.store(winner);
+    }
 }
 
 #[allow(unused_imports)]
 pub(crate) use tile::{
-    add_rms_norm_bf16, causal_attention_bf16, embedding_bf16, gather_flat_kv_bf16, gather_row_bf16,
-    rms_norm_bf16, rope_kv_write_bf16, rope_q_bf16, silu_mul_bf16,
+    add_rms_norm_bf16, argmax_blocks_bf16, argmax_reduce_bf16, causal_attention_bf16,
+    embedding_bf16, gather_flat_kv_bf16, gather_row_bf16, rms_norm_bf16, rope_kv_write_bf16,
+    rope_q_bf16, silu_mul_bf16,
 };

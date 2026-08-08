@@ -283,7 +283,7 @@ mod cuda_impl {
         api,
         core::bf16,
         tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
-        tile_kernel::{PartitionOp, TileKernel},
+        tile_kernel::{PartitionOp, TileKernel, ToHostVecOp},
     };
 
     use crate::{
@@ -303,6 +303,7 @@ mod cuda_impl {
     const MLP_BLOCK: usize = 512;
     const ATTENTION_QUERY_BLOCK: usize = 1;
     const ATTENTION_KEY_BLOCK: usize = 16;
+    const ARGMAX_BLOCK: usize = 256;
 
     type Bf16Tensor = Arc<Tensor<bf16>>;
     type F32Tensor = Arc<Tensor<f32>>;
@@ -402,6 +403,12 @@ mod cuda_impl {
         execution_stats: BackendExecutionStats,
     }
 
+    enum ForwardOutput {
+        None,
+        Logits(Vec<f32>),
+        Token(u32),
+    }
+
     impl CudaLlama {
         fn load(
             model: Arc<Llama32>,
@@ -460,10 +467,16 @@ mod cuda_impl {
             current_slots: &[u32],
             context_slots: &[u32],
             return_logits: bool,
-        ) -> Result<Option<Vec<f32>>, ModelError> {
+            greedy: bool,
+        ) -> Result<ForwardOutput, ModelError> {
             if return_logits && token_ids.len() == 1 && positions[0] > 0 {
-                let output =
-                    self.decode_graph(token_ids[0], positions[0], current_slots[0], context_slots);
+                let output = self.decode_graph(
+                    token_ids[0],
+                    positions[0],
+                    current_slots[0],
+                    context_slots,
+                    greedy,
+                );
                 if output.is_ok() {
                     self.execution_stats.graph_replays += 1;
                 }
@@ -489,7 +502,7 @@ mod cuda_impl {
             current_slots: &[u32],
             context_slots: &[u32],
             return_logits: bool,
-        ) -> Result<Option<Vec<f32>>, ModelError> {
+        ) -> Result<ForwardOutput, ModelError> {
             let rows = token_ids.len();
             if rows == 0
                 || positions.len() != rows
@@ -729,7 +742,7 @@ mod cuda_impl {
             }
 
             if !return_logits {
-                return Ok(None);
+                return Ok(ForwardOutput::None);
             }
 
             let (residual, update) = pending
@@ -758,7 +771,9 @@ mod cuda_impl {
                 .to_host_vec()
                 .sync_on(stream)
                 .map_err(|error| cuda_error("copy logits to host", error))?;
-            Ok(Some(logits.into_iter().map(bf16::to_f32).collect()))
+            Ok(ForwardOutput::Logits(
+                logits.into_iter().map(bf16::to_f32).collect(),
+            ))
         }
 
         fn decode_graph(
@@ -767,7 +782,8 @@ mod cuda_impl {
             position: u32,
             current_slot: u32,
             context_slots: &[u32],
-        ) -> Result<Option<Vec<f32>>, ModelError> {
+            greedy: bool,
+        ) -> Result<ForwardOutput, ModelError> {
             if current_slot as usize >= self.capacity
                 || context_slots.is_empty()
                 || context_slots
@@ -786,15 +802,14 @@ mod cuda_impl {
                 .decode_graphs
                 .get_mut(&bucket)
                 .ok_or_else(|| ModelError::Cuda("decode graph cache insertion failed".into()))?;
-            graph
-                .forward(
-                    token_id,
-                    position,
-                    current_slot,
-                    context_slots,
-                    self.capacity as u32,
-                )
-                .map(Some)
+            graph.forward(
+                token_id,
+                position,
+                current_slot,
+                context_slots,
+                self.capacity as u32,
+                greedy,
+            )
         }
 
         fn warm_decode_graphs(&mut self) -> Result<(), ModelError> {
@@ -973,6 +988,8 @@ mod cuda_impl {
         _layers: Vec<DecodeLayerBuffers>,
         _final_hidden: Tensor<bf16>,
         _final_residual: Tensor<bf16>,
+        _argmax_block_max: Tensor<f32>,
+        _argmax_block_index: Tensor<u32>,
     }
 
     struct DecodeGraph {
@@ -984,6 +1001,7 @@ mod cuda_impl {
         context_slots: Tensor<u32>,
         attention_metadata: Tensor<i32>,
         logits: Arc<Tensor<bf16>>,
+        sampled_token: Tensor<u32>,
         context_bucket: usize,
         _storage: DecodeGraphStorage,
     }
@@ -1009,6 +1027,17 @@ mod cuda_impl {
             let mut final_hidden = zeros_bf16(&[1, cfg.hidden_size], &stream)?;
             let mut final_residual = zeros_bf16(&[1, cfg.hidden_size], &stream)?;
             let logits = Arc::new(zeros_bf16(&[1, cfg.vocab_size], &stream)?);
+            let argmax_blocks = cfg.vocab_size.div_ceil(ARGMAX_BLOCK);
+            let argmax_reduce_block = argmax_blocks.next_power_of_two();
+            let mut argmax_block_max = api::zeros::<f32>(&[argmax_blocks])
+                .sync_on(&stream)
+                .map_err(|error| cuda_error("allocate graph argmax maxima", error))?;
+            let mut argmax_block_index = api::zeros::<u32>(&[argmax_blocks])
+                .sync_on(&stream)
+                .map_err(|error| cuda_error("allocate graph argmax indices", error))?;
+            let mut sampled_token = api::zeros::<u32>(&[1])
+                .sync_on(&stream)
+                .map_err(|error| cuda_error("allocate graph sampled token", error))?;
 
             let graph = CudaGraph::scope(&stream, |scope| {
                 scope.record(
@@ -1255,7 +1284,27 @@ mod cuda_impl {
                     cfg.vocab_size,
                     1,
                     cfg.hidden_size,
-                )
+                )?;
+                let flat_logits = logits.view(&[cfg.vocab_size]).map_err(device_error)?;
+                scope.record(
+                    kernels::argmax_blocks_bf16(
+                        &flat_logits,
+                        (&mut argmax_block_max).partition([1]),
+                        (&mut argmax_block_index).partition([1]),
+                        cfg.vocab_size as i32,
+                    )
+                    .generics(vec![ARGMAX_BLOCK.to_string()]),
+                )?;
+                scope.record(
+                    kernels::argmax_reduce_bf16(
+                        &argmax_block_max,
+                        &argmax_block_index,
+                        (&mut sampled_token).partition([1]),
+                        argmax_blocks as i32,
+                    )
+                    .generics(vec![argmax_reduce_block.to_string()]),
+                )?;
+                Ok(())
             })
             .map_err(|error| cuda_error("capture decode CUDA graph", error))?;
 
@@ -1268,12 +1317,15 @@ mod cuda_impl {
                 context_slots,
                 attention_metadata,
                 logits,
+                sampled_token,
                 context_bucket,
                 _storage: DecodeGraphStorage {
                     _embedding_hidden: embedding_hidden,
                     _layers: layers,
                     _final_hidden: final_hidden,
                     _final_residual: final_residual,
+                    _argmax_block_max: argmax_block_max,
+                    _argmax_block_index: argmax_block_index,
                 },
             })
         }
@@ -1285,7 +1337,8 @@ mod cuda_impl {
             current_slot: u32,
             context_slots: &[u32],
             sentinel_slot: u32,
-        ) -> Result<Vec<f32>, ModelError> {
+            greedy: bool,
+        ) -> Result<ForwardOutput, ModelError> {
             let token_ids = copy_u32(&[token_id], &self.stream, "decode graph token")?;
             let positions = copy_u32(&[position], &self.stream, "decode graph position")?;
             let current_slots = copy_u32(&[current_slot], &self.stream, "decode graph KV slot")?;
@@ -1326,13 +1379,27 @@ mod cuda_impl {
                 .launch()
                 .sync_on(&self.stream)
                 .map_err(|error| cuda_error("replay decode CUDA graph", error))?;
+            if greedy {
+                let sampled: Vec<u32> = self
+                    .sampled_token
+                    .dup()
+                    .to_host_vec()
+                    .sync_on(&self.stream)
+                    .map_err(|error| cuda_error("copy graph sampled token to host", error))?;
+                let token = sampled.first().copied().ok_or_else(|| {
+                    ModelError::Cuda("graph argmax returned no sampled token".into())
+                })?;
+                return Ok(ForwardOutput::Token(token));
+            }
             let logits: Vec<bf16> = self
                 .logits
                 .clone()
                 .to_host_vec()
                 .sync_on(&self.stream)
                 .map_err(|error| cuda_error("copy graph logits to host", error))?;
-            Ok(logits.into_iter().map(bf16::to_f32).collect())
+            Ok(ForwardOutput::Logits(
+                logits.into_iter().map(bf16::to_f32).collect(),
+            ))
         }
     }
 
@@ -1463,7 +1530,7 @@ mod cuda_impl {
                     .collect::<Result<_, _>>()?;
                 request.slots.extend_from_slice(&work.kv_slots);
 
-                let logits = self
+                let forward = self
                     .runtime
                     .forward(
                         &token_ids,
@@ -1471,20 +1538,26 @@ mod cuda_impl {
                         &work.kv_slots,
                         &request.slots,
                         work.sample,
+                        request.temperature == 0.0,
                     )
                     .map_err(execution)?;
                 if !work.sample {
                     continue;
                 }
-                let logits = logits.ok_or_else(|| {
-                    BackendError::Execution("sampled forward omitted logits".into())
-                })?;
-                let token_id = sample_token(
-                    &logits,
-                    request.temperature,
-                    request.top_p,
-                    &mut request.rng,
-                )?;
+                let token_id = match forward {
+                    ForwardOutput::Token(token_id) => token_id,
+                    ForwardOutput::Logits(logits) => sample_token(
+                        &logits,
+                        request.temperature,
+                        request.top_p,
+                        &mut request.rng,
+                    )?,
+                    ForwardOutput::None => {
+                        return Err(BackendError::Execution(
+                            "sampled forward omitted logits and token".into(),
+                        ));
+                    }
+                };
                 request.generated.push(token_id);
                 let text = request.decoder.push(token_id).map_err(execution)?;
                 outputs.push(StepOutput {
@@ -1679,9 +1752,12 @@ mod cuda_impl {
             .map(|index| (capacity - 1 - index) as u32)
             .collect();
         let mut runtime = CudaLlama::load(Arc::new(model), device_id, capacity)?;
-        let logits = runtime
-            .forward(&token_ids, &positions, &slots, &slots, true)?
-            .ok_or_else(|| ModelError::Cuda("forward omitted requested logits".into()))?;
+        let logits = match runtime.forward(&token_ids, &positions, &slots, &slots, true, false)? {
+            ForwardOutput::Logits(logits) => logits,
+            ForwardOutput::None | ForwardOutput::Token(_) => {
+                return Err(ModelError::Cuda("forward omitted requested logits".into()));
+            }
+        };
         let mut ranked: Vec<_> = logits
             .iter()
             .enumerate()
