@@ -266,21 +266,14 @@ fn validate_transformer_primitives(
         .generics(vec!["64".into()])
         .sync_on(stream)
         .map_err(|error| kernel_error("gather flat value cache", error))?;
+    let key = key.unpartition();
+    let value = value.unpartition();
     let attention = api::zeros::<bf16>(&[1, 4, 64])
         .partition([1, 1, 64])
         .sync_on(stream)
         .map_err(|error| kernel_error("allocate attention output", error))?;
     let (_, _, _, attention, _, _, _, _) = unsafe {
-        kernels::causal_attention_bf16(
-            &rotated,
-            &key.unpartition(),
-            &value.unpartition(),
-            attention,
-            0.125,
-            2,
-            2,
-            0,
-        )
+        kernels::causal_attention_bf16(&rotated, &key, &value, attention, 0.125, 2, 2, 0)
     }
     .generics(vec!["1".into(), "16".into(), "64".into()])
     .sync_on(stream)
