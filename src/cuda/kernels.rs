@@ -15,7 +15,7 @@ mod tile {
         let block = pid.1;
         let token = token_ids.partition(const_shape![1]).load([row]);
         let token: Tile<i32, { [1] }> = bitcast(token);
-        let token = tile_to_scalar(token.reshape(const_shape![]));
+        let token: i32 = tile_to_scalar(token.reshape(const_shape![]));
         let table = table.partition(const_shape![1, BLOCK]);
         out.store(table.load([token, block]));
     }
@@ -126,7 +126,7 @@ mod tile {
         let head = pid.1;
         let position = positions.partition(const_shape![1]).load([row]);
         let position: Tile<i32, { [1] }> = bitcast(position);
-        let position = tile_to_scalar(position.reshape(const_shape![]));
+        let position: i32 = tile_to_scalar(position.reshape(const_shape![]));
         let input = input.partition(const_shape![1, 1, HALF]);
         let lo: Tile<f32, { [1, HALF] }> =
             convert_tile(input.load([row, head, 0i32]).reshape(const_shape![1, HALF]));
@@ -167,10 +167,10 @@ mod tile {
         let head = pid.1;
         let position = positions.partition(const_shape![1]).load([row]);
         let position: Tile<i32, { [1] }> = bitcast(position);
-        let position = tile_to_scalar(position.reshape(const_shape![]));
+        let position: i32 = tile_to_scalar(position.reshape(const_shape![]));
         let slot = slots.partition(const_shape![1]).load([row]);
         let slot: Tile<i32, { [1] }> = bitcast(slot);
-        let slot = tile_to_scalar(slot.reshape(const_shape![]));
+        let slot: i32 = tile_to_scalar(slot.reshape(const_shape![]));
 
         let key = key.partition(const_shape![1, 1, HALF]);
         let lo: Tile<f32, { [1, HALF] }> =
@@ -233,7 +233,7 @@ mod tile {
         let position = pid.1;
         let slot = slots.partition(const_shape![1]).load([position]);
         let slot: Tile<i32, { [1] }> = bitcast(slot);
-        let slot = tile_to_scalar(slot.reshape(const_shape![]));
+        let slot: i32 = tile_to_scalar(slot.reshape(const_shape![]));
         let cache = cache.partition(const_shape![1, 1, D]);
         out.store(cache.load([slot, head, 0i32]));
     }
