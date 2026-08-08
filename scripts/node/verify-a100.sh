@@ -29,6 +29,8 @@ cargo +"${TESSERACT_RUST_TOOLCHAIN}" test --all-targets
 cargo +"${TESSERACT_RUST_TOOLCHAIN}" clippy --all-targets -- -D warnings
 cargo +"${TESSERACT_RUST_TOOLCHAIN}" run --release --bin model-check -- \
   --model-path "${TESSERACT_MODEL_PATH}"
+cargo +"${TESSERACT_RUST_TOOLCHAIN}" run --release --features cuda \
+  --bin cuda-check
 
 mkdir -p "$(dirname -- "${TESSERACT_CUTILE_PATH}")"
 if [[ ! -d "${TESSERACT_CUTILE_PATH}/.git" ]]; then

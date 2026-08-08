@@ -25,14 +25,24 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1", features = ["serde", "v7"] }
 
+cuda-async = { git = "https://github.com/NVlabs/cutile-rs.git", rev = "9fe5756f861bc40f098e6981ac2dff6cf5d3d0e4", optional = true }
+cuda-core = { git = "https://github.com/NVlabs/cutile-rs.git", rev = "9fe5756f861bc40f098e6981ac2dff6cf5d3d0e4", optional = true }
+cutile = { git = "https://github.com/NVlabs/cutile-rs.git", rev = "9fe5756f861bc40f098e6981ac2dff6cf5d3d0e4", optional = true }
+
 [dev-dependencies]
 http-body-util = "0.1"
 tempfile = "3"
 
 [features]
 default = []
+cuda = ["dep:cuda-async", "dep:cuda-core", "dep:cutile"]
 test-backend = []
 
 [[bin]]
 name = "model-check"
 path = "src/bin/model-check.rs"
+
+[[bin]]
+name = "cuda-check"
+path = "src/bin/cuda-check.rs"
+required-features = ["cuda"]

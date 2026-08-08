@@ -36,6 +36,10 @@ Bootstrap is idempotent and installs:
 - Python venv support and an isolated Hugging Face CLI;
 - `meta-llama/Llama-3.2-1B-Instruct` under `/home/ubuntu/models`.
 
+Verification compiles and executes both Tesseract's own BF16 cuTile kernel and
+the pinned upstream cuTile hello-world kernel. This distinguishes an upstream
+toolchain installation check from a project-owned BF16 execution check.
+
 Run all host/model/cuTile gates afterward:
 
 ```bash
