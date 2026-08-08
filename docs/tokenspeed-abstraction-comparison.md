@@ -134,7 +134,7 @@ changing the hot-path ownership model.
 ## Models and layer composition
 
 TokenSpeed's dense Llama implementation is 395 lines, versus the current
-2,904-line `src/model/llama_3_2.rs`, because generic execution, cache, graph,
+2,712-line `src/model/llama_3_2.rs`, because generic execution, cache, graph,
 sampling, and common transformer mechanics live elsewhere. Llama defines its
 MLP, projections/RoPE/attention computation, layer resolvers, and weight mapping
 (`python/tokenspeed/runtime/models/llama.py:63`, `:115`, and `:290`). Shared
@@ -310,6 +310,29 @@ conformance suites.
    tied together by ticket IDs and reclamation epochs.
 9. Add shrinking reference-model properties for scheduler/cache behavior and a
    reusable numerical/graph conformance suite for every backend implementation.
+
+## Consequences for the current implementation
+
+The source comparison changes the immediate implementation plan in one
+important way: merely moving Llama's block-size constants into a `KernelPlan`
+would not implement the boundary described above. A real first plan must name
+the selected implementation of each semantic operation and carry the exact
+compile-time arguments used by that implementation.
+
+| Current code | TokenSpeed evidence | Tesseract next state |
+| --- | --- | --- |
+| `HIDDEN_BLOCK`, `MLP_BLOCK`, `ATTENTION_KEY_BLOCK`, and `ARGMAX_BLOCK` live beside Llama | selection is per family/mode/format/capability/traits, not one backend-wide choice | typed plans for embedding/norm/activation, GEMM, RoPE/KV write, attention by forward mode, and sampling |
+| `KernelImplementation::{CutileBf16,CublasBf16}` identifies only a provider | `KernelSpec` has stable identity, solution, features, formats, traits, and priority | every selected leaf has a stable descriptor and its validated geometry; the aggregate descriptor is inspectable |
+| one attention kernel happens to serve eager mixed/prefill and captured decode | TokenSpeed exposes distinct extend/decode paths even when a backend implements both | an attention plan records prepared prefill/mixed and decode leaves independently, with sharing explicit rather than assumed |
+| `AttentionBackend` currently exposes only `layer_state`, eager enqueue, and decode recording | TokenSpeed backends own cache attachment, eager metadata, capture state, replay update, and mode capabilities | evolve the sealed trait toward typed preparation and capability declarations as those states leave Llama; do not fabricate empty hooks now |
+| `CudaExecutor` implements tickets over one synchronous completion slot | TokenSpeed admits one overlapped scheduling step and tracks pending results | retain the ticket API and later replace only completion storage with event-backed multi-flight state |
+| scheduler properties cover batch construction and randomized traces separately | TokenSpeed's strongest cache invariant test is fixed-seed and cannot shrink | build one small reference-state machine spanning scheduling, completion epochs, cancellation, and cache ownership |
+
+This also establishes a rejection rule for the catalog: it may reject a model
+geometry only because no registered implementation satisfies a documented
+requirement. It must not infer restrictions from a convenient tile constant.
+Padding, masking, divisibility, capture legality, and fallback behavior belong
+to the selected leaf's typed capability contract.
 
 ## What to copy and what not to copy
 

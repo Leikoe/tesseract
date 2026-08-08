@@ -330,6 +330,10 @@ mod cuda_impl {
             batch::CudaBatch,
             cublas,
             executor::{CudaExecutor, ModelProgram, ProgramOutput},
+            kernel_plan::{
+                AttentionKernelPlan, ComputeCapability, DecoderKernelRequirement, KernelCatalog,
+                KernelPlan,
+            },
             kernels,
         },
         engine::{ExecutionError, ExecutionStats, ModelExecutor, TokenId},
@@ -340,11 +344,6 @@ mod cuda_impl {
         CudaForwardReport, CudaModelReport, CudaTokenLogit, Llama32, ModelError, WeightStore,
         execution_bucket, warmup_logical_sizes,
     };
-
-    const HIDDEN_BLOCK: usize = 512;
-    const MLP_BLOCK: usize = 512;
-    const ATTENTION_KEY_BLOCK: usize = 16;
-    const ARGMAX_BLOCK: usize = 256;
 
     type Bf16Tensor = Arc<Tensor<bf16>>;
     type F32Tensor = Arc<Tensor<f32>>;
@@ -436,6 +435,7 @@ mod cuda_impl {
         stream: Arc<Stream>,
         weights: RuntimeWeights,
         attention: A,
+        kernel_plan: KernelPlan,
         capacity: usize,
         max_decode_batch_bucket: usize,
         max_query_bucket: usize,
@@ -454,8 +454,7 @@ mod cuda_impl {
         cosine: Arc<Tensor<f32>>,
         sine: Arc<Tensor<f32>>,
         num_attention_heads: usize,
-        num_key_value_heads: usize,
-        head_dim: usize,
+        plan: AttentionKernelPlan,
     }
 
     enum ForwardOutput {
@@ -521,6 +520,7 @@ mod cuda_impl {
             scratch_slots: usize,
             cosine: Arc<Tensor<f32>>,
             sine: Arc<Tensor<f32>>,
+            plan: AttentionKernelPlan,
         ) -> Result<Self, ModelError> {
             let cache_shape = [
                 capacity
@@ -558,8 +558,7 @@ mod cuda_impl {
                 cosine,
                 sine,
                 num_attention_heads: config.num_attention_heads,
-                num_key_value_heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
+                plan,
             })
         }
     }
@@ -576,12 +575,13 @@ mod cuda_impl {
 
         fn enqueue_eager(&self, input: EagerAttention<'_>) -> Result<Tensor<bf16>, Self::Error> {
             let state = self.layer_state(input.layer)?;
+            let head_dim = self.plan.head_dim.get();
             let rotated_query = output_buffer_async::<bf16>(
-                &[input.rows, self.num_attention_heads, self.head_dim],
+                &[input.rows, self.num_attention_heads, head_dim],
                 input.stream,
                 "rotated query",
             )?
-            .partition([1, 1, self.head_dim]);
+            .partition([1, 1, head_dim]);
             let (_, _, _, _, rotated_query) = enqueue(
                 kernels::rope_q_bf16(
                     input.query,
@@ -591,8 +591,8 @@ mod cuda_impl {
                     rotated_query,
                 )
                 .generics(vec![
-                    self.head_dim.to_string(),
-                    (self.head_dim / 2).to_string(),
+                    head_dim.to_string(),
+                    self.plan.rope.rotary_dim.get().to_string(),
                 ]),
                 input.stream,
                 "query RoPE",
@@ -600,11 +600,11 @@ mod cuda_impl {
             let rotated_query = Arc::new(rotated_query.unpartition());
 
             let rotated_key = output_buffer_async::<bf16>(
-                &[input.rows, self.num_key_value_heads, self.head_dim],
+                &[input.rows, self.plan.kv_heads.get(), head_dim],
                 input.stream,
                 "rotated key",
             )?
-            .partition([1, 1, self.head_dim]);
+            .partition([1, 1, head_dim]);
             let (_, _, _, _, _, _, _, _, _rotated_key) = enqueue(
                 unsafe {
                     kernels::rope_kv_write_bf16(
@@ -620,20 +620,20 @@ mod cuda_impl {
                     )
                 }
                 .generics(vec![
-                    self.head_dim.to_string(),
-                    (self.head_dim / 2).to_string(),
-                    self.num_key_value_heads.to_string(),
+                    head_dim.to_string(),
+                    self.plan.rope.rotary_dim.get().to_string(),
+                    self.plan.kv_heads.get().to_string(),
                 ]),
                 input.stream,
                 "key RoPE and flat KV write",
             )?;
 
             let attention = output_buffer_async::<bf16>(
-                &[input.rows, self.num_attention_heads, self.head_dim],
+                &[input.rows, self.num_attention_heads, head_dim],
                 input.stream,
                 "ragged attention output",
             )?
-            .partition([1, 1, self.head_dim]);
+            .partition([1, 1, head_dim]);
             let (_, _, _, _, _, _, attention, _, _) = enqueue(
                 unsafe {
                     kernels::ragged_attention_bf16(
@@ -644,14 +644,14 @@ mod cuda_impl {
                         state.key_cache.device_pointer(),
                         state.value_cache.device_pointer(),
                         attention,
-                        1.0 / (self.head_dim as f32).sqrt(),
-                        (self.num_attention_heads / self.num_key_value_heads) as i32,
+                        1.0 / (head_dim as f32).sqrt(),
+                        self.plan.query_heads_per_kv.get() as i32,
                     )
                 }
                 .generics(vec![
-                    ATTENTION_KEY_BLOCK.to_string(),
-                    self.head_dim.to_string(),
-                    self.num_key_value_heads.to_string(),
+                    self.plan.prefill_mixed.key_block.get().to_string(),
+                    head_dim.to_string(),
+                    self.plan.kv_heads.get().to_string(),
                 ]),
                 input.stream,
                 "ragged flat-KV attention",
@@ -661,6 +661,7 @@ mod cuda_impl {
 
         fn record_decode(&self, input: DecodeGraphAttention<'_>) -> Result<(), Self::Error> {
             let state = self.layer_state(input.layer)?;
+            let head_dim = self.plan.head_dim.get();
             input
                 .scope
                 .record(
@@ -669,11 +670,11 @@ mod cuda_impl {
                         input.positions,
                         &self.cosine,
                         &self.sine,
-                        input.rotated_query.partition([1, 1, self.head_dim]),
+                        input.rotated_query.partition([1, 1, head_dim]),
                     )
                     .generics(vec![
-                        self.head_dim.to_string(),
-                        (self.head_dim / 2).to_string(),
+                        head_dim.to_string(),
+                        self.plan.rope.rotary_dim.get().to_string(),
                     ]),
                 )
                 .map_err(|error| cuda_error("record query RoPE", error))?;
@@ -690,13 +691,13 @@ mod cuda_impl {
                             &self.sine,
                             state.key_cache.device_pointer(),
                             state.value_cache.device_pointer(),
-                            input.rotated_key.partition([1, 1, self.head_dim]),
+                            input.rotated_key.partition([1, 1, head_dim]),
                         )
                     }
                     .generics(vec![
-                        self.head_dim.to_string(),
-                        (self.head_dim / 2).to_string(),
-                        self.num_key_value_heads.to_string(),
+                        head_dim.to_string(),
+                        self.plan.rope.rotary_dim.get().to_string(),
+                        self.plan.kv_heads.get().to_string(),
                     ]),
                 )
                 .map_err(|error| cuda_error("record key RoPE and flat KV write", error))?;
@@ -711,15 +712,15 @@ mod cuda_impl {
                             input.context_lengths,
                             state.key_cache.device_pointer(),
                             state.value_cache.device_pointer(),
-                            input.attention.partition([1, 1, self.head_dim]),
-                            1.0 / (self.head_dim as f32).sqrt(),
-                            (self.num_attention_heads / self.num_key_value_heads) as i32,
+                            input.attention.partition([1, 1, head_dim]),
+                            1.0 / (head_dim as f32).sqrt(),
+                            self.plan.query_heads_per_kv.get() as i32,
                         )
                     }
                     .generics(vec![
-                        ATTENTION_KEY_BLOCK.to_string(),
-                        self.head_dim.to_string(),
-                        self.num_key_value_heads.to_string(),
+                        self.plan.decode.key_block.get().to_string(),
+                        head_dim.to_string(),
+                        self.plan.kv_heads.get().to_string(),
                     ]),
                 )
                 .map_err(|error| cuda_error("record ragged flat-KV attention", error))?;
@@ -735,6 +736,22 @@ mod cuda_impl {
             max_running: usize,
             max_batch_tokens: usize,
         ) -> Result<Self, ModelError> {
+            let compute_capability = ComputeCapability::detect(device_id)
+                .map_err(|error| ModelError::Cuda(error.to_string()))?;
+            let kernel_plan = KernelCatalog
+                .resolve(
+                    compute_capability,
+                    DecoderKernelRequirement {
+                        hidden_size: model.config.hidden_size,
+                        intermediate_size: model.config.intermediate_size,
+                        head_dim: model.config.head_dim,
+                        attention_heads: model.config.num_attention_heads,
+                        kv_heads: model.config.num_key_value_heads,
+                        vocab_size: model.config.vocab_size,
+                    },
+                )
+                .map_err(|error| ModelError::Cuda(error.to_string()))?;
+            tracing::info!(plan = %kernel_plan.diagnostic_summary(), "resolved CUDA kernel plan");
             let device = Device::new(device_id).map_err(|error| {
                 ModelError::Cuda(format!("initialize device {device_id}: {error:?}"))
             })?;
@@ -743,9 +760,13 @@ mod cuda_impl {
                 .map_err(|error| ModelError::Cuda(format!("create stream: {error:?}")))?;
             let weights = RuntimeWeights::load(&model, &stream)?;
             let (cosine, sine) = rope_tables(&model.config, &stream)?;
-            let max_decode_batch_bucket = execution_bucket(max_running, 1)
+            let max_decode_batch_bucket = kernel_plan
+                .shapes
+                .query_bucket(max_running)
                 .ok_or_else(|| ModelError::Cuda("max running batch bucket overflowed".into()))?;
-            let max_query_bucket = execution_bucket(max_batch_tokens, 1)
+            let max_query_bucket = kernel_plan
+                .shapes
+                .query_bucket(max_batch_tokens)
                 .ok_or_else(|| ModelError::Cuda("max query bucket overflowed".into()))?;
             let attention = DirectFlatKvAttention::load(
                 &model.config,
@@ -754,12 +775,14 @@ mod cuda_impl {
                 max_decode_batch_bucket.max(max_query_bucket),
                 cosine,
                 sine,
+                kernel_plan.attention,
             )?;
             Ok(Self {
                 model,
                 stream,
                 weights,
                 attention,
+                kernel_plan,
                 capacity,
                 max_decode_batch_bucket,
                 max_query_bucket,
@@ -781,7 +804,10 @@ mod cuda_impl {
             greedy: bool,
         ) -> Result<ForwardOutput, ModelError> {
             if return_logits && token_ids.len() == 1 && positions[0] > 0 {
-                let context_bucket = execution_bucket(context_slots.len(), 16)
+                let context_bucket = self
+                    .kernel_plan
+                    .shapes
+                    .context_bucket(context_slots.len())
                     .ok_or_else(|| ModelError::Cuda("decode context bucket overflowed".into()))?;
                 let key = (1, context_bucket);
                 if !self.failed_decode_graphs.contains(&key) {
@@ -861,11 +887,16 @@ mod cuda_impl {
             current_slots: &[u32],
             contexts: &[Vec<u32>],
         ) -> Result<Vec<u32>, ModelError> {
-            let batch_bucket = execution_bucket(token_ids.len(), 1)
+            let batch_bucket = self
+                .kernel_plan
+                .shapes
+                .query_bucket(token_ids.len())
                 .ok_or_else(|| ModelError::Cuda("decode batch bucket overflowed".into()))?;
-            let context_bucket =
-                execution_bucket(contexts.iter().map(Vec::len).max().unwrap_or(0), 16)
-                    .ok_or_else(|| ModelError::Cuda("decode context bucket overflowed".into()))?;
+            let context_bucket = self
+                .kernel_plan
+                .shapes
+                .context_bucket(contexts.iter().map(Vec::len).max().unwrap_or(0))
+                .ok_or_else(|| ModelError::Cuda("decode context bucket overflowed".into()))?;
             let key = (batch_bucket, context_bucket);
             let request_indices: Vec<u32> = (0..token_ids.len())
                 .map(|index| {
@@ -948,7 +979,10 @@ mod cuda_impl {
             let logical_rows = token_ids.len();
             let cfg = &self.model.config;
             let stream = &self.stream;
-            let rows = execution_bucket(logical_rows, 1)
+            let rows = self
+                .kernel_plan
+                .shapes
+                .query_bucket(logical_rows)
                 .ok_or_else(|| ModelError::Cuda("query token bucket size overflowed".into()))?;
             if rows > self.max_query_bucket {
                 return Err(ModelError::Cuda(format!(
@@ -978,7 +1012,10 @@ mod cuda_impl {
             let current_slots = copy_u32(&current_slots, stream, "current KV slots")?;
             let request_indices = copy_u32(&request_indices, stream, "request indices")?;
             let context_lengths = copy_i32(&context_lengths, stream, "query context lengths")?;
-            let context_bucket = execution_bucket(self.capacity, 16)
+            let context_bucket = self
+                .kernel_plan
+                .shapes
+                .context_bucket(self.capacity)
                 .ok_or_else(|| ModelError::Cuda("context bucket size overflowed".into()))?;
             let request_bucket = self.max_decode_batch_bucket;
             if contexts.len() > request_bucket {
@@ -1007,10 +1044,14 @@ mod cuda_impl {
 
             let hidden =
                 output_buffer_async::<bf16>(&[rows, cfg.hidden_size], stream, "embedding output")?
-                    .partition([1, HIDDEN_BLOCK]);
+                    .partition([1, self.kernel_plan.dense.embedding.block.get()]);
             let (_, _, hidden) = enqueue(
-                kernels::embedding_bf16(&token_ids, &*self.weights.embedding, hidden)
-                    .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()]),
+                kernels::embedding_bf16(&token_ids, &*self.weights.embedding, hidden).generics(
+                    vec![
+                        cfg.hidden_size.to_string(),
+                        self.kernel_plan.dense.embedding.block.get().to_string(),
+                    ],
+                ),
                 stream,
                 "embedding",
             )?;
@@ -1117,10 +1158,11 @@ mod cuda_impl {
                     stream,
                     "MLP activation",
                 )?
-                .partition([1, MLP_BLOCK]);
+                .partition([1, self.kernel_plan.dense.silu_mul.block.get()]);
                 let (_, _, activated) = enqueue(
-                    kernels::silu_mul_bf16(&gate, &up, activated)
-                        .generics(vec![MLP_BLOCK.to_string()]),
+                    kernels::silu_mul_bf16(&gate, &up, activated).generics(vec![
+                        self.kernel_plan.dense.silu_mul.block.get().to_string(),
+                    ]),
                     stream,
                     "SiLU gated activation",
                 )?;
@@ -1152,7 +1194,10 @@ mod cuda_impl {
             let (final_hidden, _final_residual) =
                 self.add_rms_norm(&residual, &update, &self.weights.final_norm, rows)?;
             let samples = sample_rows.len();
-            let sample_bucket = execution_bucket(samples, 1)
+            let sample_bucket = self
+                .kernel_plan
+                .shapes
+                .query_bucket(samples)
                 .ok_or_else(|| ModelError::Cuda("sample row bucket size overflowed".into()))?;
             let mut padded_sample_rows = sample_rows.to_vec();
             padded_sample_rows.resize(sample_bucket, sample_rows[0]);
@@ -1162,7 +1207,7 @@ mod cuda_impl {
                 stream,
                 "sampled hidden states",
             )?
-            .partition([1, HIDDEN_BLOCK]);
+            .partition([1, self.kernel_plan.dense.gather_rows.block.get()]);
             let (_, _, sampled_hidden) = enqueue(
                 unsafe {
                     kernels::gather_rows_bf16(
@@ -1171,7 +1216,10 @@ mod cuda_impl {
                         sampled_hidden,
                     )
                 }
-                .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()]),
+                .generics(vec![
+                    cfg.hidden_size.to_string(),
+                    self.kernel_plan.dense.gather_rows.block.get().to_string(),
+                ]),
                 stream,
                 "gather sampled hidden states",
             )?;
@@ -1185,8 +1233,12 @@ mod cuda_impl {
                 "ragged language-model head",
             )?;
             if greedy {
-                let argmax_blocks = cfg.vocab_size.div_ceil(ARGMAX_BLOCK);
-                let reduce_block = execution_bucket(argmax_blocks, 1)
+                let argmax_block = self.kernel_plan.sampling.argmax.block.get();
+                let argmax_blocks = cfg.vocab_size.div_ceil(argmax_block);
+                let reduce_block = self
+                    .kernel_plan
+                    .shapes
+                    .query_bucket(argmax_blocks)
                     .ok_or_else(|| ModelError::Cuda("argmax reduce bucket overflowed".into()))?;
                 let block_max = output_buffer_async::<f32>(
                     &[sample_bucket, argmax_blocks],
@@ -1207,7 +1259,7 @@ mod cuda_impl {
                         block_index,
                         cfg.vocab_size as i32,
                     )
-                    .generics(vec![ARGMAX_BLOCK.to_string()]),
+                    .generics(vec![argmax_block.to_string()]),
                     stream,
                     "ragged logits argmax blocks",
                 )?;
@@ -1295,13 +1347,17 @@ mod cuda_impl {
             {
                 return Err(ModelError::Cuda("invalid decode graph metadata".into()));
             }
-            let batch_bucket = execution_bucket(batch_size, 1)
+            let batch_bucket = self
+                .kernel_plan
+                .shapes
+                .query_bucket(batch_size)
                 .filter(|bucket| *bucket <= self.max_decode_batch_bucket)
                 .ok_or_else(|| ModelError::Cuda("decode graph batch bucket overflowed".into()))?;
-            let context_bucket =
-                execution_bucket(contexts.iter().map(Vec::len).max().unwrap_or(0), 16).ok_or_else(
-                    || ModelError::Cuda("decode graph context bucket overflowed".into()),
-                )?;
+            let context_bucket = self
+                .kernel_plan
+                .shapes
+                .context_bucket(contexts.iter().map(Vec::len).max().unwrap_or(0))
+                .ok_or_else(|| ModelError::Cuda("decode graph context bucket overflowed".into()))?;
             let key = (batch_bucket, context_bucket);
             if !self.decode_graphs.contains_key(&key) {
                 let graph = DecodeGraph::capture(self, batch_bucket, context_bucket)?;
@@ -1336,14 +1392,20 @@ mod cuda_impl {
                 .min(self.capacity)
                 .min(self.model.config.max_position_embeddings);
             let max_logical_samples = max_running.min(self.capacity);
-            let max_sample_bucket = execution_bucket(max_logical_samples, 1)
+            let max_sample_bucket = self
+                .kernel_plan
+                .shapes
+                .query_bucket(max_logical_samples)
                 .ok_or_else(|| ModelError::Cuda("sample warmup bucket overflowed".into()))?;
             let decode_batch_warmup_sizes = warmup_logical_sizes(max_logical_samples, 1)
                 .ok_or_else(|| ModelError::Cuda("decode batch warmup sizes overflowed".into()))?;
             let query_warmup_sizes = warmup_logical_sizes(max_logical_queries, 1)
                 .ok_or_else(|| ModelError::Cuda("query warmup sizes overflowed".into()))?;
             for logical_queries in query_warmup_sizes {
-                let query_bucket = execution_bucket(logical_queries, 1)
+                let query_bucket = self
+                    .kernel_plan
+                    .shapes
+                    .query_bucket(logical_queries)
                     .ok_or_else(|| ModelError::Cuda("query warmup bucket overflowed".into()))?;
                 let token_ids = vec![self.model.config.bos_token_id; logical_queries];
                 let positions = vec![0; logical_queries];
@@ -1391,7 +1453,10 @@ mod cuda_impl {
             let context_warmup_sizes = warmup_logical_sizes(self.capacity, 16)
                 .ok_or_else(|| ModelError::Cuda("context warmup sizes overflowed".into()))?;
             for logical_context in context_warmup_sizes {
-                let bucket = execution_bucket(logical_context, 16)
+                let bucket = self
+                    .kernel_plan
+                    .shapes
+                    .context_bucket(logical_context)
                     .ok_or_else(|| ModelError::Cuda("context warmup bucket overflowed".into()))?;
                 // Compile every shape and initialize the cuBLAS handle before
                 // capture. Repeating slot zero is safe during warmup and is
@@ -1410,9 +1475,13 @@ mod cuda_impl {
                     true,
                 )?;
                 for logical_batch in &decode_batch_warmup_sizes {
-                    let batch_bucket = execution_bucket(*logical_batch, 1).ok_or_else(|| {
-                        ModelError::Cuda("decode batch warmup bucket overflowed".into())
-                    })?;
+                    let batch_bucket = self
+                        .kernel_plan
+                        .shapes
+                        .query_bucket(*logical_batch)
+                        .ok_or_else(|| {
+                            ModelError::Cuda("decode batch warmup bucket overflowed".into())
+                        })?;
                     let mut graph = DecodeGraph::capture(self, batch_bucket, bucket)?;
                     // Capture records work but does not pay every first-launch
                     // cost. Replay each graph once before readiness using one
@@ -1489,7 +1558,7 @@ mod cuda_impl {
                 }
                 .generics(vec![
                     self.model.config.hidden_size.to_string(),
-                    HIDDEN_BLOCK.to_string(),
+                    self.kernel_plan.dense.rms_norm.block.get().to_string(),
                 ]),
                 &self.stream,
                 "RMSNorm",
@@ -1529,7 +1598,7 @@ mod cuda_impl {
                 }
                 .generics(vec![
                     self.model.config.hidden_size.to_string(),
-                    HIDDEN_BLOCK.to_string(),
+                    self.kernel_plan.dense.add_rms_norm.block.get().to_string(),
                 ]),
                 &self.stream,
                 "fused residual RMSNorm",
@@ -1661,8 +1730,16 @@ mod cuda_impl {
             let mut final_hidden = output_bf16(&[batch_size, cfg.hidden_size], &stream)?;
             let mut final_residual = output_bf16(&[batch_size, cfg.hidden_size], &stream)?;
             let logits = Arc::new(output_bf16(&[batch_size, cfg.vocab_size], &stream)?);
-            let argmax_blocks = cfg.vocab_size.div_ceil(ARGMAX_BLOCK);
-            let argmax_reduce_block = execution_bucket(argmax_blocks, 1)
+            let hidden_block = runtime.kernel_plan.dense.embedding.block.get();
+            let rms_norm_block = runtime.kernel_plan.dense.rms_norm.block.get();
+            let add_rms_norm_block = runtime.kernel_plan.dense.add_rms_norm.block.get();
+            let mlp_block = runtime.kernel_plan.dense.silu_mul.block.get();
+            let argmax_block = runtime.kernel_plan.sampling.argmax.block.get();
+            let argmax_blocks = cfg.vocab_size.div_ceil(argmax_block);
+            let argmax_reduce_block = runtime
+                .kernel_plan
+                .shapes
+                .query_bucket(argmax_blocks)
                 .ok_or_else(|| ModelError::Cuda("graph argmax bucket overflowed".into()))?;
             let mut argmax_block_max =
                 output_buffer::<f32>(&[batch_size, argmax_blocks], &stream, "graph argmax maxima")?;
@@ -1679,9 +1756,9 @@ mod cuda_impl {
                     kernels::embedding_bf16(
                         &token_ids,
                         &runtime.weights.embedding,
-                        (&mut embedding_hidden).partition([1, HIDDEN_BLOCK]),
+                        (&mut embedding_hidden).partition([1, hidden_block]),
                     )
-                    .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()]),
+                    .generics(vec![cfg.hidden_size.to_string(), hidden_block.to_string()]),
                 )?;
 
                 for layer_index in 0..cfg.num_hidden_layers {
@@ -1696,7 +1773,10 @@ mod cuda_impl {
                                     cfg.rms_norm_eps,
                                 )
                             }
-                            .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()]),
+                            .generics(vec![
+                                cfg.hidden_size.to_string(),
+                                rms_norm_block.to_string(),
+                            ]),
                         )?;
                     } else {
                         let (previous, current) = layers.split_at_mut(layer_index);
@@ -1713,7 +1793,10 @@ mod cuda_impl {
                                     cfg.rms_norm_eps,
                                 )
                             }
-                            .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()]),
+                            .generics(vec![
+                                cfg.hidden_size.to_string(),
+                                add_rms_norm_block.to_string(),
+                            ]),
                         )?;
                     }
 
@@ -1806,7 +1889,10 @@ mod cuda_impl {
                                 cfg.rms_norm_eps,
                             )
                         }
-                        .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()]),
+                        .generics(vec![
+                            cfg.hidden_size.to_string(),
+                            add_rms_norm_block.to_string(),
+                        ]),
                     )?;
                     record_gemm(
                         scope,
@@ -1830,9 +1916,9 @@ mod cuda_impl {
                         kernels::silu_mul_bf16(
                             &layer.gate,
                             &layer.up,
-                            (&mut layer.activated).partition([1, MLP_BLOCK]),
+                            (&mut layer.activated).partition([1, mlp_block]),
                         )
-                        .generics(vec![MLP_BLOCK.to_string()]),
+                        .generics(vec![mlp_block.to_string()]),
                     )?;
                     record_gemm(
                         scope,
@@ -1859,7 +1945,10 @@ mod cuda_impl {
                             cfg.rms_norm_eps,
                         )
                     }
-                    .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()]),
+                    .generics(vec![
+                        cfg.hidden_size.to_string(),
+                        add_rms_norm_block.to_string(),
+                    ]),
                 )?;
                 record_gemm(
                     scope,
@@ -1877,7 +1966,7 @@ mod cuda_impl {
                         (&mut argmax_block_index).partition([1, 1]),
                         cfg.vocab_size as i32,
                     )
-                    .generics(vec![ARGMAX_BLOCK.to_string()]),
+                    .generics(vec![argmax_block.to_string()]),
                 )?;
                 scope.record(
                     kernels::argmax_reduce_batch_bf16(
