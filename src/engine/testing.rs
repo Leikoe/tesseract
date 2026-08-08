@@ -2,73 +2,89 @@ use std::{sync::Arc, time::Duration};
 
 use crate::model::{ChatMessage, IncrementalDecoder, Model, ModelError, ModelSummary};
 
-use super::{Backend, BackendError, ForwardBatch, StepOutput, TokenId};
+use super::{
+    BatchTicket, CompletionId, ExecutionError, ExecutionOutput, ForwardBatch, GeneratedToken,
+    ImmediateCompletion, ModelExecutor, TokenId,
+};
 
-/// Deterministic token backend used only by API and scheduler tests.
-pub struct DeterministicBackend {
+/// Deterministic model executor used only by API and scheduler tests.
+pub struct DeterministicExecutor {
     model: Arc<TestModel>,
-    step_delay: Duration,
-    fail_next_step: bool,
+    submission_delay: Duration,
+    fail_next_submission: bool,
+    completions: ImmediateCompletion,
 }
 
-impl DeterministicBackend {
+impl DeterministicExecutor {
     pub fn new(model_id: impl Into<String>) -> Self {
         Self {
             model: Arc::new(TestModel {
                 id: model_id.into(),
             }),
-            step_delay: Duration::ZERO,
-            fail_next_step: false,
+            submission_delay: Duration::ZERO,
+            fail_next_submission: false,
+            completions: ImmediateCompletion::default(),
         }
     }
 
-    pub fn with_step_delay(mut self, step_delay: Duration) -> Self {
-        self.step_delay = step_delay;
+    pub fn with_submission_delay(mut self, submission_delay: Duration) -> Self {
+        self.submission_delay = submission_delay;
         self
     }
 
-    pub fn failing_next_step(mut self) -> Self {
-        self.fail_next_step = true;
+    pub fn failing_next_submission(mut self) -> Self {
+        self.fail_next_submission = true;
         self
     }
 }
 
-impl Backend for DeterministicBackend {
+impl ModelExecutor for DeterministicExecutor {
     fn model(&self) -> Arc<dyn Model> {
         self.model.clone()
     }
 
-    fn step(&mut self, batch: &ForwardBatch) -> Result<Vec<StepOutput>, BackendError> {
-        if std::mem::take(&mut self.fail_next_step) {
-            return Err(BackendError::Execution("injected step failure".into()));
+    fn submit(&mut self, batch: &ForwardBatch) -> Result<BatchTicket, ExecutionError> {
+        self.completions.ensure_available()?;
+        if std::mem::take(&mut self.fail_next_submission) {
+            return Err(ExecutionError::Execution(
+                "injected submission failure".into(),
+            ));
         }
-        if !self.step_delay.is_zero() {
-            std::thread::sleep(self.step_delay);
+        if !self.submission_delay.is_zero() {
+            std::thread::sleep(self.submission_delay);
         }
-        let mut outputs = Vec::new();
+        let mut tokens = Vec::new();
         for sequence in batch.sequences() {
             if !sequence.should_sample() {
                 continue;
             }
             let previous =
                 sequence.token_ids().last().copied().ok_or_else(|| {
-                    BackendError::Execution("sampled sequence has no token".into())
+                    ExecutionError::Execution("sampled sequence has no token".into())
                 })?;
             let token_id = if previous.get() >= 1000 {
                 previous
                     .get()
                     .checked_add(1)
                     .map(TokenId::new)
-                    .ok_or_else(|| BackendError::Execution("test token overflowed".into()))?
+                    .ok_or_else(|| ExecutionError::Execution("test token overflowed".into()))?
             } else {
                 TokenId::new(1000)
             };
-            outputs.push(StepOutput {
+            tokens.push(GeneratedToken {
                 request_id: sequence.request_id(),
                 token_id,
             });
         }
-        Ok(outputs)
+        self.completions
+            .submit(ExecutionOutput::Generation { tokens })
+    }
+
+    fn poll(
+        &mut self,
+        completion: CompletionId,
+    ) -> Result<Option<ExecutionOutput>, ExecutionError> {
+        self.completions.poll(completion)
     }
 }
 

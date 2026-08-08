@@ -106,7 +106,7 @@ impl Metrics {
         self.request_duration_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn add_backend_execution(&self, stats: crate::engine::BackendExecutionStats) {
+    pub(crate) fn add_execution(&self, stats: crate::engine::ExecutionStats) {
         self.eager_forwards
             .fetch_add(stats.eager_forwards, Ordering::Relaxed);
         self.graph_replays
@@ -197,19 +197,19 @@ impl Metrics {
         );
         metric!(
             "tesseract_engine_batches_total",
-            "Backend execution batches",
+            "Model-executor batches",
             "counter",
             self.engine_batches.load(Ordering::Relaxed)
         );
         metric!(
             "tesseract_batch_items_total",
-            "Scheduled request items across backend batches",
+            "Scheduled request items across executor batches",
             "counter",
             self.batch_items.load(Ordering::Relaxed)
         );
         metric!(
             "tesseract_max_batch_size",
-            "Largest scheduled backend batch",
+            "Largest scheduled executor batch",
             "gauge",
             self.max_batch_size.load(Ordering::Relaxed)
         );

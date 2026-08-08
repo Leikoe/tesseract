@@ -81,17 +81,17 @@ pub fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelErr
 }
 
 #[cfg(feature = "cuda")]
-pub fn load_cuda_backend(
+pub fn load_cuda_executor(
     model_id: &str,
     model_dir: &Path,
     device_id: usize,
     kv_capacity_tokens: usize,
     max_batch_tokens: usize,
     max_running: usize,
-) -> Result<Box<dyn crate::engine::Backend>, ModelError> {
+) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError> {
     crate::cuda::enable_persistent_cubin_cache()?;
     if llama_3_2::supports(model_id) {
-        return llama_3_2::load_cuda_backend(
+        return llama_3_2::load_cuda_executor(
             model_id,
             model_dir,
             device_id,

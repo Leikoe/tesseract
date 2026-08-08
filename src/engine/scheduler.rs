@@ -17,17 +17,17 @@ use crate::model::{IncrementalDecoder, Model};
 use crate::{config::EngineConfig, metrics::Metrics};
 
 use super::{
-    Backend, FinishReason, ForwardBatch, ForwardPhase, ForwardSequence, GenerateRequest,
-    GenerationEvent, GenerationParams, Position, RequestId, SamplingInput, StepOutput, TokenId,
-    Usage, kv::KvSlots,
+    ExecutionOutput, FinishReason, ForwardBatch, ForwardPhase, ForwardSequence, GenerateRequest,
+    GeneratedToken, GenerationEvent, GenerationParams, ModelExecutor, Position, RequestId,
+    SamplingInput, TokenId, Usage, kv::KvSlots,
 };
 
 #[derive(Debug, Error)]
 pub enum EngineSpawnError {
     #[error("failed to spawn engine thread: {0}")]
     Thread(#[from] std::io::Error),
-    #[error("failed to initialize inference backend: {0}")]
-    BackendInitialization(String),
+    #[error("failed to initialize inference executor: {0}")]
+    ExecutorInitialization(String),
     #[error("engine thread exited during initialization")]
     InitializationChannelClosed,
 }
@@ -80,22 +80,22 @@ impl Admission {
 }
 
 impl EngineHandle {
-    pub fn spawn<B: Backend + Send>(
-        backend: B,
+    pub fn spawn<B: ModelExecutor + Send>(
+        executor: B,
         config: EngineConfig,
         command_capacity: usize,
         metrics: Arc<Metrics>,
     ) -> Result<Self, EngineSpawnError> {
         Self::spawn_with_factory(
-            move || Ok::<B, Infallible>(backend),
+            move || Ok::<B, Infallible>(executor),
             config,
             command_capacity,
             metrics,
         )
     }
 
-    /// Builds the backend on the dedicated engine thread, then returns only
-    /// after model loading and backend initialization have succeeded.
+    /// Builds the executor on the dedicated engine thread, then returns only
+    /// after model loading and executor initialization have succeeded.
     pub fn spawn_with_factory<B, F, E>(
         factory: F,
         config: EngineConfig,
@@ -103,7 +103,7 @@ impl EngineHandle {
         metrics: Arc<Metrics>,
     ) -> Result<Self, EngineSpawnError>
     where
-        B: Backend,
+        B: ModelExecutor,
         F: FnOnce() -> Result<B, E> + Send + 'static,
         E: Display,
     {
@@ -115,10 +115,10 @@ impl EngineHandle {
         thread::Builder::new()
             .name("tesseract-engine".into())
             .spawn(move || match factory() {
-                Ok(backend) => {
-                    let model = backend.model();
+                Ok(executor) => {
+                    let model = executor.model();
                     if initialized_tx.send(Ok(model)).is_ok() {
-                        EngineWorker::new(backend, config, worker_metrics).run(commands_rx);
+                        EngineWorker::new(executor, config, worker_metrics).run(commands_rx);
                     }
                 }
                 Err(error) => {
@@ -128,7 +128,7 @@ impl EngineHandle {
         let model = initialized_rx
             .recv()
             .map_err(|_| EngineSpawnError::InitializationChannelClosed)?
-            .map_err(EngineSpawnError::BackendInitialization)?;
+            .map_err(EngineSpawnError::ExecutorInitialization)?;
         let model_id: Arc<str> = Arc::from(model.id());
 
         Ok(Self {
@@ -336,7 +336,7 @@ impl SplitMix64 {
 }
 
 struct EngineWorker<B> {
-    backend: B,
+    executor: B,
     model: Arc<dyn Model>,
     config: EngineConfig,
     metrics: Arc<Metrics>,
@@ -344,15 +344,17 @@ struct EngineWorker<B> {
     requests: HashMap<RequestId, RequestState>,
     waiting: VecDeque<RequestId>,
     running: VecDeque<RequestId>,
+    in_flight_requests: HashSet<RequestId>,
+    deferred_cancellations: HashSet<RequestId>,
     shutting_down: bool,
     shutdown_ack: Option<oneshot::Sender<()>>,
 }
 
-impl<B: Backend> EngineWorker<B> {
-    fn new(backend: B, config: EngineConfig, metrics: Arc<Metrics>) -> Self {
-        let model = backend.model();
+impl<B: ModelExecutor> EngineWorker<B> {
+    fn new(executor: B, config: EngineConfig, metrics: Arc<Metrics>) -> Self {
+        let model = executor.model();
         Self {
-            backend,
+            executor,
             model,
             kv: KvSlots::new(config.kv_capacity_tokens),
             config,
@@ -360,6 +362,8 @@ impl<B: Backend> EngineWorker<B> {
             requests: HashMap::new(),
             waiting: VecDeque::new(),
             running: VecDeque::new(),
+            in_flight_requests: HashSet::new(),
+            deferred_cancellations: HashSet::new(),
             shutting_down: false,
             shutdown_ack: None,
         }
@@ -367,7 +371,7 @@ impl<B: Backend> EngineWorker<B> {
 
     fn run(mut self, mut commands: mpsc::Receiver<Command>) {
         self.metrics
-            .add_backend_execution(self.backend.take_execution_stats());
+            .add_execution(self.executor.take_execution_stats());
         self.metrics.set_ready(true);
         loop {
             self.receive_commands(&mut commands);
@@ -392,26 +396,74 @@ impl<B: Backend> EngineWorker<B> {
 
             self.metrics.engine_step();
             self.metrics.observe_batch(batch.len());
-            let result = self.backend.step(&batch);
-            self.metrics
-                .add_backend_execution(self.backend.take_execution_stats());
-            match result {
-                Ok(outputs) => self.apply_step(&batch, outputs),
-                Err(error) => {
-                    for sequence in batch.sequences() {
-                        self.fail_request(sequence.request_id(), error.to_string());
-                    }
-                }
-            }
+            self.execute_batch(batch, &mut commands);
             self.update_gauges();
         }
 
         self.metrics.set_ready(false);
-        if let Err(error) = self.backend.shutdown() {
-            tracing::error!(%error, "backend shutdown failed");
+        if let Err(error) = self.executor.shutdown() {
+            tracing::error!(%error, "executor shutdown failed");
         }
         if let Some(ack) = self.shutdown_ack.take() {
             let _ = ack.send(());
+        }
+    }
+
+    fn execute_batch(&mut self, batch: ForwardBatch, commands: &mut mpsc::Receiver<Command>) {
+        let ticket = match self.executor.submit(&batch) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.fail_batch(&batch, error.to_string());
+                return;
+            }
+        };
+        self.in_flight_requests
+            .extend(batch.sequences().iter().map(ForwardSequence::request_id));
+
+        loop {
+            self.receive_commands(commands);
+            self.prune_disconnected();
+            match self.executor.poll(ticket.completion()) {
+                Ok(Some(output)) => {
+                    self.finish_execution(batch, output);
+                    break;
+                }
+                Ok(None) => thread::yield_now(),
+                Err(error) => {
+                    self.clear_in_flight();
+                    self.fail_batch(&batch, error.to_string());
+                    break;
+                }
+            }
+        }
+        self.metrics
+            .add_execution(self.executor.take_execution_stats());
+    }
+
+    fn finish_execution(&mut self, batch: ForwardBatch, output: ExecutionOutput) {
+        self.clear_in_flight();
+        let cancelled = std::mem::take(&mut self.deferred_cancellations);
+        for request_id in cancelled {
+            self.finish_request(request_id, FinishReason::Cancelled);
+        }
+        match output {
+            ExecutionOutput::Generation { tokens } => self.apply_step(&batch, tokens),
+        }
+    }
+
+    fn clear_in_flight(&mut self) {
+        self.in_flight_requests.clear();
+    }
+
+    fn fail_batch(&mut self, batch: &ForwardBatch, message: String) {
+        let cancelled = std::mem::take(&mut self.deferred_cancellations);
+        for sequence in batch.sequences() {
+            let request_id = sequence.request_id();
+            if cancelled.contains(&request_id) {
+                self.finish_request(request_id, FinishReason::Cancelled);
+            } else {
+                self.fail_request(request_id, message.clone());
+            }
         }
     }
 
@@ -616,7 +668,7 @@ impl<B: Backend> EngineWorker<B> {
             .expect("scheduler must construct a valid non-aliasing batch")
     }
 
-    fn apply_step(&mut self, batch: &ForwardBatch, outputs: Vec<StepOutput>) {
+    fn apply_step(&mut self, batch: &ForwardBatch, outputs: Vec<GeneratedToken>) {
         let expected_outputs = batch
             .sequences()
             .iter()
@@ -638,7 +690,7 @@ impl<B: Backend> EngineWorker<B> {
             for request_id in request_ids {
                 self.fail_request(
                     request_id,
-                    "backend returned a duplicate or unexpected sampled output".into(),
+                    "executor returned a duplicate or unexpected sampled output".into(),
                 );
             }
             return;
@@ -657,7 +709,7 @@ impl<B: Backend> EngineWorker<B> {
             let Some(output) = output_map.remove(&sequence.request_id()) else {
                 failed.push((
                     sequence.request_id(),
-                    "backend omitted output for a sampled request".to_string(),
+                    "executor omitted output for a sampled request".to_string(),
                 ));
                 continue;
             };
@@ -768,7 +820,13 @@ impl<B: Backend> EngineWorker<B> {
     }
 
     fn cancel_request(&mut self, id: RequestId) {
-        self.finish_request(id, FinishReason::Cancelled);
+        if self.in_flight_requests.contains(&id) {
+            self.waiting.retain(|candidate| *candidate != id);
+            self.running.retain(|candidate| *candidate != id);
+            self.deferred_cancellations.insert(id);
+        } else {
+            self.finish_request(id, FinishReason::Cancelled);
+        }
     }
 
     fn prune_disconnected(&mut self) {
@@ -799,7 +857,7 @@ impl<B: Backend> EngineWorker<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{GenerationParams, QueryRow, testing::DeterministicBackend};
+    use crate::engine::{GenerationParams, QueryRow, testing::DeterministicExecutor};
     use proptest::prelude::*;
     use std::collections::HashSet;
 
@@ -833,7 +891,7 @@ mod tests {
     async fn produces_deltas_and_length_finish() {
         let metrics = Arc::new(Metrics::default());
         let engine = EngineHandle::spawn(
-            DeterministicBackend::new("test-model"),
+            DeterministicExecutor::new("test-model"),
             config(),
             8,
             metrics,
@@ -864,7 +922,7 @@ mod tests {
     async fn dropping_stream_cancels_and_releases_kv() {
         let metrics = Arc::new(Metrics::default());
         let engine = EngineHandle::spawn(
-            DeterministicBackend::new("test-model"),
+            DeterministicExecutor::new("test-model"),
             config(),
             8,
             Arc::clone(&metrics),
@@ -892,7 +950,7 @@ mod tests {
     async fn stop_string_is_not_emitted() {
         let metrics = Arc::new(Metrics::default());
         let engine = EngineHandle::spawn(
-            DeterministicBackend::new("test-model"),
+            DeterministicExecutor::new("test-model"),
             config(),
             8,
             metrics,
@@ -926,9 +984,13 @@ mod tests {
         let mut bounded = config();
         bounded.max_pending = 0;
         bounded.max_running = 1;
-        let engine =
-            EngineHandle::spawn(DeterministicBackend::new("test-model"), bounded, 8, metrics)
-                .unwrap();
+        let engine = EngineHandle::spawn(
+            DeterministicExecutor::new("test-model"),
+            bounded,
+            8,
+            metrics,
+        )
+        .unwrap();
         let first = engine.try_generate(request(20)).unwrap();
         assert!(matches!(
             engine.try_generate(request(1)),
@@ -942,7 +1004,7 @@ mod tests {
     async fn explicit_cancellation_finishes_the_request() {
         let metrics = Arc::new(Metrics::default());
         let engine = EngineHandle::spawn(
-            DeterministicBackend::new("test-model"),
+            DeterministicExecutor::new("test-model"),
             config(),
             8,
             metrics,
@@ -963,7 +1025,8 @@ mod tests {
     async fn shutdown_cancels_active_requests_and_clears_readiness() {
         let metrics = Arc::new(Metrics::default());
         let engine = EngineHandle::spawn(
-            DeterministicBackend::new("test-model").with_step_delay(Duration::from_millis(25)),
+            DeterministicExecutor::new("test-model")
+                .with_submission_delay(Duration::from_millis(25)),
             config(),
             8,
             Arc::clone(&metrics),
@@ -982,12 +1045,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_failure_releases_state_and_the_engine_keeps_serving() {
+    async fn executor_failure_releases_state_and_the_engine_keeps_serving() {
         let metrics = Arc::new(Metrics::default());
         let mut single = config();
         single.max_running = 1;
         let engine = EngineHandle::spawn(
-            DeterministicBackend::new("test-model").failing_next_step(),
+            DeterministicExecutor::new("test-model").failing_next_submission(),
             single,
             8,
             Arc::clone(&metrics),
@@ -997,7 +1060,7 @@ mod tests {
         let mut failed = engine.try_generate(request(1)).unwrap();
         assert!(matches!(
             failed.recv().await,
-            Some(GenerationEvent::Failed { message }) if message.contains("injected step failure")
+            Some(GenerationEvent::Failed { message }) if message.contains("injected submission failure")
         ));
 
         let mut recovered = engine.try_generate(request(1)).unwrap();
@@ -1031,10 +1094,10 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_backend_outputs_fail_without_leaking_request_state() {
+    fn duplicate_executor_outputs_fail_without_leaking_request_state() {
         let metrics = Arc::new(Metrics::default());
-        let backend = DeterministicBackend::new("test-model");
-        let mut worker = EngineWorker::new(backend, config(), metrics);
+        let executor = DeterministicExecutor::new("test-model");
+        let mut worker = EngineWorker::new(executor, config(), metrics);
         let (output, _receiver) = mpsc::channel(8);
         let request = request(1);
         let request_id = request.id;
@@ -1046,13 +1109,43 @@ mod tests {
         worker.apply_step(&first, Vec::new());
         let sampled = worker.build_batch();
         assert!(sampled[0].should_sample());
-        let duplicate = StepOutput {
+        let duplicate = GeneratedToken {
             request_id,
             token_id: TokenId::new(1000),
         };
         worker.apply_step(&sampled, vec![duplicate.clone(), duplicate]);
 
         assert!(worker.requests.is_empty());
+        assert_eq!(worker.kv.used(), 0);
+    }
+
+    #[test]
+    fn cancellation_defers_kv_reclamation_until_ticket_completion() {
+        let metrics = Arc::new(Metrics::default());
+        let executor = DeterministicExecutor::new("test-model");
+        let mut worker = EngineWorker::new(executor, config(), metrics);
+        let (output, _receiver) = mpsc::channel(8);
+        let request = request(1);
+        let request_id = request.id;
+        worker.add_request(request, output);
+        worker.admit_waiting();
+
+        let batch = worker.build_batch();
+        let ticket = worker.executor.submit(&batch).unwrap();
+        worker.in_flight_requests.insert(request_id);
+        worker.cancel_request(request_id);
+
+        assert!(worker.requests.contains_key(&request_id));
+        assert!(worker.deferred_cancellations.contains(&request_id));
+        assert!(!worker.running.contains(&request_id));
+        assert!(worker.kv.used() > 0);
+
+        let output = worker.executor.poll(ticket.completion()).unwrap().unwrap();
+        worker.finish_execution(batch, output);
+
+        assert!(!worker.requests.contains_key(&request_id));
+        assert!(worker.in_flight_requests.is_empty());
+        assert!(worker.deferred_cancellations.is_empty());
         assert_eq!(worker.kv.used(), 0);
     }
 
@@ -1066,8 +1159,8 @@ mod tests {
                 test_config.prefill_chunk_tokens = chunk;
                 test_config.kv_capacity_tokens = 256;
                 let metrics = Arc::new(Metrics::default());
-                let backend = DeterministicBackend::new("test-model");
-                let mut worker = EngineWorker::new(backend, test_config, metrics);
+                let executor = DeterministicExecutor::new("test-model");
+                let mut worker = EngineWorker::new(executor, test_config, metrics);
                 let mut receivers = Vec::new();
                 for prompt_tokens in [2usize, 5, 11] {
                     let (output, receiver) = mpsc::channel(8);
@@ -1104,8 +1197,8 @@ mod tests {
         let mut test_config = config();
         test_config.max_batch_tokens = 1;
         let metrics = Arc::new(Metrics::default());
-        let backend = DeterministicBackend::new("test-model");
-        let mut worker = EngineWorker::new(backend, test_config, metrics);
+        let executor = DeterministicExecutor::new("test-model");
+        let mut worker = EngineWorker::new(executor, test_config, metrics);
         let (decode_output, _decode_receiver) = mpsc::channel(8);
         let decode = request(3);
         let decode_id = decode.id;
@@ -1140,8 +1233,8 @@ mod tests {
         test_config.max_batch_tokens = 1;
         test_config.prefill_chunk_tokens = 1;
         let metrics = Arc::new(Metrics::default());
-        let backend = DeterministicBackend::new("test-model");
-        let mut worker = EngineWorker::new(backend, test_config, metrics);
+        let executor = DeterministicExecutor::new("test-model");
+        let mut worker = EngineWorker::new(executor, test_config, metrics);
         let (first_output, _first_receiver) = mpsc::channel(8);
         let first = request(3);
         let first_id = first.id;
@@ -1181,8 +1274,8 @@ mod tests {
             test_config.output_buffer = 128;
 
             let metrics = Arc::new(Metrics::default());
-            let backend = DeterministicBackend::new("test-model");
-            let mut worker = EngineWorker::new(backend, test_config, metrics);
+            let executor = DeterministicExecutor::new("test-model");
+            let mut worker = EngineWorker::new(executor, test_config, metrics);
             let mut receivers = Vec::with_capacity(requests.len());
             let mut maximum_steps = 0usize;
             for (prompt_tokens, max_tokens) in requests {
@@ -1240,16 +1333,22 @@ mod tests {
                     .collect();
                 prop_assert_eq!(slots.len(), batch.num_tokens());
 
-                let outputs = worker.backend.step(&batch).unwrap();
+                let ticket = worker.executor.submit(&batch).unwrap();
+                let output = worker
+                    .executor
+                    .poll(ticket.completion())
+                    .unwrap()
+                    .expect("deterministic executor completes synchronously");
+                let ExecutionOutput::Generation { tokens } = output;
                 prop_assert_eq!(
-                    outputs.len(),
+                    tokens.len(),
                     batch
                         .sequences()
                         .iter()
                         .filter(|sequence| sequence.should_sample())
                         .count()
                 );
-                worker.apply_step(&batch, outputs);
+                worker.apply_step(&batch, tokens);
                 prop_assert!(worker.kv.used() <= 512);
                 for (id, state) in &worker.requests {
                     prop_assert!(state.computed_tokens >= before[id]);

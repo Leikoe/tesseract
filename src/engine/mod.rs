@@ -1,5 +1,5 @@
-mod backend;
 mod batch;
+mod executor;
 mod kv;
 mod scheduler;
 mod types;
@@ -7,10 +7,15 @@ mod types;
 #[cfg(any(test, feature = "test-backend"))]
 pub mod testing;
 
-pub use backend::{Backend, BackendError, BackendExecutionStats, StepOutput};
 pub use batch::{
     ForwardBatch, ForwardBatchError, ForwardKind, ForwardPhase, ForwardSequence, KvSlot, Position,
     QueryRow, SamplingInput, SequenceIndex, TokenId,
+};
+#[cfg(any(test, feature = "cuda", feature = "test-backend"))]
+pub(crate) use executor::ImmediateCompletion;
+pub use executor::{
+    BatchTicket, CompletionId, ExecutionError, ExecutionOutput, ExecutionStats, GeneratedToken,
+    ModelExecutor,
 };
 pub use scheduler::{EngineHandle, EngineSpawnError, RequestStream, SubmitError};
 pub use types::{

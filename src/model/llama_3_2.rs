@@ -40,15 +40,15 @@ pub(super) fn validate_cuda_next_token(
 }
 
 #[cfg(feature = "cuda")]
-pub(super) fn load_cuda_backend(
+pub(super) fn load_cuda_executor(
     model_id: &str,
     model_dir: &Path,
     device_id: usize,
     kv_capacity_tokens: usize,
     max_batch_tokens: usize,
     max_running: usize,
-) -> Result<Box<dyn crate::engine::Backend>, ModelError> {
-    cuda_impl::load_backend(
+) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError> {
+    cuda_impl::load_executor(
         model_id,
         model_dir,
         device_id,
@@ -247,7 +247,7 @@ impl Llama32 {
         validate_weights(&weights, &config)?;
         let tokenizer = Tokenizer::load(model_dir)?;
         // The tokenizers regex/BPE machinery initializes lazily. Since prompt
-        // preparation runs on the single backend thread, paying that cost on
+        // preparation runs on the single executor thread, paying that cost on
         // the first admitted request leaves the A100 idle for hundreds of
         // milliseconds. Readiness includes representative tokenizer paths so
         // the first user request sees steady-state preprocessing latency.
@@ -327,7 +327,8 @@ mod cuda_impl {
     use crate::{
         cuda::{cublas, kernels},
         engine::{
-            Backend, BackendError, BackendExecutionStats, ForwardBatch, SequenceIndex, StepOutput,
+            BatchTicket, CompletionId, ExecutionError, ExecutionOutput, ExecutionStats,
+            ForwardBatch, GeneratedToken, ImmediateCompletion, ModelExecutor, SequenceIndex,
             TokenId,
         },
         model::Model,
@@ -441,7 +442,7 @@ mod cuda_impl {
         max_query_bucket: usize,
         decode_graphs: HashMap<(usize, usize), DecodeGraph>,
         failed_decode_graphs: HashSet<(usize, usize)>,
-        execution_stats: BackendExecutionStats,
+        execution_stats: ExecutionStats,
     }
 
     enum ForwardOutput {
@@ -560,7 +561,7 @@ mod cuda_impl {
                 max_query_bucket,
                 decode_graphs: HashMap::new(),
                 failed_decode_graphs: HashSet::new(),
-                execution_stats: BackendExecutionStats::default(),
+                execution_stats: ExecutionStats::default(),
             })
         }
 
@@ -1298,9 +1299,9 @@ mod cuda_impl {
             // allocator/free backlog from initialization.
             unsafe { self.stream.device().synchronize() }
                 .map_err(|error| cuda_error("complete CUDA warmup", error))?;
-            self.execution_stats = BackendExecutionStats {
+            self.execution_stats = ExecutionStats {
                 graph_captures: self.decode_graphs.len() as u64,
-                ..BackendExecutionStats::default()
+                ..ExecutionStats::default()
             };
             Ok(())
         }
@@ -1996,7 +1997,7 @@ mod cuda_impl {
                 "{operation} output cannot be empty"
             )));
         }
-        // SAFETY: the backend owns this stream and enqueues every dependent
+        // SAFETY: the executor owns this stream and enqueues every dependent
         // operation on it. The forward synchronizes before exposing host output
         // or committing scheduler-visible KV state.
         let tensor = unsafe { Tensor::<T>::uninitialized(len).async_on(stream) }
@@ -2031,7 +2032,7 @@ mod cuda_impl {
     }
 
     fn synchronize_stream(stream: &Arc<Stream>, operation: &'static str) -> Result<(), ModelError> {
-        // SAFETY: the stream is owned by the thread-confined backend.
+        // SAFETY: the stream is owned by the thread-confined executor.
         let started = Instant::now();
         let result = unsafe { stream.synchronize() }.map_err(|error| cuda_error(operation, error));
         let elapsed = started.elapsed();
@@ -2088,16 +2089,18 @@ mod cuda_impl {
         DeviceError::Internal(format!("decode graph tensor view: {error:?}"))
     }
 
-    struct LlamaCudaBackend {
+    struct LlamaCudaExecutor {
         runtime: CudaLlama,
+        completions: ImmediateCompletion,
     }
 
-    impl Backend for LlamaCudaBackend {
+    impl ModelExecutor for LlamaCudaExecutor {
         fn model(&self) -> Arc<dyn Model> {
             self.runtime.model.clone()
         }
 
-        fn step(&mut self, batch: &ForwardBatch) -> Result<Vec<StepOutput>, BackendError> {
+        fn submit(&mut self, batch: &ForwardBatch) -> Result<BatchTicket, ExecutionError> {
+            self.completions.ensure_available()?;
             let mut token_ids = Vec::with_capacity(batch.num_tokens());
             let mut positions = Vec::with_capacity(batch.num_tokens());
             let mut current_slots = Vec::with_capacity(batch.num_tokens());
@@ -2113,21 +2116,21 @@ mod cuda_impl {
                     .position()
                     .get()
                     .checked_add(sequence.num_tokens())
-                    .ok_or_else(|| BackendError::Execution("token position overflowed".into()))?;
+                    .ok_or_else(|| ExecutionError::Execution("token position overflowed".into()))?;
                 let request_index = SequenceIndex::try_from_usize(request_index)
-                    .map_err(|error| BackendError::Execution(error.to_string()))?;
+                    .map_err(|error| ExecutionError::Execution(error.to_string()))?;
                 let query_range = batch.query_range(request_index);
                 request_indices.extend(std::iter::repeat_n(request_index.get(), query_range.len()));
                 token_ids.extend(sequence.token_ids().iter().map(|token| token.get()));
                 for position in sequence.position().get()..end {
                     positions.push(u32::try_from(position).map_err(|_| {
-                        BackendError::Execution("token position exceeds u32".into())
+                        ExecutionError::Execution("token position exceeds u32".into())
                     })?);
                     let context_length = position.checked_add(1).ok_or_else(|| {
-                        BackendError::Execution("token context length overflowed".into())
+                        ExecutionError::Execution("token context length overflowed".into())
                     })?;
                     context_lengths.push(i32::try_from(context_length).map_err(|_| {
-                        BackendError::Execution("token context length exceeds i32".into())
+                        ExecutionError::Execution("token context length exceeds i32".into())
                     })?);
                 }
                 current_slots.extend(sequence.kv_slots().iter().map(|slot| slot.get()));
@@ -2141,7 +2144,7 @@ mod cuda_impl {
                 if let Some(sampling) = sequence.sampling() {
                     sample_rows.push(
                         u32::try_from(query_range.end - 1).map_err(|_| {
-                            BackendError::Execution("sample row exceeds u32".into())
+                            ExecutionError::Execution("sample row exceeds u32".into())
                         })?,
                     );
                     samples.push((sequence.request_id(), sampling));
@@ -2197,7 +2200,7 @@ mod cuda_impl {
                 ForwardOutput::BatchLogits(logits) => {
                     let vocab_size = self.runtime.model.config.vocab_size;
                     if logits.len() != samples.len() * vocab_size {
-                        return Err(BackendError::Execution(format!(
+                        return Err(ExecutionError::Execution(format!(
                             "ragged logits returned {} values for {} samples and vocab {vocab_size}",
                             logits.len(),
                             samples.len()
@@ -2211,7 +2214,7 @@ mod cuda_impl {
                     tokens
                 }
                 _ => {
-                    return Err(BackendError::Execution(
+                    return Err(ExecutionError::Execution(
                         "ragged forward returned output inconsistent with sampling rows".into(),
                     ));
                 }
@@ -2219,15 +2222,23 @@ mod cuda_impl {
 
             let mut outputs = Vec::with_capacity(sampled_tokens.len());
             for ((request_id, _), token_id) in samples.into_iter().zip(sampled_tokens) {
-                outputs.push(StepOutput {
+                outputs.push(GeneratedToken {
                     request_id,
                     token_id: TokenId::new(token_id),
                 });
             }
-            Ok(outputs)
+            self.completions
+                .submit(ExecutionOutput::Generation { tokens: outputs })
         }
 
-        fn take_execution_stats(&mut self) -> BackendExecutionStats {
+        fn poll(
+            &mut self,
+            completion: CompletionId,
+        ) -> Result<Option<ExecutionOutput>, ExecutionError> {
+            self.completions.poll(completion)
+        }
+
+        fn take_execution_stats(&mut self) -> ExecutionStats {
             std::mem::take(&mut self.runtime.execution_stats)
         }
     }
@@ -2235,9 +2246,9 @@ mod cuda_impl {
     fn sample_token(
         logits: &[f32],
         sampling: crate::engine::SamplingInput,
-    ) -> Result<u32, BackendError> {
+    ) -> Result<u32, ExecutionError> {
         if logits.is_empty() || logits.iter().any(|logit| !logit.is_finite()) {
-            return Err(BackendError::Execution(
+            return Err(ExecutionError::Execution(
                 "sampler received empty or non-finite logits".into(),
             ));
         }
@@ -2247,7 +2258,7 @@ mod cuda_impl {
                 .enumerate()
                 .max_by(|(_, left), (_, right)| left.total_cmp(right))
                 .map(|(token, _)| token as u32)
-                .ok_or_else(|| BackendError::Execution("sampler received no logits".into()));
+                .ok_or_else(|| ExecutionError::Execution("sampler received no logits".into()));
         }
 
         let inverse_temperature = 1.0 / sampling.temperature();
@@ -2256,7 +2267,7 @@ mod cuda_impl {
             .copied()
             .map(|logit| logit * inverse_temperature)
             .max_by(f32::total_cmp)
-            .ok_or_else(|| BackendError::Execution("sampler received no logits".into()))?;
+            .ok_or_else(|| ExecutionError::Execution("sampler received no logits".into()))?;
         let mut candidates: Vec<(u32, f64)> = logits
             .iter()
             .enumerate()
@@ -2270,7 +2281,7 @@ mod cuda_impl {
         candidates.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
         let total: f64 = candidates.iter().map(|(_, weight)| weight).sum();
         if !total.is_finite() || total <= 0.0 {
-            return Err(BackendError::Execution(
+            return Err(ExecutionError::Execution(
                 "sampler probability mass is invalid".into(),
             ));
         }
@@ -2293,23 +2304,23 @@ mod cuda_impl {
                 return Ok(token);
             }
         }
-        Err(BackendError::Execution(
+        Err(ExecutionError::Execution(
             "sampler failed to select a token".into(),
         ))
     }
 
-    fn execution(error: ModelError) -> BackendError {
-        BackendError::Execution(error.to_string())
+    fn execution(error: ModelError) -> ExecutionError {
+        ExecutionError::Execution(error.to_string())
     }
 
-    pub(super) fn load_backend(
+    pub(super) fn load_executor(
         model_id: &str,
         model_dir: &Path,
         device_id: usize,
         kv_capacity_tokens: usize,
         max_batch_tokens: usize,
         max_running: usize,
-    ) -> Result<Box<dyn Backend>, ModelError> {
+    ) -> Result<Box<dyn ModelExecutor>, ModelError> {
         let model = Arc::new(Llama32::load(model_id, model_dir)?);
         let mut runtime = CudaLlama::load(
             model,
@@ -2324,9 +2335,12 @@ mod cuda_impl {
             kv_capacity_tokens,
             max_batch_tokens,
             max_running,
-            "Llama CUDA backend loaded and execution buckets warmed"
+            "Llama CUDA executor loaded and execution buckets warmed"
         );
-        Ok(Box::new(LlamaCudaBackend { runtime }))
+        Ok(Box::new(LlamaCudaExecutor {
+            runtime,
+            completions: ImmediateCompletion::default(),
+        }))
     }
 
     pub(super) fn validate(

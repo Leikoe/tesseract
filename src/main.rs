@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let max_running = config.max_running;
     let engine = EngineHandle::spawn_with_factory(
         move || {
-            model::load_cuda_backend(
+            model::load_cuda_executor(
                 &model_id,
                 &model_path,
                 device,
