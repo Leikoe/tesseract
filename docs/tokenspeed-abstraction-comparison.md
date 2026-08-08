@@ -49,10 +49,11 @@ important:
 | Executor request state | the engine owns prompt/generated/decoder/sampling state; the executor consumes batch-local materializations and owns physical KV | retain engine authority while allowing explicit versioned, non-authoritative device mirrors when they are performance-justified |
 | Physical state | one flat `KvSlot` domain | a schema of attention/recurrent/cache groups with typed arena identity |
 | Model program | a generic statically composed `CudaExecutor<P>` owns lowering, completion, output validation, and sampling; Llama is the initial whole-batch `ModelProgram`, with graph/workspace internals and the first attention implementation still in its 2,712-line file | small private architecture adapter constructing a shared decoder program |
-| Operation implementations | crate-private, statically composed `AttentionBackend` with typed layer state and eager/graph paths; explicit model-neutral `HostLogitsSampler` | retain this attention boundary, add `MoeBackend` with the first MoE, and resolve leaf kernels at construction time |
+| Operation implementations | crate-private, statically composed `AttentionBackend`; explicit model-neutral `HostLogitsSampler`; construction-time typed `KernelCatalog` resolving stable per-operation descriptors and immutable geometry/mode plans | retain these boundaries and add `MoeBackend` with the first MoE |
 
-The typed mixed batch, engine-owned request record, ticketed executor, and
-statically composed CUDA program are realized slices of the design. They remove
+The typed mixed batch, engine-owned request record, ticketed executor,
+statically composed CUDA program, and immutable leaf-kernel plan are realized
+slices of the design. They remove
 semantic request authority and generic execution mechanics from Llama while
 making completion-gated reclamation explicit. Device execution is still
 synchronous and one-at-a-time, and graph/workspace ownership plus the concrete
@@ -319,10 +320,10 @@ would not implement the boundary described above. A real first plan must name
 the selected implementation of each semantic operation and carry the exact
 compile-time arguments used by that implementation.
 
-| Current code | TokenSpeed evidence | Tesseract next state |
+| Pressure found during the audit | TokenSpeed evidence | Tesseract decision |
 | --- | --- | --- |
-| `HIDDEN_BLOCK`, `MLP_BLOCK`, `ATTENTION_KEY_BLOCK`, and `ARGMAX_BLOCK` live beside Llama | selection is per family/mode/format/capability/traits, not one backend-wide choice | typed plans for embedding/norm/activation, GEMM, RoPE/KV write, attention by forward mode, and sampling |
-| `KernelImplementation::{CutileBf16,CublasBf16}` identifies only a provider | `KernelSpec` has stable identity, solution, features, formats, traits, and priority | every selected leaf has a stable descriptor and its validated geometry; the aggregate descriptor is inspectable |
+| block constants lived beside Llama | selection is per family/mode/format/capability/traits, not one backend-wide choice | implemented typed plans for embedding/gather/norm/activation, GEMM, RoPE/KV write, attention by forward mode, and sampling |
+| a provider-only implementation enum would be too coarse | `KernelSpec` has stable identity, solution, features, formats, traits, and priority | every selected leaf now has a stable descriptor and validated geometry; the aggregate plan is inspectable |
 | one attention kernel happens to serve eager mixed/prefill and captured decode | TokenSpeed exposes distinct extend/decode paths even when a backend implements both | an attention plan records prepared prefill/mixed and decode leaves independently, with sharing explicit rather than assumed |
 | `AttentionBackend` currently exposes only `layer_state`, eager enqueue, and decode recording | TokenSpeed backends own cache attachment, eager metadata, capture state, replay update, and mode capabilities | evolve the sealed trait toward typed preparation and capability declarations as those states leave Llama; do not fabricate empty hooks now |
 | `CudaExecutor` implements tickets over one synchronous completion slot | TokenSpeed admits one overlapped scheduling step and tracks pending results | retain the ticket API and later replace only completion storage with event-backed multi-flight state |

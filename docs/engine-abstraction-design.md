@@ -798,8 +798,11 @@ The refactor should remain runnable after every step:
    current direct flat-KV path is its first static implementation and owns K/V
    tensors plus RoPE tables. Moving that implementation out of the Llama module
    and generalizing physical state into grouped `StateSchema` remain.
-7. Add the typed construction-time `KernelCatalog`; resolve the current kernels
-   into one immutable default `KernelPlan` without changing their execution.
+7. **Implemented:** add the typed construction-time `KernelCatalog`; every
+   current dense, attention, and sampling leaf has a stable descriptor and
+   validated compile-time geometry in one immutable `KernelPlan`. Prefill/mixed
+   and decode attention are planned independently, runtime bucket dispatch uses
+   the plan, and selection completes before allocation or graph capture.
 8. Extract the common transformer computation into `DenseDecoder`; make the
    Llama module validate and construct it.
 9. Add the architecture registry and independent `WeightSource`; remove
