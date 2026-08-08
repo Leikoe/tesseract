@@ -104,3 +104,7 @@ you can use the safetensors library if you want OR build your own safetensors su
 ```text
 we will support different models. a model shouldn't leak outside it's own file.
 ```
+
+```text
+you should save everything needed for the node setup somewhere, the next nodes will have the same base image.
+```
