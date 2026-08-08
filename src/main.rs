@@ -1,9 +1,11 @@
 #[cfg(feature = "cuda")]
-use std::sync::Arc;
+use std::{env, path::PathBuf, process::Command, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
-use tesseract::config::ServerConfig;
+#[cfg(feature = "cuda")]
+use tesseract::config::{BenchmarkConfig, ServerConfig};
+use tesseract::config::{Cli, CliCommand};
 
 #[cfg(feature = "cuda")]
 #[tokio::main]
@@ -21,7 +23,11 @@ async fn main() -> anyhow::Result<()> {
         trace::TraceLayer,
     };
 
-    let config = ServerConfig::parse();
+    let cli = Cli::parse();
+    if let Some(CliCommand::Bench(config)) = cli.command {
+        return run_benchmark(config);
+    }
+    let config = cli.server;
     config.validate().context("invalid server configuration")?;
     init_tracing(&config)?;
 
@@ -77,6 +83,69 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "cuda")]
+fn run_benchmark(config: BenchmarkConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cfg!(debug_assertions),
+        "serving benchmarks require a release binary; use `cargo bench-a100`"
+    );
+    let repo_path = env::var_os("TESSERACT_REPO_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let script = repo_path.join("scripts/benchmark/run_a100.py");
+    anyhow::ensure!(
+        script.is_file(),
+        "benchmark runner does not exist at `{}`; run from a Tesseract checkout or set TESSERACT_REPO_PATH",
+        script.display()
+    );
+    let executable = env::current_exe().context("resolve the Tesseract executable")?;
+    let invocation = env::args().collect::<Vec<_>>().join(" ");
+    let mut benchmark = Command::new("python3");
+    benchmark
+        .arg(script)
+        .arg("--server-binary")
+        .arg(executable)
+        .arg("--invocation")
+        .arg(invocation)
+        .arg("--listen")
+        .arg(config.listen)
+        .arg("--batch1-requests")
+        .arg(config.batch1_requests.to_string())
+        .arg("--concurrency")
+        .arg(config.concurrency.to_string())
+        .arg("--concurrent-requests")
+        .arg(config.concurrent_requests.to_string())
+        .arg("--max-tokens")
+        .arg(config.max_tokens.to_string())
+        .arg("--warmup-requests")
+        .arg(config.warmup_requests.to_string())
+        .arg("--ready-timeout-seconds")
+        .arg(config.ready_timeout_seconds.to_string());
+    if let Some(path) = config.model_path {
+        benchmark.arg("--model-path").arg(path);
+    }
+    if let Some(revision) = config.model_revision {
+        benchmark.arg("--model-revision").arg(revision);
+    }
+    if let Some(model) = config.model {
+        benchmark.arg("--model").arg(model);
+    }
+    if let Some(output) = config.output {
+        benchmark.arg("--output").arg(output);
+    }
+    for argument in config.server_arg {
+        benchmark.arg("--server-arg").arg(argument);
+    }
+    if config.allow_dirty {
+        benchmark.arg("--allow-dirty");
+    }
+    let status = benchmark
+        .status()
+        .context("launch the serving benchmark runner")?;
+    anyhow::ensure!(status.success(), "serving benchmark failed with {status}");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn init_tracing(config: &ServerConfig) -> anyhow::Result<()> {
     use tracing_subscriber::EnvFilter;
 
@@ -98,7 +167,16 @@ fn init_tracing(config: &ServerConfig) -> anyhow::Result<()> {
 
 #[cfg(not(feature = "cuda"))]
 fn main() -> anyhow::Result<()> {
-    let config = ServerConfig::parse();
-    config.validate().context("invalid server configuration")?;
-    anyhow::bail!("tesseract must be built with --features cuda")
+    let cli = Cli::parse();
+    match cli.command {
+        Some(CliCommand::Bench(_)) => {
+            anyhow::bail!("serving benchmarks require --features cuda")
+        }
+        None => {
+            cli.server
+                .validate()
+                .context("invalid server configuration")?;
+            anyhow::bail!("tesseract must be built with --features cuda")
+        }
+    }
 }

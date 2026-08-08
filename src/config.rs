@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
 pub const DEFAULT_MODEL_ID: &str = "meta-llama/Llama-3.2-1B-Instruct";
 
@@ -8,8 +8,70 @@ pub const DEFAULT_MODEL_ID: &str = "meta-llama/Llama-3.2-1B-Instruct";
 #[command(
     name = "tesseract",
     version,
-    about = "A production BF16 inference server"
+    about = "A production BF16 inference server",
+    args_conflicts_with_subcommands = true
 )]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<CliCommand>,
+
+    #[command(flatten)]
+    pub server: ServerConfig,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum CliCommand {
+    /// Benchmark production serving on an NVIDIA A100.
+    Bench(BenchmarkConfig),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct BenchmarkConfig {
+    #[arg(long, env = "TESSERACT_MODEL_PATH")]
+    pub model_path: Option<PathBuf>,
+
+    #[arg(long, env = "TESSERACT_MODEL_REVISION")]
+    pub model_revision: Option<String>,
+
+    #[arg(long, env = "TESSERACT_MODEL")]
+    pub model: Option<String>,
+
+    #[arg(long, default_value = "127.0.0.1:8000")]
+    pub listen: String,
+
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 8)]
+    pub batch1_requests: usize,
+
+    #[arg(long, default_value_t = 8)]
+    pub concurrency: usize,
+
+    #[arg(long, default_value_t = 16)]
+    pub concurrent_requests: usize,
+
+    #[arg(long, default_value_t = 16)]
+    pub max_tokens: usize,
+
+    #[arg(long, default_value_t = 2)]
+    pub warmup_requests: usize,
+
+    #[arg(long, default_value_t = 600.0)]
+    pub ready_timeout_seconds: f64,
+
+    #[arg(
+        long,
+        value_name = "--FLAG=VALUE",
+        help = "Extra server argument; repeat as --server-arg=--flag=value"
+    )]
+    pub server_arg: Vec<String>,
+
+    #[arg(long, help = "Allow benchmarking tracked changes outside HEAD")]
+    pub allow_dirty: bool,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct ServerConfig {
     #[arg(long, env = "TESSERACT_LISTEN", default_value = "0.0.0.0:8000")]
     pub listen: SocketAddr,
@@ -117,5 +179,44 @@ impl From<&ServerConfig> for EngineConfig {
             kv_capacity_tokens: value.kv_capacity_tokens,
             output_buffer: value.output_buffer,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_server_flags_remain_compatible() {
+        let cli = Cli::try_parse_from([
+            "tesseract",
+            "--listen",
+            "127.0.0.1:9000",
+            "--max-running",
+            "4",
+        ])
+        .unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.server.listen.to_string(), "127.0.0.1:9000");
+        assert_eq!(cli.server.max_running, 4);
+    }
+
+    #[test]
+    fn parses_serving_benchmark_subcommand() {
+        let cli = Cli::try_parse_from([
+            "tesseract",
+            "bench",
+            "--concurrency",
+            "4",
+            "--output",
+            "/tmp/tesseract-bench",
+        ])
+        .unwrap();
+        let Some(CliCommand::Bench(bench)) = cli.command else {
+            panic!("expected bench subcommand");
+        };
+        assert_eq!(bench.concurrency, 4);
+        assert_eq!(bench.output, Some(PathBuf::from("/tmp/tesseract-bench")));
+        assert_eq!(cli.server.listen.to_string(), "0.0.0.0:8000");
     }
 }

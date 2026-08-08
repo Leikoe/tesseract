@@ -179,6 +179,10 @@ i'd love a proper bench command.
 ```
 
 ```text
+I meant a `tesseract bench` clap command. for doing the serving benchmarks
+```
+
+```text
 <codex_internal_context source="goal">
 Continue working toward the active thread goal.
 

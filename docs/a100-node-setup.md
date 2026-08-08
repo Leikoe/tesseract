@@ -61,7 +61,8 @@ Run the complete production serving benchmark with:
 
 ```bash
 cd /home/ubuntu/tesseract
-cargo bench-a100
+cargo build --release --features cuda --bin tesseract
+target/release/tesseract bench
 ```
 
 The command owns the release build and server lifecycle, waits for readiness,

@@ -67,14 +67,18 @@ concurrency workloads, captures raw results/metrics/logs, writes a Markdown
 report, and shuts the server down:
 
 ```bash
-cargo bench-a100
+target/release/tesseract bench
 ```
 
 Results default to a timestamped directory under `target/benchmarks/`. The
 command refuses tracked worktree changes so every result names a reproducible
-Git revision. Use `cargo bench-a100 --help` for workload, output, model, and
-server configuration overrides. An exact end-to-end command run is retained in
+Git revision. Use `target/release/tesseract bench --help` for workload, output,
+model, and server configuration overrides. An exact end-to-end command run is
+retained in
 [`docs/benchmarks/2026-08-08-bench-command/`](docs/benchmarks/2026-08-08-bench-command/README.md).
+
+`cargo bench-a100` is a convenience alias that builds the release CUDA binary
+and invokes the same `tesseract bench` Clap subcommand.
 
 
 ## Research notes

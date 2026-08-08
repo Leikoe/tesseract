@@ -70,6 +70,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="record results even when tracked files differ from HEAD",
     )
+    parser.add_argument("--server-binary", type=pathlib.Path, help=argparse.SUPPRESS)
+    parser.add_argument("--invocation", help=argparse.SUPPRESS)
     args = parser.parse_args()
     positive = {
         "batch1-requests": args.batch1_requests,
@@ -297,7 +299,8 @@ def main() -> int:
         "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "git_revision": revision,
         "git_dirty": bool(tracked_changes),
-        "command": shlex.join(["cargo", "bench-a100", *sys.argv[1:]]),
+        "command": args.invocation
+        or shlex.join(["cargo", "bench-a100", *sys.argv[1:]]),
         "model": args.model,
         "model_revision": args.model_revision,
         "model_path": str(args.model_path),
@@ -314,28 +317,38 @@ def main() -> int:
 
     print(f"benchmark revision: {revision}", flush=True)
     print(f"benchmark output: {output_dir}", flush=True)
-    subprocess.run(
-        [
-            cargo,
-            f"+{toolchain}",
-            "build",
-            "--release",
-            "--features",
-            "cuda",
-            "--bin",
-            "tesseract",
-        ],
-        cwd=root,
-        env=environment,
-        check=True,
-    )
+    if args.server_binary is None:
+        subprocess.run(
+            [
+                cargo,
+                f"+{toolchain}",
+                "build",
+                "--release",
+                "--features",
+                "cuda",
+                "--bin",
+                "tesseract",
+            ],
+            cwd=root,
+            env=environment,
+            check=True,
+        )
+        server_binary = root / "target/release/tesseract"
+    else:
+        server_binary = args.server_binary.resolve()
+        if not server_binary.is_file():
+            print(
+                f"benchmark refused: server binary not found at {server_binary}",
+                file=sys.stderr,
+            )
+            return 2
 
     server_log_path = output_dir / "server.log"
     server_process: subprocess.Popen[bytes] | None = None
     try:
         with server_log_path.open("wb") as server_log:
             server_process = subprocess.Popen(
-                [str(root / "target/release/tesseract"), *server_cli],
+                [str(server_binary), *server_cli],
                 cwd=root,
                 env=environment,
                 stdout=server_log,

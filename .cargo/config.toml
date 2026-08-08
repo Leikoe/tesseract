@@ -4,4 +4,4 @@
 CUDA_TILE_RS_CACHE = "1"
 
 [alias]
-bench-a100 = "run --quiet --bin benchmark --"
+bench-a100 = "run --quiet --release --features cuda --bin tesseract -- bench"
