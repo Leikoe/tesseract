@@ -52,10 +52,35 @@ pub enum ExecutionError {
     },
 }
 
-#[derive(Debug, Clone)]
-pub struct GeneratedToken {
-    pub request_id: RequestId,
-    pub token_id: TokenId,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedTokens {
+    request_id: RequestId,
+    token_ids: Vec<TokenId>,
+}
+
+impl GeneratedTokens {
+    pub fn new(request_id: RequestId, token_ids: Vec<TokenId>) -> Self {
+        Self {
+            request_id,
+            token_ids,
+        }
+    }
+
+    pub fn one(request_id: RequestId, token_id: TokenId) -> Self {
+        Self::new(request_id, vec![token_id])
+    }
+
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    pub fn token_ids(&self) -> &[TokenId] {
+        &self.token_ids
+    }
+
+    pub fn into_token_ids(self) -> Vec<TokenId> {
+        self.token_ids
+    }
 }
 
 /// Mode-aware result of one submitted batch.
@@ -66,7 +91,7 @@ pub struct GeneratedToken {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ExecutionOutput {
-    Generation { tokens: Vec<GeneratedToken> },
+    Generation { requests: Vec<GeneratedTokens> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -211,10 +236,14 @@ mod tests {
     fn immediate_completion_enforces_ticket_identity_and_one_in_flight() {
         let mut completions = ImmediateCompletion::default();
         let first = completions
-            .submit(ExecutionOutput::Generation { tokens: Vec::new() })
+            .submit(ExecutionOutput::Generation {
+                requests: Vec::new(),
+            })
             .unwrap();
         assert!(matches!(
-            completions.submit(ExecutionOutput::Generation { tokens: Vec::new() }),
+            completions.submit(ExecutionOutput::Generation {
+                requests: Vec::new()
+            }),
             Err(ExecutionError::Unavailable(_))
         ));
         assert!(matches!(
@@ -228,7 +257,9 @@ mod tests {
         ));
         assert!(
             completions
-                .submit(ExecutionOutput::Generation { tokens: Vec::new() })
+                .submit(ExecutionOutput::Generation {
+                    requests: Vec::new(),
+                })
                 .is_ok()
         );
     }

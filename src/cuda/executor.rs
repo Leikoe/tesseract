@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     engine::{
         BatchTicket, CompletionId, ExecutionError, ExecutionOutput, ExecutionStats, ForwardBatch,
-        GeneratedToken, HostLogitsSampler, ImmediateCompletion, ModelExecutor, StateSchema,
+        GeneratedTokens, HostLogitsSampler, ImmediateCompletion, ModelExecutor, StateSchema,
         TokenId,
     },
     model::Model,
@@ -71,7 +71,7 @@ impl<P: ModelProgram> ModelExecutor for CudaExecutor<P> {
         let output = self.program.execute(&batch)?;
         let tokens = self.resolve_generation_output(&batch, output)?;
         self.completions
-            .submit(ExecutionOutput::Generation { tokens })
+            .submit(ExecutionOutput::Generation { requests: tokens })
     }
 
     fn poll(
@@ -91,7 +91,7 @@ impl<P> CudaExecutor<P> {
         &self,
         batch: &CudaBatch,
         output: ProgramOutput,
-    ) -> Result<Vec<GeneratedToken>, ExecutionError> {
+    ) -> Result<Vec<GeneratedTokens>, ExecutionError> {
         let sampled = match output {
             ProgramOutput::None if batch.samples.is_empty() => Vec::new(),
             ProgramOutput::None => {
@@ -129,10 +129,7 @@ impl<P> CudaExecutor<P> {
             .samples
             .iter()
             .zip(sampled)
-            .map(|(sample, token_id)| GeneratedToken {
-                request_id: sample.request_id,
-                token_id,
-            })
+            .map(|(sample, token_id)| GeneratedTokens::one(sample.request_id, token_id))
             .collect())
     }
 }
@@ -211,9 +208,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0].request_id, batch.samples[0].request_id);
-        assert_eq!(tokens[0].token_id.get(), 1);
-        assert_eq!(tokens[1].request_id, batch.samples[1].request_id);
-        assert_eq!(tokens[1].token_id.get(), 0);
+        assert_eq!(tokens[0].request_id(), batch.samples[0].request_id);
+        assert_eq!(tokens[0].token_ids(), [TokenId::new(1)]);
+        assert_eq!(tokens[1].request_id(), batch.samples[1].request_id);
+        assert_eq!(tokens[1].token_ids(), [TokenId::new(0)]);
     }
 }

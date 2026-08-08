@@ -18,7 +18,7 @@ use crate::{config::EngineConfig, metrics::Metrics};
 
 use super::{
     ExecutionOutput, FinishReason, ForwardBatch, ForwardPhase, ForwardSequence, GenerateRequest,
-    GeneratedToken, GenerationEvent, GenerationParams, ModelExecutor, Position, RequestId,
+    GeneratedTokens, GenerationEvent, GenerationParams, ModelExecutor, Position, RequestId,
     SamplingInput, TokenId, Usage, kv::KvSlots,
 };
 
@@ -470,7 +470,7 @@ impl<B: ModelExecutor> EngineWorker<B> {
             self.finish_request(request_id, FinishReason::Cancelled);
         }
         match output {
-            ExecutionOutput::Generation { tokens } => self.apply_step(&batch, tokens),
+            ExecutionOutput::Generation { requests } => self.apply_step(&batch, requests),
         }
     }
 
@@ -691,7 +691,7 @@ impl<B: ModelExecutor> EngineWorker<B> {
             .expect("scheduler must construct a valid non-aliasing batch")
     }
 
-    fn apply_step(&mut self, batch: &ForwardBatch, outputs: Vec<GeneratedToken>) {
+    fn apply_step(&mut self, batch: &ForwardBatch, outputs: Vec<GeneratedTokens>) {
         let expected_outputs = batch
             .sequences()
             .iter()
@@ -700,7 +700,7 @@ impl<B: ModelExecutor> EngineWorker<B> {
             .collect::<HashSet<_>>();
         let mut output_map = HashMap::with_capacity(outputs.len());
         let malformed = outputs.into_iter().any(|output| {
-            let request_id = output.request_id;
+            let request_id = output.request_id();
             !expected_outputs.contains(&request_id)
                 || output_map.insert(request_id, output).is_some()
         });
@@ -737,47 +737,60 @@ impl<B: ModelExecutor> EngineWorker<B> {
                 continue;
             };
 
-            let token_id = output.token_id;
-            let text = match state.decoder.push(token_id.get()) {
-                Ok(text) => text,
-                Err(error) => {
-                    failed.push((sequence.request_id(), error.to_string()));
-                    continue;
-                }
-            };
-            state.generated.push(token_id);
-            self.metrics.token_generated();
-            let now = Instant::now();
-            match state.last_token_at {
-                Some(previous) => self.metrics.observe_inter_token(now - previous),
-                None => {
-                    self.metrics.observe_ttft(now - state.started_at);
-                }
-            }
-            state.last_token_at = Some(now);
-            let (text, hit_stop) = state.consume_text(&text);
-            if !text.is_empty()
-                && state
-                    .output
-                    .try_send(GenerationEvent::Delta {
-                        text,
-                        token_id: Some(token_id.get()),
-                    })
-                    .is_err()
-            {
-                finish.push((sequence.request_id(), FinishReason::Cancelled));
+            let token_ids = output.into_token_ids();
+            if token_ids.is_empty() {
+                failed.push((
+                    sequence.request_id(),
+                    "executor returned no progress for a sampled request".into(),
+                ));
                 continue;
             }
 
-            let reason = if hit_stop || self.model.eos_token_ids().contains(&token_id.get()) {
-                Some(FinishReason::Stop)
-            } else if state.generated.len() >= state.params.max_tokens {
-                Some(FinishReason::Length)
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
-                finish.push((sequence.request_id(), reason));
+            for token_id in token_ids {
+                if state.generated.len() >= state.params.max_tokens {
+                    finish.push((sequence.request_id(), FinishReason::Length));
+                    break;
+                }
+                let text = match state.decoder.push(token_id.get()) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        failed.push((sequence.request_id(), error.to_string()));
+                        break;
+                    }
+                };
+                state.generated.push(token_id);
+                self.metrics.token_generated();
+                let now = Instant::now();
+                match state.last_token_at {
+                    Some(previous) => self.metrics.observe_inter_token(now - previous),
+                    None => self.metrics.observe_ttft(now - state.started_at),
+                }
+                state.last_token_at = Some(now);
+                let (text, hit_stop) = state.consume_text(&text);
+                if !text.is_empty()
+                    && state
+                        .output
+                        .try_send(GenerationEvent::Delta {
+                            text,
+                            token_id: Some(token_id.get()),
+                        })
+                        .is_err()
+                {
+                    finish.push((sequence.request_id(), FinishReason::Cancelled));
+                    break;
+                }
+
+                let reason = if hit_stop || self.model.eos_token_ids().contains(&token_id.get()) {
+                    Some(FinishReason::Stop)
+                } else if state.generated.len() >= state.params.max_tokens {
+                    Some(FinishReason::Length)
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    finish.push((sequence.request_id(), reason));
+                    break;
+                }
             }
         }
 
@@ -907,6 +920,31 @@ mod tests {
                 seed: 7,
                 stop: vec![],
             },
+        }
+    }
+
+    fn worker_ready_to_sample(
+        max_tokens: usize,
+    ) -> (
+        EngineWorker<DeterministicExecutor>,
+        ForwardBatch,
+        mpsc::Receiver<GenerationEvent>,
+        RequestId,
+    ) {
+        let metrics = Arc::new(Metrics::default());
+        let executor = DeterministicExecutor::new("test-model");
+        let mut worker = EngineWorker::new(executor, config(), metrics);
+        let (output, receiver) = mpsc::channel(32);
+        let request = request(max_tokens);
+        let request_id = request.id;
+        worker.add_request(request, output);
+        worker.admit_waiting();
+        loop {
+            let batch = worker.build_batch();
+            if batch.iter().any(ForwardSequence::should_sample) {
+                return (worker, batch, receiver, request_id);
+            }
+            worker.apply_step(&batch, Vec::new());
         }
     }
 
@@ -1148,14 +1186,72 @@ mod tests {
         worker.apply_step(&first, Vec::new());
         let sampled = worker.build_batch();
         assert!(sampled[0].should_sample());
-        let duplicate = GeneratedToken {
-            request_id,
-            token_id: TokenId::new(1000),
-        };
+        let duplicate = GeneratedTokens::one(request_id, TokenId::new(1000));
         worker.apply_step(&sampled, vec![duplicate.clone(), duplicate]);
 
         assert!(worker.requests.is_empty());
         assert_eq!(worker.kv.used(), 0);
+    }
+
+    #[test]
+    fn empty_sample_output_fails_instead_of_stalling() {
+        let (mut worker, batch, _receiver, request_id) = worker_ready_to_sample(2);
+        worker.apply_step(&batch, vec![GeneratedTokens::new(request_id, Vec::new())]);
+        assert!(worker.requests.is_empty());
+        assert_eq!(worker.kv.used(), 0);
+    }
+
+    #[test]
+    fn variable_output_is_truncated_at_the_request_length() {
+        let (mut worker, batch, mut receiver, request_id) = worker_ready_to_sample(2);
+        worker.apply_step(
+            &batch,
+            vec![GeneratedTokens::new(
+                request_id,
+                vec![TokenId::new(1000), TokenId::new(1001), TokenId::new(1002)],
+            )],
+        );
+
+        assert!(worker.requests.is_empty());
+        assert_eq!(worker.kv.used(), 0);
+        let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GenerationEvent::Delta { .. }))
+                .count(),
+            2
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GenerationEvent::Finished {
+                reason: FinishReason::Length,
+                usage,
+            } if usage.completion_tokens == 2
+        )));
+    }
+
+    #[test]
+    fn variable_output_stops_at_the_first_terminal_token() {
+        let (mut worker, batch, mut receiver, request_id) = worker_ready_to_sample(4);
+        worker.requests.get_mut(&request_id).unwrap().params.stop = vec!["token1".into()];
+        worker.apply_step(
+            &batch,
+            vec![GeneratedTokens::new(
+                request_id,
+                vec![TokenId::new(1000), TokenId::new(1001), TokenId::new(1002)],
+            )],
+        );
+
+        assert!(worker.requests.is_empty());
+        let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GenerationEvent::Finished {
+                reason: FinishReason::Stop,
+                usage,
+            } if usage.completion_tokens == 2
+        )));
     }
 
     #[test]
@@ -1297,6 +1393,36 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
         #[test]
+        fn variable_generation_never_commits_past_length(
+            max_tokens in 1usize..12,
+            extra_tokens in 0usize..8,
+        ) {
+            let (mut worker, batch, mut receiver, request_id) =
+                worker_ready_to_sample(max_tokens);
+            let accepted = (0..max_tokens + extra_tokens)
+                .map(|offset| TokenId::new(1000 + offset as u32))
+                .collect();
+            worker.apply_step(&batch, vec![GeneratedTokens::new(request_id, accepted)]);
+
+            prop_assert!(worker.requests.is_empty());
+            prop_assert_eq!(worker.kv.used(), 0);
+            let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+            let deltas = events
+                .iter()
+                .filter(|event| matches!(event, GenerationEvent::Delta { .. }))
+                .count();
+            prop_assert_eq!(deltas, max_tokens);
+            let usage_is_exact = events.iter().any(|event| matches!(
+                event,
+                GenerationEvent::Finished {
+                    reason: FinishReason::Length,
+                    usage,
+                } if usage.completion_tokens == max_tokens
+            ));
+            prop_assert!(usage_is_exact);
+        }
+
+        #[test]
         fn arbitrary_scheduler_runs_preserve_batch_and_kv_invariants(
             requests in prop::collection::vec((1usize..16, 1usize..8), 1..7),
             token_budget in 1usize..33,
@@ -1378,16 +1504,16 @@ mod tests {
                     .poll(ticket.completion())
                     .unwrap()
                     .expect("deterministic executor completes synchronously");
-                let ExecutionOutput::Generation { tokens } = output;
+                let ExecutionOutput::Generation { requests } = output;
                 prop_assert_eq!(
-                    tokens.len(),
+                    requests.len(),
                     batch
                         .sequences()
                         .iter()
                         .filter(|sequence| sequence.should_sample())
                         .count()
                 );
-                worker.apply_step(&batch, tokens);
+                worker.apply_step(&batch, requests);
                 prop_assert!(worker.kv.used() <= 512);
                 for (id, state) in &worker.requests {
                     prop_assert!(state.computed_tokens >= before[id]);

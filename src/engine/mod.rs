@@ -17,7 +17,7 @@ pub use batch::{
 pub(crate) use executor::ImmediateCompletion;
 pub use executor::{
     BatchLoweringError, BatchTicket, CompletionId, ExecutionError, ExecutionOutput, ExecutionStats,
-    GeneratedToken, ModelExecutor,
+    GeneratedTokens, ModelExecutor,
 };
 pub use sampling::{HostLogitsSampler, SamplingError};
 pub use scheduler::{EngineHandle, EngineSpawnError, RequestStream, SubmitError};

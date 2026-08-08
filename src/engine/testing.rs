@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use crate::model::{ChatMessage, IncrementalDecoder, Model, ModelError, ModelSummary};
 
 use super::{
-    BatchTicket, CompletionId, ExecutionError, ExecutionOutput, ForwardBatch, GeneratedToken,
+    BatchTicket, CompletionId, ExecutionError, ExecutionOutput, ForwardBatch, GeneratedTokens,
     ImmediateCompletion, ModelExecutor, StateSchema, TokenId,
 };
 
@@ -88,13 +88,10 @@ impl ModelExecutor for DeterministicExecutor {
             } else {
                 TokenId::new(1000)
             };
-            tokens.push(GeneratedToken {
-                request_id: sequence.request_id(),
-                token_id,
-            });
+            tokens.push(GeneratedTokens::one(sequence.request_id(), token_id));
         }
         self.completions
-            .submit(ExecutionOutput::Generation { tokens })
+            .submit(ExecutionOutput::Generation { requests: tokens })
     }
 
     fn poll(
