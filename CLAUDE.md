@@ -31,3 +31,7 @@ I will give you an A100 box. you can ssh to it and test your code there when nee
 ```text
 I say you use llama 3.2 1B Instruct for now. you have a .env with the hf token to hf download it. you can copy that .env to the A100 machine it's ok. "ssh ubuntu@216.81.245.246"
 ```
+
+```text
+I made it public, retry
+```
