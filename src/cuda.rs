@@ -159,14 +159,12 @@ pub fn validate_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaErr
         }
     }
 
-    let graph_out = std::sync::Arc::new(
-        api::zeros::<bf16>(&[1, 2])
-            .sync_on(&stream)
-            .map_err(|error| kernel_error("allocate graph GEMM output", error))?,
-    );
+    let graph_out = api::zeros::<bf16>(&[1, 2])
+        .sync_on(&stream)
+        .map_err(|error| kernel_error("allocate graph GEMM output", error))?;
     let graph = CudaGraph::scope(&stream, |scope| {
         let result = scope.record(
-            cublas::gemm_bf16_into(matrix, rhs, graph_out.clone(), 2, 1, 3)
+            cublas::gemm_bf16_into(&matrix, &rhs, &graph_out, 2, 1, 3)
                 .map_err(|error| DeviceError::Internal(error.to_string()))?,
         )?;
         result.map_err(|error| DeviceError::Internal(error.to_string()))

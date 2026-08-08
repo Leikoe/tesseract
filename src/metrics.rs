@@ -25,6 +25,9 @@ pub struct Metrics {
     inter_token_count: AtomicU64,
     request_microseconds: AtomicU64,
     request_duration_count: AtomicU64,
+    eager_forwards: AtomicU64,
+    graph_replays: AtomicU64,
+    graph_captures: AtomicU64,
 }
 
 impl Metrics {
@@ -99,6 +102,15 @@ impl Metrics {
         self.request_microseconds
             .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
         self.request_duration_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_backend_execution(&self, stats: crate::engine::BackendExecutionStats) {
+        self.eager_forwards
+            .fetch_add(stats.eager_forwards, Ordering::Relaxed);
+        self.graph_replays
+            .fetch_add(stats.graph_replays, Ordering::Relaxed);
+        self.graph_captures
+            .fetch_add(stats.graph_captures, Ordering::Relaxed);
     }
 
     pub fn prometheus(&self) -> String {
@@ -194,6 +206,24 @@ impl Metrics {
             "Largest scheduled backend batch",
             "gauge",
             self.max_batch_size.load(Ordering::Relaxed)
+        );
+        metric!(
+            "tesseract_eager_forwards_total",
+            "Model forwards executed through the eager fallback",
+            "counter",
+            self.eager_forwards.load(Ordering::Relaxed)
+        );
+        metric!(
+            "tesseract_cuda_graph_replays_total",
+            "Model forwards executed by CUDA graph replay",
+            "counter",
+            self.graph_replays.load(Ordering::Relaxed)
+        );
+        metric!(
+            "tesseract_cuda_graph_captures_total",
+            "Full-model CUDA decode graphs captured",
+            "counter",
+            self.graph_captures.load(Ordering::Relaxed)
         );
         timing_metrics(
             &mut out,

@@ -79,7 +79,7 @@ impl Admission {
 }
 
 impl EngineHandle {
-    pub fn spawn<B: Backend>(
+    pub fn spawn<B: Backend + Send>(
         backend: B,
         config: EngineConfig,
         command_capacity: usize,
@@ -331,6 +331,8 @@ impl<B: Backend> EngineWorker<B> {
     }
 
     fn run(mut self, mut commands: mpsc::Receiver<Command>) {
+        self.metrics
+            .add_backend_execution(self.backend.take_execution_stats());
         self.metrics.set_ready(true);
         loop {
             self.receive_commands(&mut commands);
@@ -355,7 +357,10 @@ impl<B: Backend> EngineWorker<B> {
 
             self.metrics.engine_step();
             self.metrics.observe_batch(batch.len());
-            match self.backend.step(&batch) {
+            let result = self.backend.step(&batch);
+            self.metrics
+                .add_backend_execution(self.backend.take_execution_stats());
+            match result {
                 Ok(outputs) => self.apply_step(&batch, outputs),
                 Err(error) => {
                     for work in batch {

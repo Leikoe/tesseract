@@ -89,6 +89,21 @@ CUDA graph, replayed it, and compared the replay output to the eager result.
 This proves the selected cuBLAS/CUDA/cuTile stack supports graph capture; it is
 not evidence that the complete Llama decode path is captured yet.
 
+The complete decode path was then converted to static per-bucket buffers and a
+single graph spanning embedding, all 16 transformer layers, flat-KV writes and
+gathers, attention, MLPs, final normalization, and the tied LM head. For a
+six-token completion, metrics directly reported one eager prefill, one graph
+capture, and five graph replays; output remained `One\nTwo\nThree` and stopped
+on EOS. That run measured 1.557 s TTFT and 1.285 s total inter-token time across
+five intervals (about 257 ms/interval). These are unoptimized measurements, not
+targets: request metadata still uses allocating host-to-device updates, logits
+are copied to the host, and scheduled requests are executed serially.
+
+Startup warmup was subsequently enabled for every power-of-two context bucket.
+With a 256-token test capacity, the backend logged five warmed graph buckets
+before the server's ready log. Before any request, metrics showed readiness 1,
+five graph captures, zero eager forwards, and zero graph replays.
+
 ## Independent BF16 logits reference
 
 The isolated reference environment used PyTorch 2.8.0, Transformers 4.55.0,

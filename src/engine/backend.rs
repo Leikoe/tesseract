@@ -38,7 +38,16 @@ pub struct StepOutput {
     pub is_eos: bool,
 }
 
-pub trait Backend: Send + 'static {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BackendExecutionStats {
+    pub eager_forwards: u64,
+    pub graph_replays: u64,
+    pub graph_captures: u64,
+}
+
+/// Thread-confined model backend. Production backends are constructed and used
+/// on the dedicated engine thread, so CUDA handles do not need to be movable.
+pub trait Backend: 'static {
     fn model(&self) -> Arc<dyn Model>;
 
     fn add_request(&mut self, request: &GenerateRequest) -> Result<PreparedRequest, BackendError>;
@@ -46,6 +55,10 @@ pub trait Backend: Send + 'static {
     fn step(&mut self, batch: &[ScheduledWork]) -> Result<Vec<StepOutput>, BackendError>;
 
     fn remove_request(&mut self, request_id: RequestId);
+
+    fn take_execution_stats(&mut self) -> BackendExecutionStats {
+        BackendExecutionStats::default()
+    }
 
     fn shutdown(&mut self) -> Result<(), BackendError> {
         Ok(())
@@ -67,6 +80,10 @@ impl<T: Backend + ?Sized> Backend for Box<T> {
 
     fn remove_request(&mut self, request_id: RequestId) {
         (**self).remove_request(request_id);
+    }
+
+    fn take_execution_stats(&mut self) -> BackendExecutionStats {
+        (**self).take_execution_stats()
     }
 
     fn shutdown(&mut self) -> Result<(), BackendError> {

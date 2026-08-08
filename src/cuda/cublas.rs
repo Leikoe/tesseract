@@ -135,23 +135,23 @@ pub fn gemm_bf16(
 }
 
 /// Allocation-free BF16 GEMM operation suitable for CUDA graph capture.
-pub struct GemmBf16 {
-    matrix: Arc<Tensor<bf16>>,
-    rhs: Arc<Tensor<bf16>>,
-    out: Arc<Tensor<bf16>>,
+pub struct GemmBf16<'a> {
+    matrix: &'a Tensor<bf16>,
+    rhs: &'a Tensor<bf16>,
+    out: &'a Tensor<bf16>,
     m: i32,
     n: i32,
     k: i32,
 }
 
-pub fn gemm_bf16_into(
-    matrix: Arc<Tensor<bf16>>,
-    rhs: Arc<Tensor<bf16>>,
-    out: Arc<Tensor<bf16>>,
+pub fn gemm_bf16_into<'a>(
+    matrix: &'a Tensor<bf16>,
+    rhs: &'a Tensor<bf16>,
+    out: &'a Tensor<bf16>,
     m: usize,
     n: usize,
     k: usize,
-) -> Result<GemmBf16, CublasError> {
+) -> Result<GemmBf16<'a>, CublasError> {
     if m == 0
         || n == 0
         || k == 0
@@ -171,7 +171,7 @@ pub fn gemm_bf16_into(
     })
 }
 
-impl DeviceOp for GemmBf16 {
+impl DeviceOp for GemmBf16<'_> {
     type Output = Result<(), CublasError>;
 
     unsafe fn execute(
@@ -184,9 +184,9 @@ impl DeviceOp for GemmBf16 {
             launch(
                 context.get_device_id(),
                 stream,
-                &self.matrix,
-                &self.rhs,
-                &self.out,
+                self.matrix,
+                self.rhs,
+                self.out,
                 self.m,
                 self.n,
                 self.k,
@@ -195,9 +195,9 @@ impl DeviceOp for GemmBf16 {
     }
 }
 
-impl GraphNode for GemmBf16 {}
+impl GraphNode for GemmBf16<'_> {}
 
-impl IntoFuture for GemmBf16 {
+impl IntoFuture for GemmBf16<'_> {
     type Output = Result<Result<(), CublasError>, DeviceError>;
     type IntoFuture = DeviceFuture<Result<(), CublasError>, Self>;
 

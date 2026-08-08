@@ -273,20 +273,24 @@ impl Model for Llama32 {
 mod cuda_impl {
     use std::{collections::HashMap, f32::consts::TAU, path::Path, sync::Arc};
 
-    use cuda_async::device_operation::DeviceOp;
+    use cuda_async::{
+        cuda_graph::{CudaGraph, Scope},
+        device_operation::DeviceOp,
+        error::DeviceError,
+    };
     use cuda_core::{Device, Stream};
     use cutile::{
         api,
         core::bf16,
-        tensor::{Reshape, Tensor, ToHostVec},
+        tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
         tile_kernel::{PartitionOp, TileKernel},
     };
 
     use crate::{
         cuda::{cublas, kernels},
         engine::{
-            Backend, BackendError, GenerateRequest, PreparedRequest, RequestId, ScheduledWork,
-            StepOutput,
+            Backend, BackendError, BackendExecutionStats, GenerateRequest, PreparedRequest,
+            RequestId, ScheduledWork, StepOutput,
         },
         model::{IncrementalDecoder, Model},
     };
@@ -394,6 +398,8 @@ mod cuda_impl {
         key_cache: Vec<Bf16Tensor>,
         value_cache: Vec<Bf16Tensor>,
         capacity: usize,
+        decode_graphs: HashMap<usize, DecodeGraph>,
+        execution_stats: BackendExecutionStats,
     }
 
     impl CudaLlama {
@@ -442,10 +448,41 @@ mod cuda_impl {
                 key_cache,
                 value_cache,
                 capacity,
+                decode_graphs: HashMap::new(),
+                execution_stats: BackendExecutionStats::default(),
             })
         }
 
         fn forward(
+            &mut self,
+            token_ids: &[u32],
+            positions: &[u32],
+            current_slots: &[u32],
+            context_slots: &[u32],
+            return_logits: bool,
+        ) -> Result<Option<Vec<f32>>, ModelError> {
+            if return_logits && token_ids.len() == 1 && positions[0] > 0 {
+                let output =
+                    self.decode_graph(token_ids[0], positions[0], current_slots[0], context_slots);
+                if output.is_ok() {
+                    self.execution_stats.graph_replays += 1;
+                }
+                return output;
+            }
+            let output = self.forward_eager(
+                token_ids,
+                positions,
+                current_slots,
+                context_slots,
+                return_logits,
+            );
+            if output.is_ok() {
+                self.execution_stats.eager_forwards += 1;
+            }
+            output
+        }
+
+        fn forward_eager(
             &self,
             token_ids: &[u32],
             positions: &[u32],
@@ -724,6 +761,77 @@ mod cuda_impl {
             Ok(Some(logits.into_iter().map(bf16::to_f32).collect()))
         }
 
+        fn decode_graph(
+            &mut self,
+            token_id: u32,
+            position: u32,
+            current_slot: u32,
+            context_slots: &[u32],
+        ) -> Result<Option<Vec<f32>>, ModelError> {
+            if current_slot as usize >= self.capacity
+                || context_slots.is_empty()
+                || context_slots
+                    .iter()
+                    .any(|slot| *slot as usize >= self.capacity)
+            {
+                return Err(ModelError::Cuda("invalid decode graph metadata".into()));
+            }
+            let bucket = context_slots.len().next_power_of_two().max(16);
+            if !self.decode_graphs.contains_key(&bucket) {
+                let graph = DecodeGraph::capture(self, bucket)?;
+                self.decode_graphs.insert(bucket, graph);
+                self.execution_stats.graph_captures += 1;
+            }
+            let graph = self
+                .decode_graphs
+                .get_mut(&bucket)
+                .ok_or_else(|| ModelError::Cuda("decode graph cache insertion failed".into()))?;
+            graph
+                .forward(
+                    token_id,
+                    position,
+                    current_slot,
+                    context_slots,
+                    self.capacity as u32,
+                )
+                .map(Some)
+        }
+
+        fn warm_decode_graphs(&mut self) -> Result<(), ModelError> {
+            if self.capacity == 0 {
+                return Err(ModelError::Cuda(
+                    "KV capacity must be positive before graph warmup".into(),
+                ));
+            }
+            let max_bucket = self.capacity.next_power_of_two().max(16);
+            let mut bucket = 16usize;
+            while bucket <= max_bucket {
+                // Compile every shape and initialize the cuBLAS handle before
+                // capture. Repeating slot zero is safe during warmup and is
+                // overwritten when the allocator first assigns that slot.
+                let context_slots = vec![0u32; bucket];
+                let position =
+                    (self.capacity - 1).min(self.model.config.max_position_embeddings - 1) as u32;
+                self.forward_eager(
+                    &[self.model.config.bos_token_id],
+                    &[position],
+                    &[0],
+                    &context_slots,
+                    true,
+                )?;
+                let graph = DecodeGraph::capture(self, bucket)?;
+                self.decode_graphs.insert(bucket, graph);
+                bucket = bucket.checked_mul(2).ok_or_else(|| {
+                    ModelError::Cuda("decode graph bucket size overflowed".into())
+                })?;
+            }
+            self.execution_stats = BackendExecutionStats {
+                graph_captures: self.decode_graphs.len() as u64,
+                ..BackendExecutionStats::default()
+            };
+            Ok(())
+        }
+
         fn gemm(
             &self,
             weight: Bf16Tensor,
@@ -802,6 +910,457 @@ mod cuda_impl {
                 Arc::new(combined.unpartition()),
             ))
         }
+    }
+
+    struct DecodeLayerBuffers {
+        attention_input: Tensor<bf16>,
+        residual: Tensor<bf16>,
+        query: Tensor<bf16>,
+        key: Tensor<bf16>,
+        value: Tensor<bf16>,
+        rotated_query: Tensor<bf16>,
+        rotated_key: Tensor<bf16>,
+        gathered_key: Tensor<bf16>,
+        gathered_value: Tensor<bf16>,
+        attention: Tensor<bf16>,
+        attention_flat: Tensor<bf16>,
+        attention_output: Tensor<bf16>,
+        mlp_input: Tensor<bf16>,
+        hidden_after_attention: Tensor<bf16>,
+        gate: Tensor<bf16>,
+        up: Tensor<bf16>,
+        activated: Tensor<bf16>,
+        down: Tensor<bf16>,
+    }
+
+    impl DecodeLayerBuffers {
+        fn allocate(
+            cfg: &super::Config,
+            context_bucket: usize,
+            stream: &Arc<Stream>,
+        ) -> Result<Self, ModelError> {
+            Ok(Self {
+                attention_input: zeros_bf16(&[1, cfg.hidden_size], stream)?,
+                residual: zeros_bf16(&[1, cfg.hidden_size], stream)?,
+                query: zeros_bf16(&[1, cfg.q_width()], stream)?,
+                key: zeros_bf16(&[1, cfg.kv_width()], stream)?,
+                value: zeros_bf16(&[1, cfg.kv_width()], stream)?,
+                rotated_query: zeros_bf16(&[1, cfg.num_attention_heads, cfg.head_dim], stream)?,
+                rotated_key: zeros_bf16(&[1, cfg.num_key_value_heads, cfg.head_dim], stream)?,
+                gathered_key: zeros_bf16(
+                    &[cfg.num_key_value_heads, context_bucket, cfg.head_dim],
+                    stream,
+                )?,
+                gathered_value: zeros_bf16(
+                    &[cfg.num_key_value_heads, context_bucket, cfg.head_dim],
+                    stream,
+                )?,
+                attention: zeros_bf16(&[1, cfg.num_attention_heads, cfg.head_dim], stream)?,
+                attention_flat: zeros_bf16(&[1, cfg.hidden_size], stream)?,
+                attention_output: zeros_bf16(&[1, cfg.hidden_size], stream)?,
+                mlp_input: zeros_bf16(&[1, cfg.hidden_size], stream)?,
+                hidden_after_attention: zeros_bf16(&[1, cfg.hidden_size], stream)?,
+                gate: zeros_bf16(&[1, cfg.intermediate_size], stream)?,
+                up: zeros_bf16(&[1, cfg.intermediate_size], stream)?,
+                activated: zeros_bf16(&[1, cfg.intermediate_size], stream)?,
+                down: zeros_bf16(&[1, cfg.hidden_size], stream)?,
+            })
+        }
+    }
+
+    struct DecodeGraphStorage {
+        _embedding_hidden: Tensor<bf16>,
+        _layers: Vec<DecodeLayerBuffers>,
+        _final_hidden: Tensor<bf16>,
+        _final_residual: Tensor<bf16>,
+    }
+
+    struct DecodeGraph {
+        graph: CudaGraph<()>,
+        stream: Arc<Stream>,
+        token_ids: Tensor<u32>,
+        positions: Tensor<u32>,
+        current_slots: Tensor<u32>,
+        context_slots: Tensor<u32>,
+        attention_metadata: Tensor<i32>,
+        logits: Arc<Tensor<bf16>>,
+        context_bucket: usize,
+        _storage: DecodeGraphStorage,
+    }
+
+    impl DecodeGraph {
+        fn capture(runtime: &CudaLlama, context_bucket: usize) -> Result<Self, ModelError> {
+            let cfg = &runtime.model.config;
+            let stream = runtime.stream.clone();
+            let token_ids = copy_u32(&[0], &stream, "graph token IDs")?;
+            let positions = copy_u32(&[0], &stream, "graph positions")?;
+            let current_slots =
+                copy_u32(&[runtime.capacity as u32], &stream, "graph current slots")?;
+            let context_slots = copy_u32(
+                &vec![runtime.capacity as u32; context_bucket],
+                &stream,
+                "graph context slots",
+            )?;
+            let attention_metadata = copy_i32(&[1, 0], &stream, "graph attention metadata")?;
+            let mut embedding_hidden = zeros_bf16(&[1, cfg.hidden_size], &stream)?;
+            let mut layers: Vec<_> = (0..cfg.num_hidden_layers)
+                .map(|_| DecodeLayerBuffers::allocate(cfg, context_bucket, &stream))
+                .collect::<Result<_, _>>()?;
+            let mut final_hidden = zeros_bf16(&[1, cfg.hidden_size], &stream)?;
+            let mut final_residual = zeros_bf16(&[1, cfg.hidden_size], &stream)?;
+            let logits = Arc::new(zeros_bf16(&[1, cfg.vocab_size], &stream)?);
+
+            let graph = CudaGraph::scope(&stream, |scope| {
+                scope.record(
+                    kernels::embedding_bf16(
+                        &token_ids,
+                        &runtime.weights.embedding,
+                        (&mut embedding_hidden).partition([1, HIDDEN_BLOCK]),
+                    )
+                    .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()]),
+                )?;
+
+                for layer_index in 0..cfg.num_hidden_layers {
+                    if layer_index == 0 {
+                        let layer = &mut layers[0];
+                        scope.record(
+                            unsafe {
+                                kernels::rms_norm_bf16(
+                                    &embedding_hidden,
+                                    &runtime.weights.layers[0].input_norm,
+                                    (&mut layer.attention_input).partition([1, cfg.hidden_size]),
+                                    cfg.rms_norm_eps,
+                                )
+                            }
+                            .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()]),
+                        )?;
+                    } else {
+                        let (previous, current) = layers.split_at_mut(layer_index);
+                        let previous = &previous[layer_index - 1];
+                        let current = &mut current[0];
+                        scope.record(
+                            unsafe {
+                                kernels::add_rms_norm_bf16(
+                                    &previous.hidden_after_attention,
+                                    &previous.down,
+                                    &runtime.weights.layers[layer_index].input_norm,
+                                    (&mut current.attention_input).partition([1, cfg.hidden_size]),
+                                    (&mut current.residual).partition([1, cfg.hidden_size]),
+                                    cfg.rms_norm_eps,
+                                )
+                            }
+                            .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()]),
+                        )?;
+                    }
+
+                    let layer_weights = &runtime.weights.layers[layer_index];
+                    let layer = &mut layers[layer_index];
+                    record_gemm(
+                        scope,
+                        &layer_weights.query,
+                        &layer.attention_input,
+                        &layer.query,
+                        cfg.q_width(),
+                        1,
+                        cfg.hidden_size,
+                    )?;
+                    record_gemm(
+                        scope,
+                        &layer_weights.key,
+                        &layer.attention_input,
+                        &layer.key,
+                        cfg.kv_width(),
+                        1,
+                        cfg.hidden_size,
+                    )?;
+                    record_gemm(
+                        scope,
+                        &layer_weights.value,
+                        &layer.attention_input,
+                        &layer.value,
+                        cfg.kv_width(),
+                        1,
+                        cfg.hidden_size,
+                    )?;
+
+                    let query = layer
+                        .query
+                        .view(&[1, cfg.num_attention_heads, cfg.head_dim])
+                        .map_err(device_error)?;
+                    let key = layer
+                        .key
+                        .view(&[1, cfg.num_key_value_heads, cfg.head_dim])
+                        .map_err(device_error)?;
+                    let value = layer
+                        .value
+                        .view(&[1, cfg.num_key_value_heads, cfg.head_dim])
+                        .map_err(device_error)?;
+                    scope.record(
+                        kernels::rope_q_bf16(
+                            &query,
+                            &positions,
+                            &runtime.cosine,
+                            &runtime.sine,
+                            (&mut layer.rotated_query).partition([1, 1, cfg.head_dim]),
+                        )
+                        .generics(vec![
+                            cfg.head_dim.to_string(),
+                            (cfg.head_dim / 2).to_string(),
+                        ]),
+                    )?;
+                    scope.record(
+                        unsafe {
+                            kernels::rope_kv_write_bf16(
+                                &key,
+                                &value,
+                                &positions,
+                                &current_slots,
+                                &runtime.cosine,
+                                &runtime.sine,
+                                runtime.key_cache[layer_index].device_pointer(),
+                                runtime.value_cache[layer_index].device_pointer(),
+                                (&mut layer.rotated_key).partition([1, 1, cfg.head_dim]),
+                            )
+                        }
+                        .generics(vec![
+                            cfg.head_dim.to_string(),
+                            (cfg.head_dim / 2).to_string(),
+                            cfg.num_key_value_heads.to_string(),
+                        ]),
+                    )?;
+                    scope.record(
+                        kernels::gather_flat_kv_bf16(
+                            &context_slots,
+                            &runtime.key_cache[layer_index],
+                            (&mut layer.gathered_key).partition([1, 1, cfg.head_dim]),
+                        )
+                        .generics(vec![cfg.head_dim.to_string()]),
+                    )?;
+                    scope.record(
+                        kernels::gather_flat_kv_bf16(
+                            &context_slots,
+                            &runtime.value_cache[layer_index],
+                            (&mut layer.gathered_value).partition([1, 1, cfg.head_dim]),
+                        )
+                        .generics(vec![cfg.head_dim.to_string()]),
+                    )?;
+                    scope.record(
+                        unsafe {
+                            kernels::causal_attention_bf16(
+                                &layer.rotated_query,
+                                &layer.gathered_key,
+                                &layer.gathered_value,
+                                &attention_metadata,
+                                (&mut layer.attention).partition([
+                                    ATTENTION_QUERY_BLOCK,
+                                    1,
+                                    cfg.head_dim,
+                                ]),
+                                1.0 / (cfg.head_dim as f32).sqrt(),
+                                (cfg.num_attention_heads / cfg.num_key_value_heads) as i32,
+                            )
+                        }
+                        .generics(vec![
+                            ATTENTION_QUERY_BLOCK.to_string(),
+                            ATTENTION_KEY_BLOCK.to_string(),
+                            cfg.head_dim.to_string(),
+                        ]),
+                    )?;
+                    scope.record(api::memcpy(&mut layer.attention_flat, &layer.attention))?;
+                    record_gemm(
+                        scope,
+                        &layer_weights.output,
+                        &layer.attention_flat,
+                        &layer.attention_output,
+                        cfg.hidden_size,
+                        1,
+                        cfg.hidden_size,
+                    )?;
+                    let residual = if layer_index == 0 {
+                        &embedding_hidden
+                    } else {
+                        &layer.residual
+                    };
+                    scope.record(
+                        unsafe {
+                            kernels::add_rms_norm_bf16(
+                                residual,
+                                &layer.attention_output,
+                                &layer_weights.post_norm,
+                                (&mut layer.mlp_input).partition([1, cfg.hidden_size]),
+                                (&mut layer.hidden_after_attention).partition([1, cfg.hidden_size]),
+                                cfg.rms_norm_eps,
+                            )
+                        }
+                        .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()]),
+                    )?;
+                    record_gemm(
+                        scope,
+                        &layer_weights.gate,
+                        &layer.mlp_input,
+                        &layer.gate,
+                        cfg.intermediate_size,
+                        1,
+                        cfg.hidden_size,
+                    )?;
+                    record_gemm(
+                        scope,
+                        &layer_weights.up,
+                        &layer.mlp_input,
+                        &layer.up,
+                        cfg.intermediate_size,
+                        1,
+                        cfg.hidden_size,
+                    )?;
+                    scope.record(
+                        kernels::silu_mul_bf16(
+                            &layer.gate,
+                            &layer.up,
+                            (&mut layer.activated).partition([1, MLP_BLOCK]),
+                        )
+                        .generics(vec![MLP_BLOCK.to_string()]),
+                    )?;
+                    record_gemm(
+                        scope,
+                        &layer_weights.down,
+                        &layer.activated,
+                        &layer.down,
+                        cfg.hidden_size,
+                        1,
+                        cfg.intermediate_size,
+                    )?;
+                }
+
+                let last = layers
+                    .last()
+                    .ok_or_else(|| DeviceError::Internal("model has no layers".into()))?;
+                scope.record(
+                    unsafe {
+                        kernels::add_rms_norm_bf16(
+                            &last.hidden_after_attention,
+                            &last.down,
+                            &runtime.weights.final_norm,
+                            (&mut final_hidden).partition([1, cfg.hidden_size]),
+                            (&mut final_residual).partition([1, cfg.hidden_size]),
+                            cfg.rms_norm_eps,
+                        )
+                    }
+                    .generics(vec![cfg.hidden_size.to_string(), HIDDEN_BLOCK.to_string()]),
+                )?;
+                record_gemm(
+                    scope,
+                    &runtime.weights.lm_head,
+                    &final_hidden,
+                    &logits,
+                    cfg.vocab_size,
+                    1,
+                    cfg.hidden_size,
+                )
+            })
+            .map_err(|error| cuda_error("capture decode CUDA graph", error))?;
+
+            Ok(Self {
+                graph,
+                stream,
+                token_ids,
+                positions,
+                current_slots,
+                context_slots,
+                attention_metadata,
+                logits,
+                context_bucket,
+                _storage: DecodeGraphStorage {
+                    _embedding_hidden: embedding_hidden,
+                    _layers: layers,
+                    _final_hidden: final_hidden,
+                    _final_residual: final_residual,
+                },
+            })
+        }
+
+        fn forward(
+            &mut self,
+            token_id: u32,
+            position: u32,
+            current_slot: u32,
+            context_slots: &[u32],
+            sentinel_slot: u32,
+        ) -> Result<Vec<f32>, ModelError> {
+            let token_ids = copy_u32(&[token_id], &self.stream, "decode graph token")?;
+            let positions = copy_u32(&[position], &self.stream, "decode graph position")?;
+            let current_slots = copy_u32(&[current_slot], &self.stream, "decode graph KV slot")?;
+            let context_len = i32::try_from(context_slots.len())
+                .map_err(|_| ModelError::Cuda("decode context exceeds i32".into()))?;
+            let mut padded_context_slots = context_slots.to_vec();
+            padded_context_slots.resize(self.context_bucket, sentinel_slot);
+            let context_slots = copy_u32(
+                &padded_context_slots,
+                &self.stream,
+                "decode graph context slots",
+            )?;
+            let attention_metadata = copy_i32(
+                &[context_len, position as i32],
+                &self.stream,
+                "decode graph attention metadata",
+            )?;
+
+            self.graph
+                .update(api::memcpy(&mut self.token_ids, &token_ids))
+                .map_err(|error| cuda_error("update graph token", error))?;
+            self.graph
+                .update(api::memcpy(&mut self.positions, &positions))
+                .map_err(|error| cuda_error("update graph position", error))?;
+            self.graph
+                .update(api::memcpy(&mut self.current_slots, &current_slots))
+                .map_err(|error| cuda_error("update graph KV slot", error))?;
+            self.graph
+                .update(api::memcpy(&mut self.context_slots, &context_slots))
+                .map_err(|error| cuda_error("update graph context slots", error))?;
+            self.graph
+                .update(api::memcpy(
+                    &mut self.attention_metadata,
+                    &attention_metadata,
+                ))
+                .map_err(|error| cuda_error("update graph attention metadata", error))?;
+            self.graph
+                .launch()
+                .sync_on(&self.stream)
+                .map_err(|error| cuda_error("replay decode CUDA graph", error))?;
+            let logits: Vec<bf16> = self
+                .logits
+                .clone()
+                .to_host_vec()
+                .sync_on(&self.stream)
+                .map_err(|error| cuda_error("copy graph logits to host", error))?;
+            Ok(logits.into_iter().map(bf16::to_f32).collect())
+        }
+    }
+
+    fn record_gemm(
+        scope: &Scope,
+        matrix: &Tensor<bf16>,
+        rhs: &Tensor<bf16>,
+        out: &Tensor<bf16>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), DeviceError> {
+        scope
+            .record(
+                cublas::gemm_bf16_into(matrix, rhs, out, m, n, k)
+                    .map_err(|error| DeviceError::Internal(error.to_string()))?,
+            )?
+            .map_err(|error| DeviceError::Internal(error.to_string()))
+    }
+
+    fn zeros_bf16(shape: &[usize], stream: &Arc<Stream>) -> Result<Tensor<bf16>, ModelError> {
+        api::zeros::<bf16>(shape)
+            .sync_on(stream)
+            .map_err(|error| cuda_error("allocate decode graph buffer", error))
+    }
+
+    fn device_error(error: impl std::fmt::Debug) -> DeviceError {
+        DeviceError::Internal(format!("decode graph tensor view: {error:?}"))
     }
 
     struct LlamaCudaBackend {
@@ -941,6 +1500,10 @@ mod cuda_impl {
         fn remove_request(&mut self, request_id: RequestId) {
             self.requests.remove(&request_id);
         }
+
+        fn take_execution_stats(&mut self) -> BackendExecutionStats {
+            std::mem::take(&mut self.runtime.execution_stats)
+        }
     }
 
     #[derive(Debug)]
@@ -1046,7 +1609,13 @@ mod cuda_impl {
         kv_capacity_tokens: usize,
     ) -> Result<Box<dyn Backend>, ModelError> {
         let model = Arc::new(Llama32::load(model_id, model_dir)?);
-        let runtime = CudaLlama::load(model, device_id, kv_capacity_tokens)?;
+        let mut runtime = CudaLlama::load(model, device_id, kv_capacity_tokens)?;
+        runtime.warm_decode_graphs()?;
+        tracing::info!(
+            graph_buckets = runtime.decode_graphs.len(),
+            kv_capacity_tokens,
+            "Llama CUDA backend loaded and decode graphs warmed"
+        );
         Ok(Box::new(LlamaCudaBackend {
             runtime,
             requests: HashMap::new(),
@@ -1109,7 +1678,7 @@ mod cuda_impl {
         let slots: Vec<u32> = (0..token_ids.len())
             .map(|index| (capacity - 1 - index) as u32)
             .collect();
-        let runtime = CudaLlama::load(Arc::new(model), device_id, capacity)?;
+        let mut runtime = CudaLlama::load(Arc::new(model), device_id, capacity)?;
         let logits = runtime
             .forward(&token_ids, &positions, &slots, &slots, true)?
             .ok_or_else(|| ModelError::Cuda("forward omitted requested logits".into()))?;
