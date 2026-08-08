@@ -128,9 +128,9 @@ def wait_until_ready(
     raise TimeoutError(f"server did not become ready within {timeout_seconds:g}s")
 
 
-def stop_server(process: subprocess.Popen[bytes]) -> None:
+def stop_server(process: subprocess.Popen[bytes]) -> int:
     if process.poll() is not None:
-        return
+        return process.returncode
     process.send_signal(signal.SIGINT)
     try:
         process.wait(timeout=30)
@@ -141,6 +141,7 @@ def stop_server(process: subprocess.Popen[bytes]) -> None:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=10)
+    return process.returncode
 
 
 def run_workload(
@@ -197,6 +198,7 @@ def write_summary(output_dir: pathlib.Path) -> None:
     ]
     reports = [(name, json.loads(path.read_text())) for name, path in workloads]
     first = reports[0][1]
+    manifest = json.loads((output_dir / "run.json").read_text())
     lines = [
         "# Tesseract A100 serving benchmark",
         "",
@@ -205,6 +207,7 @@ def write_summary(output_dir: pathlib.Path) -> None:
         "## Environment",
         "",
         f"- Git: `{first['git_revision']}`",
+        f"- Command: `{manifest['command']}`",
         f"- GPU: {first['hardware']}",
         f"- CUDA: {first['cuda']}",
         f"- Rust: {first['rust']}",
@@ -294,6 +297,7 @@ def main() -> int:
         "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "git_revision": revision,
         "git_dirty": bool(tracked_changes),
+        "command": shlex.join(["cargo", "bench-a100", *sys.argv[1:]]),
         "model": args.model,
         "model_revision": args.model_revision,
         "model_path": str(args.model_path),
@@ -308,8 +312,8 @@ def main() -> int:
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
-    print(f"benchmark revision: {revision}")
-    print(f"benchmark output: {output_dir}")
+    print(f"benchmark revision: {revision}", flush=True)
+    print(f"benchmark output: {output_dir}", flush=True)
     subprocess.run(
         [
             cargo,
@@ -348,7 +352,7 @@ def main() -> int:
             )
             manifest["status"] = "running"
             manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-            print("server ready; running batch-1 workload")
+            print("server ready; running batch-1 workload", flush=True)
             run_workload(
                 root=root,
                 environment=environment,
@@ -359,7 +363,7 @@ def main() -> int:
                 requests=args.batch1_requests,
                 output=output_dir / "batch1.json",
             )
-            print("running concurrent first-shape workload")
+            print("running concurrent first-shape workload", flush=True)
             run_workload(
                 root=root,
                 environment=environment,
@@ -370,7 +374,7 @@ def main() -> int:
                 requests=args.concurrent_requests,
                 output=output_dir / "concurrent-first.json",
             )
-            print("running identical warm-shape workload")
+            print("running identical warm-shape workload", flush=True)
             run_workload(
                 root=root,
                 environment=environment,
@@ -391,13 +395,23 @@ def main() -> int:
         return 1
     finally:
         if server_process is not None:
-            stop_server(server_process)
+            manifest["server_exit_code"] = stop_server(server_process)
+
+    if manifest.get("server_exit_code") != 0:
+        manifest["status"] = "failed"
+        manifest["error"] = (
+            f"server exited with status {manifest.get('server_exit_code')} during shutdown"
+        )
+        manifest["finished_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        print(f"benchmark failed: {manifest['error']}", file=sys.stderr)
+        return 1
 
     manifest["status"] = "complete"
     manifest["finished_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     write_summary(output_dir)
-    print(f"benchmark complete: {output_dir / 'README.md'}")
+    print(f"benchmark complete: {output_dir / 'README.md'}", flush=True)
     return 0
 
 
