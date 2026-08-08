@@ -175,6 +175,10 @@ we might want to opt-in the persistent CUBIN cache.
 ```
 
 ```text
+i'd love a proper bench command. 
+```
+
+```text
 <codex_internal_context source="goal">
 Continue working toward the active thread goal.
 

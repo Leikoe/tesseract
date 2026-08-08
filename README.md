@@ -26,7 +26,7 @@ The canonical, idempotent setup is documented in
 pinned model revision, start the release server with:
 
 ```bash
-cargo +1.89.0 run --release --features cuda -- \
+cargo +1.89.0 run --release --features cuda --bin tesseract -- \
   --model-path /home/ubuntu/models/Llama-3.2-1B-Instruct
 ```
 
@@ -58,6 +58,22 @@ strict CUDA lint, model/SafeTensors validation, project-owned cuTile kernels,
 the full next-token path, the persistent-CUBIN-cache check, and a pinned
 upstream cuTile smoke test. Retained correctness, sanitizer, API, and benchmark
 evidence lives under `docs/validation/` and `docs/benchmarks/`.
+
+## Benchmark
+
+On the validated A100 node, one command builds and runs the production server,
+waits for graph warmup/readiness, executes batch-1 plus first-shape and warm
+concurrency workloads, captures raw results/metrics/logs, writes a Markdown
+report, and shuts the server down:
+
+```bash
+cargo bench-a100
+```
+
+Results default to a timestamped directory under `target/benchmarks/`. The
+command refuses tracked worktree changes so every result names a reproducible
+Git revision. Use `cargo bench-a100 --help` for workload, output, model, and
+server configuration overrides.
 
 
 ## Research notes

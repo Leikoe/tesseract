@@ -57,6 +57,20 @@ Run all host/model/cuTile gates afterward:
 ssh ubuntu@NODE_IP '/home/ubuntu/tesseract/scripts/node/verify-a100.sh'
 ```
 
+Run the complete production serving benchmark with:
+
+```bash
+cd /home/ubuntu/tesseract
+cargo bench-a100
+```
+
+The command owns the release build and server lifecycle, waits for readiness,
+runs batch-1 and first/warm concurrency workloads, and writes a self-contained
+result directory under `target/benchmarks/`. To retain a particular run in Git,
+pass an explicit path such as
+`--output docs/benchmarks/$(date -u +%Y-%m-%d-a100)` and copy or commit it before
+the spot node disappears.
+
 For the slower memory-safety gate, build the CUDA smoke and next-token tools and
 run them under the CUDA toolkit's Compute Sanitizer:
 
