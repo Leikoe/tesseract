@@ -1,7 +1,7 @@
 # Tesseract Engine Abstraction Design
 
-Status: proposed design, revised after source-level vLLM and SGLang review,
-2026-08-08.
+Status: proposed design, revised after source-level vLLM, SGLang, and TokenSpeed
+review, 2026-08-08.
 
 This document defines the boundary between request semantics, scheduling,
 model architecture, and CUDA execution. The goal is not to maximize the number
@@ -205,10 +205,15 @@ together in both upstream engines.
 
 ```rust
 pub(crate) trait AttentionBackend: 'static {
+    type LayerState;
     type Metadata;
     type GraphState;
 
     fn capabilities(&self) -> AttentionCapabilities;
+    fn prepare_layer(
+        &self,
+        spec: &AttentionLayerSpec,
+    ) -> Result<Self::LayerState, LoadError>;
     fn prepare(&mut self, batch: &DeviceBatch) -> Result<Self::Metadata, ExecutionError>;
     fn prepare_capture(&mut self, shape: ExecutionShape)
         -> Result<Self::GraphState, ExecutionError>;
@@ -219,6 +224,7 @@ pub(crate) trait AttentionBackend: 'static {
     ) -> Result<(), ExecutionError>;
     fn enqueue(
         &self,
+        layer: &Self::LayerState,
         metadata: &Self::Metadata,
         operation: AttentionOperation<'_>,
     ) -> Result<(), ExecutionError>;
@@ -226,9 +232,12 @@ pub(crate) trait AttentionBackend: 'static {
 ```
 
 There is one startup-selected backend strategy per compatible execution path,
-not a trait object stored in every layer. `DenseDecoder<A>` uses static dispatch.
-Prefill and decode may use different concrete backends when their capabilities
-require it.
+not a trait object stored in every layer. Each layer stores only the backend's
+typed, construction-validated `LayerState`; batch metadata and graph state
+remain backend/executor-owned. `DenseDecoder<A>` uses static dispatch. Prefill,
+decode, and mixed execution may resolve to different prepared leaf plans inside
+one backend, or to different concrete backends when their capabilities require
+it.
 
 There are no per-layer trait objects or universal `Layer`/`Kernel` interfaces.
 Operation-family backends are statically composed by shared program types.
@@ -434,15 +443,18 @@ pub enum KernelRequirement {
 
 pub struct KernelPlan {
     descriptor: KernelPlanDescriptor,
-    // concrete, already-validated operation handles
+    // concrete, already-validated operation handles and shape dispatch tables
 }
 ```
 
 This catalog is a cold construction mechanism, not a universal hot-path
-`Kernel` trait. There is no registry lookup, string matching, capability
-filtering, or dynamic dispatch in the transformer loop. Explicit development
-overrides alter `BuildRequest` and are recorded in `KernelPlanDescriptor`, so
-profiles and failures always report the exact selected implementation.
+`Kernel` trait. A requirement may resolve to one implementation or to an
+immutable bucket table/typed decision tree when the best kernel depends on
+runtime batch geometry. There is no global registry lookup, string matching,
+capability filtering, or dynamic dispatch in the transformer loop. Explicit
+development overrides alter `BuildRequest` and are recorded in
+`KernelPlanDescriptor`, so profiles and failures always report the exact
+selected implementation.
 
 The demonstrated internal strategy interfaces are:
 

@@ -36,6 +36,24 @@ The conclusion is not to reproduce TokenSpeed's plugin system. Its useful idea
 is the layered contract and selection model. Tesseract can preserve that source
 extensibility with linked Rust factories and static hot-path composition.
 
+## Current implementation versus target design
+
+The comparison above is primarily validation of the target architecture, not a
+claim that the current Rust implementation has reached it. The distinction is
+important:
+
+| Concern | Current Tesseract | Target confirmed by TokenSpeed |
+| --- | --- | --- |
+| Scheduled work | private, validated `ForwardBatch` with typed positions/KV slots and an explicit mixed partition | retain this boundary and extend it with request-slot generations, output selection, and grouped state views |
+| Engine/executor protocol | synchronous `Backend::{add_request, step, remove_request}` | submission tickets, completion events, and epoch-fenced reclamation |
+| Executor request state | authoritative prompt/generated/decoder state still lives in `LlamaCudaBackend` | engine authority plus versioned, non-authoritative device mirrors |
+| Physical state | one flat `KvSlot` domain | a schema of attention/recurrent/cache groups with typed arena identity |
+| Model program | Llama architecture, batching, graphs, sampling, and CUDA lifecycle remain combined in a 2,904-line file | small private architecture adapter constructing a shared decoder program |
+| Operation implementations | direct concrete kernels | stateful `AttentionBackend`, planned `MoeBackend`, and construction-time leaf-kernel plans |
+
+The typed mixed batch is therefore the first realized slice of the design. It
+does not by itself solve the model-isolation or executor-lifecycle problem.
+
 ## The three levels must remain distinct
 
 TokenSpeed reveals three different substitution boundaries:
@@ -89,18 +107,29 @@ Tesseract should use a typed `KernelCatalog` only during executor construction.
 The architecture and selected backends submit closed `KernelRequirement` values;
 the builder resolves every requirement or fails before allocating/capturing the
 executor. The result is an immutable `KernelPlan` stored by the concrete program.
-No registry lookup, capability filtering, string comparison, or virtual dispatch
-is permitted in the transformer loop.
+A plan need not mean one kernel for every runtime shape: it may contain a
+validated bucket table or typed decision tree over dynamic batch geometry. What
+must be absent from the transformer loop is global discovery, capability
+filtering, string comparison, or virtual dispatch.
 
 An implementation descriptor should still record a stable name and revision so
 profiles and failures identify the chosen code. Explicit development overrides
 are useful, but they should alter the build request and be reported in the final
 plan rather than invisibly modifying a global selector.
 
+TokenSpeed's out-of-tree plugin mechanism is narrower than a general runtime
+component system. Discovery is an explicit startup action over the
+`tokenspeed_kernel.plugins` Python entry-point group, and each package merely
+calls a registration function
+(`tokenspeed-kernel/python/tokenspeed_kernel/plugins/__init__.py:21` and `:153`).
+Tesseract's linked-crate registration function is the source-level equivalent:
+it can add descriptors to the cold catalog without loading code dynamically or
+changing the hot-path ownership model.
+
 ## Models and layer composition
 
 TokenSpeed's dense Llama implementation is 395 lines, versus the current
-2,895-line `src/model/llama_3_2.rs`, because generic execution, cache, graph,
+2,904-line `src/model/llama_3_2.rs`, because generic execution, cache, graph,
 sampling, and common transformer mechanics live elsewhere. Llama defines its
 MLP, projections/RoPE/attention computation, layer resolvers, and weight mapping
 (`python/tokenspeed/runtime/models/llama.py:63`, `:115`, and `:290`). Shared
@@ -145,6 +174,13 @@ must be able to expose separate prepared paths for prefill, decode, and mixed
 execution, potentially using different leaf kernel plans. This need not mean
 three trait objects; it can be associated plan data inside one concrete backend.
 
+TokenSpeed also keeps a lightweight per-layer `PagedAttention` object while the
+selected backend owns batch metadata and graph state. The Rust contract should
+make the same split explicit with an associated `LayerState`: construction
+validates layer-specific cache/scaling information once, and every enqueue takes
+that typed state. Otherwise layer identifiers and scale/layout requirements are
+likely to return as untyped fields inside `AttentionOperation`.
+
 ## MoE
 
 TokenSpeed treats MoE selection as a whole plan. `MoELayer` builds a plan from
@@ -184,8 +220,9 @@ Its runtime has explicit `EXTEND`, `DECODE`, `MIXED`, and `IDLE` modes
 
 Tesseract therefore needs `ForwardKind::Mixed`; treating a mixed batch as merely
 an implementation detail would lose its ordering and output-selection contract.
-The mixed payload should hold distinct prefill and decode sub-batches and prove
-their row partition at construction.
+The current representation proves this with disjoint prefill and decode ranges
+over one stable-partitioned sequence array. Separate owning sub-batches are not
+necessary.
 
 TokenSpeed also keeps device-resident per-request state such as future input
 tokens and valid cache lengths, then updates it after a forward
@@ -253,16 +290,31 @@ conformance suites.
 ## Concrete amendments to the Tesseract design
 
 1. Keep `AttentionBackend` sealed and statically composed.
-2. Add a construction-time typed kernel catalog that resolves an immutable
-   `KernelPlan`; do not add a universal hot-path `Kernel` trait.
-3. Add `ForwardKind::Mixed` with a validated prefill/decode row partition.
-4. Expand the MoE contract into declared pipeline phases and fusion/capture/
+2. Give `AttentionBackend` typed per-layer state in addition to eager metadata
+   and graph state, and require explicit prefill/decode/mixed capability.
+3. Add a construction-time typed kernel catalog that resolves an immutable
+   shape-dispatch `KernelPlan`; do not add a universal hot-path `Kernel` trait.
+4. Retain `ForwardKind::Mixed` with its validated prefill/decode row partition.
+5. Expand the MoE contract into declared pipeline phases and fusion/capture/
    overlap capabilities.
-5. Keep dense feed-forward concrete until a second lifecycle-bearing
+6. Keep dense feed-forward concrete until a second lifecycle-bearing
    implementation proves the trait boundary.
-6. Reserve a closed construction-time `LayerPlan` for future distributed
+7. Reserve a closed construction-time `LayerPlan` for future distributed
    placement and communication compilation; do not expose it to the engine.
-7. Model scheduler output as plans and executor feedback as completion events,
+8. Model scheduler output as plans and executor feedback as completion events,
    tied together by ticket IDs and reclamation epochs.
-8. Add shrinking reference-model properties for scheduler/cache behavior and a
+9. Add shrinking reference-model properties for scheduler/cache behavior and a
    reusable numerical/graph conformance suite for every backend implementation.
+
+## What to copy and what not to copy
+
+Copy the boundaries: stable-partitioned mixed batches, scheduler plans and
+completion events, executor-resident request mirrors, stateful attention
+backends, whole-pipeline MoE planning, heterogeneous cache groups, and standalone
+kernel numerics/benchmarks.
+
+Do not copy the representation accidents: parallel public vectors, string cache
+group IDs, mutable optional-field contexts, signature introspection, plan
+dictionaries, process-global overrides, or repeated registry resolution in an
+operation call. Rust lets Tesseract make those contracts closed, typed, and
+construction-validated without giving up the extensibility that motivated them.
