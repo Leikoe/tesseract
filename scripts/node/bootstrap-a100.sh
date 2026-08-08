@@ -37,6 +37,13 @@ if [[ ! -x "${TESSERACT_CUDA_PATH}/bin/nvcc" ]]; then
   sudo apt-get install -y cuda-toolkit-13-3
 fi
 
+if [[ -f "${HOME}/.cargo/env" ]]; then
+  # Non-interactive SSH shells often omit ~/.cargo/bin from PATH even when
+  # rustup is already installed.
+  # shellcheck source=/dev/null
+  . "${HOME}/.cargo/env"
+fi
+
 if ! command -v rustup >/dev/null 2>&1; then
   TESSERACT_RUSTUP_SCRIPT="$(mktemp /tmp/tesseract-rustup.XXXXXX.sh)"
   trap 'rm -f "${TESSERACT_RUSTUP_SCRIPT}"' EXIT
