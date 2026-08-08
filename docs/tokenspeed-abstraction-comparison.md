@@ -45,7 +45,7 @@ important:
 | Concern | Current Tesseract | Target confirmed by TokenSpeed |
 | --- | --- | --- |
 | Scheduled work | private, validated `ForwardBatch` with typed positions/KV slots and an explicit mixed partition | retain this boundary and extend it with request-slot generations, output selection, and grouped state views |
-| Engine/executor protocol | `ModelExecutor::{submit,poll}` with typed completion tickets and one in-flight synchronous CUDA submission | enable event-backed overlap, multiple tickets, and epoch-fenced reclamation without changing the boundary |
+| Engine/executor protocol | `ModelExecutor::{submit,poll}` with typed completion tickets, variable accepted-token vectors per request, and one in-flight synchronous CUDA submission | enable event-backed overlap, multiple tickets, and epoch-fenced reclamation without changing the boundary |
 | Executor request state | the engine owns prompt/generated/decoder/sampling state; the executor consumes batch-local materializations and owns physical KV | retain engine authority while allowing explicit versioned, non-authoritative device mirrors when they are performance-justified |
 | Physical state | a grouped `StateSchema` with process-unique arena identity and one implemented flat-KV group | extend the same schema with paged attention, recurrent/cache groups, and shared-prefix leases |
 | Model program | `CudaExecutor<P>` owns lowering, completion, output validation, and sampling; the 538-line Llama adapter constructs a validated model-neutral dense-decoder artifact; graph policy and the concrete flat-KV attention implementation are separate private modules | preserve this composition when adding the second dense architecture and attention backend |

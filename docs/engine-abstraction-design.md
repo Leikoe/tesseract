@@ -126,6 +126,11 @@ pub trait ModelExecutor: 'static {
 accepted tokens per request; other variants carry prompt logprobs, pooling
 results, intermediate completion, or cache-transfer events. Cardinality is
 validated against the batch's `OutputSelection`, not a universal one-token rule.
+The implemented ordinary-generation mode now groups a variable token vector by
+request and validates unique, expected request IDs. Because that mode has no
+separate verification/fallback event, its vector must be non-empty; zero
+accepted candidates become valid only with a forward mode whose state machine
+defines the corresponding retry or fallback transition.
 
 The outer engine remains generic over `E: ModelExecutor`, so ordinary serving
 does not require a virtual call. A `Box<dyn ModelExecutor>` is used only by the
@@ -794,9 +799,12 @@ The refactor should remain runnable after every step:
 4. **Partially implemented:** replace synchronous `Backend::step` with
    mode-aware `ModelExecutor::{submit,poll}` and typed execution tickets. The
    first implementation enforces one in-flight ticket and defers cancellation
-   and KV reclamation until completion. CUDA submission itself remains
-   synchronous; event-backed overlap and epoch fencing are the next extension
-   of this boundary.
+   and KV reclamation until completion. `ExecutionOutput::Generation` now
+   carries a variable accepted-token vector per request; the scheduler safely
+   truncates it at stop/EOS/length boundaries and rejects missing, duplicate,
+   unexpected, or zero-progress ordinary-generation results. CUDA submission
+   itself remains synchronous; event-backed overlap and epoch fencing are the
+   next extension of this boundary.
 5. **Partially implemented:** `CudaExecutor<P>` now owns flat batch lowering,
    completion, output-cardinality validation, and sampling, while the existing
    Llama computation is its statically composed initial `ModelProgram`.
