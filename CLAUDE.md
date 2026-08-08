@@ -466,6 +466,8 @@ I want you to clone tokenspeed in references/ too
 
 ```text
 I want you to explore tokenspeed vs our ideas so far
+
+llama file is still almost 3K lines
 ```
 
 ```text

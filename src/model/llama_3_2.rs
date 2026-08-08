@@ -342,7 +342,7 @@ mod cuda_impl {
 
     use super::{
         CudaForwardReport, CudaModelReport, CudaTokenLogit, Llama32, ModelError, WeightStore,
-        execution_bucket, warmup_logical_sizes,
+        warmup_logical_sizes,
     };
 
     type Bf16Tensor = Arc<Tensor<bf16>>;
