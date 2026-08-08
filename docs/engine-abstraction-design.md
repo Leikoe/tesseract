@@ -806,10 +806,13 @@ The refactor should remain runnable after every step:
    itself remains synchronous; event-backed overlap and epoch fencing are the
    next extension of this boundary.
 5. **Partially implemented:** `CudaExecutor<P>` now owns flat batch lowering,
-   completion, output-cardinality validation, and sampling, while the existing
-   Llama computation is its statically composed initial `ModelProgram`.
-   Workspaces, graph management, and execution-shape policy still need to move
-   out of that program and into the generic executor.
+   reusable host materialization, completion, output-cardinality validation,
+   and sampling, while the existing Llama computation is its statically
+   composed initial `ModelProgram`. Lowered vectors and per-request context
+   buffers retain allocation across changing batch sizes, and packed decode no
+   longer reconstructs metadata already produced by lowering. Device
+   workspaces, graph management, and execution-shape policy still need to move
+   out of the program and into the generic executor.
 6. **Partially implemented:** extract a crate-private `AttentionBackend` with
    associated per-layer state and both eager and graph-recording contracts. The
    current direct flat-KV path is its first static implementation and owns K/V

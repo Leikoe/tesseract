@@ -1,0 +1,21 @@
+{
+  "git_revision": "d6ec8c34e24e1081159af7b1f22d6caecaa8f2d7",
+  "hardware": "NVIDIA A100-SXM4-80GB, 8.0, 580.126.09, 81920 MiB",
+  "cuda": "Build cuda_13.3.r13.3/compiler.38244171_0",
+  "rust": "rustc 1.89.0 (29483883e 2025-08-04)",
+  "batch1": {
+    "completion_tokens": 106,
+    "completion_tokens_per_second": 336.8843828821262,
+    "mean_ttft_seconds": 0.007648425999832398
+  },
+  "concurrent_first": {
+    "completion_tokens": 212,
+    "completion_tokens_per_second": 1650.386653303579,
+    "mean_ttft_seconds": 0.012441417249874576
+  },
+  "concurrent_warm": {
+    "completion_tokens": 212,
+    "completion_tokens_per_second": 1583.5244735608874,
+    "mean_ttft_seconds": 0.013229863562855826
+  }
+}
