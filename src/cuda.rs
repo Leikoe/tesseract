@@ -149,11 +149,154 @@ pub fn validate_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaErr
         }
     }
 
+    validate_transformer_primitives(&stream)?;
+
     Ok(Bf16SmokeReport {
         device_id,
         elements: SMOKE_ELEMENTS,
         gemm_rows: 2,
     })
+}
+
+fn validate_transformer_primitives(
+    stream: &std::sync::Arc<cuda_core::Stream>,
+) -> Result<(), CudaError> {
+    use cutile::{tensor::IntoPartition, tile_kernel::TileKernel};
+
+    let token_ids = api::copy_host_vec_to_device(&std::sync::Arc::new(vec![0u32, 1u32]))
+        .sync_on(stream)
+        .map_err(|error| kernel_error("copy transformer token IDs", error))?;
+    let table = api::ones::<bf16>(&[2, 128])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate transformer embedding", error))?;
+    let hidden = api::zeros::<bf16>(&[2, 128])
+        .partition([1, 64])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate transformer hidden state", error))?;
+    let (hidden, _, _) = kernels::embedding_bf16(&token_ids, &table, hidden)
+        .generics(vec!["128".into(), "64".into()])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("execute embedding", error))?;
+    let hidden = hidden.unpartition();
+
+    let norm_weight = api::ones::<bf16>(&[128])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate RMSNorm weight", error))?;
+    let normalized = api::zeros::<bf16>(&[2, 128])
+        .partition([1, 128])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate RMSNorm output", error))?;
+    let (_, _, normalized, _) =
+        unsafe { kernels::rms_norm_bf16(&hidden, &norm_weight, normalized, 1.0e-5) }
+            .generics(vec!["128".into(), "64".into()])
+            .sync_on(stream)
+            .map_err(|error| kernel_error("execute RMSNorm", error))?;
+    let normalized = normalized.unpartition();
+
+    let up = api::ones::<bf16>(&[2, 128])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate SiLU input", error))?;
+    let activated = api::zeros::<bf16>(&[2, 128])
+        .partition([1, 64])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate SiLU output", error))?;
+    let (_, _, activated) = kernels::silu_mul_bf16(&normalized, &up, activated)
+        .generics(vec!["64".into()])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("execute SiLU", error))?;
+    let activated_host: Vec<bf16> = activated
+        .unpartition()
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| kernel_error("copy SiLU result", error))?;
+    if activated_host
+        .iter()
+        .any(|value| !(0.72..=0.75).contains(&value.to_f32()))
+    {
+        return Err(CudaError::Bf16Kernel {
+            operation: "validate SiLU result",
+            message: "unexpected activation value".into(),
+        });
+    }
+
+    let query = api::ones::<bf16>(&[1, 4, 64])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate RoPE query", error))?;
+    let positions = api::copy_host_vec_to_device(&std::sync::Arc::new(vec![0u32]))
+        .sync_on(stream)
+        .map_err(|error| kernel_error("copy RoPE positions", error))?;
+    let cos = api::ones::<f32>(&[1, 32])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate RoPE cosine", error))?;
+    let sin = api::zeros::<f32>(&[1, 32])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate RoPE sine", error))?;
+    let rotated = api::zeros::<bf16>(&[1, 4, 64])
+        .partition([1, 1, 64])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate RoPE output", error))?;
+    let (_, _, _, _, rotated) = kernels::rope_q_bf16(&query, &positions, &cos, &sin, rotated)
+        .generics(vec!["64".into(), "32".into()])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("execute RoPE", error))?;
+    let rotated = rotated.unpartition();
+
+    let flat_key = api::zeros::<bf16>(&[4, 2, 64])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate flat key cache", error))?;
+    let flat_value = api::ones::<bf16>(&[4, 2, 64])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate flat value cache", error))?;
+    let slots = api::copy_host_vec_to_device(&std::sync::Arc::new(vec![3u32, 1u32]))
+        .sync_on(stream)
+        .map_err(|error| kernel_error("copy flat KV slots", error))?;
+    let key = api::zeros::<bf16>(&[2, 2, 64])
+        .partition([1, 1, 64])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate gathered key", error))?;
+    let value = api::zeros::<bf16>(&[2, 2, 64])
+        .partition([1, 1, 64])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate gathered value", error))?;
+    let (_, _, key) = kernels::gather_flat_kv_bf16(&slots, &flat_key, key)
+        .generics(vec!["64".into()])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("gather flat key cache", error))?;
+    let (_, _, value) = kernels::gather_flat_kv_bf16(&slots, &flat_value, value)
+        .generics(vec!["64".into()])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("gather flat value cache", error))?;
+    let attention = api::zeros::<bf16>(&[1, 4, 64])
+        .partition([1, 1, 64])
+        .sync_on(stream)
+        .map_err(|error| kernel_error("allocate attention output", error))?;
+    let (_, _, _, attention, _, _, _, _) = unsafe {
+        kernels::causal_attention_bf16(
+            &rotated,
+            &key.unpartition(),
+            &value.unpartition(),
+            attention,
+            0.125,
+            2,
+            2,
+            0,
+        )
+    }
+    .generics(vec!["1".into(), "16".into(), "64".into()])
+    .sync_on(stream)
+    .map_err(|error| kernel_error("execute causal attention", error))?;
+    let attention_host: Vec<bf16> = attention
+        .unpartition()
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| kernel_error("copy attention result", error))?;
+    if attention_host.iter().any(|value| value.to_f32() != 1.0) {
+        return Err(CudaError::Bf16Kernel {
+            operation: "validate causal attention result",
+            message: "uniform value cache did not produce ones".into(),
+        });
+    }
+    Ok(())
 }
 
 fn kernel_error(operation: &'static str, error: impl std::fmt::Debug) -> CudaError {
