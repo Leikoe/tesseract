@@ -230,8 +230,12 @@ pub enum ModelError {
     SafeTensors { path: PathBuf, message: String },
     #[error("required tensor `{0}` is missing")]
     MissingTensor(String),
-    #[error("tensor `{name}` has dtype {actual}; expected BF16")]
-    WrongDtype { name: String, actual: String },
+    #[error("tensor `{name}` has dtype {actual}; expected {expected}")]
+    WrongDtype {
+        name: String,
+        expected: String,
+        actual: String,
+    },
     #[error("tensor `{name}` has shape {actual:?}; expected {expected:?}")]
     WrongShape {
         name: String,

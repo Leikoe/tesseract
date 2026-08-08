@@ -205,6 +205,14 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 </codex_internal_context>
 ```
 
+```text
+great! now we can move onto the kind of real production inference that i'd do on A100: nvidia/Qwen3.6-35B-A3B-NVFP4. Remember, do things properly the first time around; it'll save you a ton fixes!
+```
+
+```text
+text-only for now
+```
+
 please ush
 
 do vllm and sglang implement that much for each model as we do in llama 3.2's file ?

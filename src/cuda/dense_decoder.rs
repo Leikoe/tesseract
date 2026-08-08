@@ -174,6 +174,7 @@ impl DeviceWeights {
             if view.dtype() != &WeightDtype::Bf16 {
                 return Err(ModelError::WrongDtype {
                     name,
+                    expected: WeightDtype::Bf16.to_string(),
                     actual: view.dtype().to_string(),
                 });
             }
