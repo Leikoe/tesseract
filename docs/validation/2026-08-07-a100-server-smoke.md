@@ -125,8 +125,17 @@ Paris.` and `The capital of Germany is Berlin.`. Eight scheduler steps executed
 only nine eager forwards: two first-step prefills and seven two-row packed
 decode forwards. The same requests run separately through batch-1 CUDA graphs
 produced byte-identical text. The maximum scheduled batch was two, and KV usage
-and running requests returned to zero. Packed decode is eager in this revision;
-captured batch-shape graphs remain a performance follow-up.
+and running requests returned to zero.
+
+Packed decode was then moved into CUDA graphs keyed by exact batch size and the
+power-of-two maximum context bucket. Batch-1 buckets remained prewarmed. The
+first two-request, bucket-32 workload raised graph captures from five to six;
+the second identical workload left captures at six while graph replays rose
+from eight to sixteen. Across both runs, packed decode counters rose from six
+forwards/12 request rows to 12 forwards/24 request rows. Both runs retained the
+same France/Paris and Germany/Berlin outputs, with zero KV and running-request
+gauges afterward. A graph capture or replay failure is remembered per shape
+and routes subsequent work through the packed eager implementation.
 
 ## Independent BF16 logits reference
 

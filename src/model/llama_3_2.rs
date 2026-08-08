@@ -404,7 +404,8 @@ mod cuda_impl {
         key_cache: Vec<Bf16Tensor>,
         value_cache: Vec<Bf16Tensor>,
         capacity: usize,
-        decode_graphs: HashMap<usize, DecodeGraph>,
+        decode_graphs: HashMap<(usize, usize), DecodeGraph>,
+        failed_decode_graphs: HashSet<(usize, usize)>,
         execution_stats: BackendExecutionStats,
     }
 
@@ -462,6 +463,7 @@ mod cuda_impl {
                 value_cache,
                 capacity,
                 decode_graphs: HashMap::new(),
+                failed_decode_graphs: HashSet::new(),
                 execution_stats: BackendExecutionStats::default(),
             })
         }
@@ -476,17 +478,30 @@ mod cuda_impl {
             greedy: bool,
         ) -> Result<ForwardOutput, ModelError> {
             if return_logits && token_ids.len() == 1 && positions[0] > 0 {
-                let output = self.decode_graph(
-                    token_ids[0],
-                    positions[0],
-                    current_slots[0],
-                    context_slots,
-                    greedy,
-                );
-                if output.is_ok() {
-                    self.execution_stats.graph_replays += 1;
+                let key = (1, context_slots.len().next_power_of_two().max(16));
+                if !self.failed_decode_graphs.contains(&key) {
+                    match self.decode_graph(
+                        token_ids[0],
+                        positions[0],
+                        current_slots[0],
+                        context_slots,
+                        greedy,
+                    ) {
+                        Ok(output) => {
+                            self.execution_stats.graph_replays += 1;
+                            return Ok(output);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                batch_size = 1,
+                                context_bucket = key.1,
+                                %error,
+                                "decode CUDA graph failed; using eager fallback"
+                            );
+                            self.failed_decode_graphs.insert(key);
+                        }
+                    }
                 }
-                return output;
             }
             let output = self.forward_eager(
                 token_ids,
@@ -520,20 +535,58 @@ mod cuda_impl {
         }
 
         fn forward_decode_batch(
-            &self,
+            &mut self,
             token_ids: &[u32],
             positions: &[u32],
             current_slots: &[u32],
             contexts: &[Vec<u32>],
         ) -> Result<Vec<u32>, ModelError> {
-            match self.forward_eager_impl(
-                token_ids,
-                positions,
-                current_slots,
-                &[],
-                Some(contexts),
-                true,
-            )? {
+            let context_bucket = contexts
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(1)
+                .next_power_of_two()
+                .max(16);
+            let key = (token_ids.len(), context_bucket);
+            let output = if self.failed_decode_graphs.contains(&key) {
+                self.forward_eager_impl(
+                    token_ids,
+                    positions,
+                    current_slots,
+                    &[],
+                    Some(contexts),
+                    true,
+                )?
+            } else {
+                match self.decode_graph_batch(token_ids, positions, current_slots, contexts, true) {
+                    Ok(output) => {
+                        self.execution_stats.graph_replays += 1;
+                        output
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            batch_size = key.0,
+                            context_bucket = key.1,
+                            %error,
+                            "packed decode CUDA graph failed; using eager fallback"
+                        );
+                        self.failed_decode_graphs.insert(key);
+                        self.forward_eager_impl(
+                            token_ids,
+                            positions,
+                            current_slots,
+                            &[],
+                            Some(contexts),
+                            true,
+                        )?
+                    }
+                }
+            };
+            if self.failed_decode_graphs.contains(&key) {
+                self.execution_stats.eager_forwards += 1;
+            }
+            match output {
                 ForwardOutput::Tokens(tokens) => Ok(tokens),
                 ForwardOutput::None | ForwardOutput::Logits(_) | ForwardOutput::Token(_) => Err(
                     ModelError::Cuda("packed decode omitted sampled tokens".into()),
@@ -1014,29 +1067,59 @@ mod cuda_impl {
             context_slots: &[u32],
             greedy: bool,
         ) -> Result<ForwardOutput, ModelError> {
-            if current_slot as usize >= self.capacity
-                || context_slots.is_empty()
-                || context_slots
+            self.decode_graph_batch(
+                &[token_id],
+                &[position],
+                &[current_slot],
+                &[context_slots.to_vec()],
+                greedy,
+            )
+        }
+
+        fn decode_graph_batch(
+            &mut self,
+            token_ids: &[u32],
+            positions: &[u32],
+            current_slots: &[u32],
+            contexts: &[Vec<u32>],
+            greedy: bool,
+        ) -> Result<ForwardOutput, ModelError> {
+            let batch_size = token_ids.len();
+            if batch_size == 0
+                || positions.len() != batch_size
+                || current_slots.len() != batch_size
+                || contexts.len() != batch_size
+                || current_slots
                     .iter()
                     .any(|slot| *slot as usize >= self.capacity)
+                || contexts.iter().any(|context| {
+                    context.is_empty() || context.iter().any(|slot| *slot as usize >= self.capacity)
+                })
             {
                 return Err(ModelError::Cuda("invalid decode graph metadata".into()));
             }
-            let bucket = context_slots.len().next_power_of_two().max(16);
-            if !self.decode_graphs.contains_key(&bucket) {
-                let graph = DecodeGraph::capture(self, bucket)?;
-                self.decode_graphs.insert(bucket, graph);
+            let bucket = contexts
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(1)
+                .next_power_of_two()
+                .max(16);
+            let key = (batch_size, bucket);
+            if !self.decode_graphs.contains_key(&key) {
+                let graph = DecodeGraph::capture(self, batch_size, bucket)?;
+                self.decode_graphs.insert(key, graph);
                 self.execution_stats.graph_captures += 1;
             }
             let graph = self
                 .decode_graphs
-                .get_mut(&bucket)
+                .get_mut(&key)
                 .ok_or_else(|| ModelError::Cuda("decode graph cache insertion failed".into()))?;
             graph.forward(
-                token_id,
-                position,
-                current_slot,
-                context_slots,
+                token_ids,
+                positions,
+                current_slots,
+                contexts,
                 self.capacity as u32,
                 greedy,
             )
@@ -1064,8 +1147,8 @@ mod cuda_impl {
                     &context_slots,
                     true,
                 )?;
-                let graph = DecodeGraph::capture(self, bucket)?;
-                self.decode_graphs.insert(bucket, graph);
+                let graph = DecodeGraph::capture(self, 1, bucket)?;
+                self.decode_graphs.insert((1, bucket), graph);
                 bucket = bucket.checked_mul(2).ok_or_else(|| {
                     ModelError::Cuda("decode graph bucket size overflowed".into())
                 })?;
@@ -1181,34 +1264,52 @@ mod cuda_impl {
     impl DecodeLayerBuffers {
         fn allocate(
             cfg: &super::Config,
+            batch_size: usize,
             context_bucket: usize,
             stream: &Arc<Stream>,
         ) -> Result<Self, ModelError> {
             Ok(Self {
-                attention_input: zeros_bf16(&[1, cfg.hidden_size], stream)?,
-                residual: zeros_bf16(&[1, cfg.hidden_size], stream)?,
-                query: zeros_bf16(&[1, cfg.q_width()], stream)?,
-                key: zeros_bf16(&[1, cfg.kv_width()], stream)?,
-                value: zeros_bf16(&[1, cfg.kv_width()], stream)?,
-                rotated_query: zeros_bf16(&[1, cfg.num_attention_heads, cfg.head_dim], stream)?,
-                rotated_key: zeros_bf16(&[1, cfg.num_key_value_heads, cfg.head_dim], stream)?,
+                attention_input: zeros_bf16(&[batch_size, cfg.hidden_size], stream)?,
+                residual: zeros_bf16(&[batch_size, cfg.hidden_size], stream)?,
+                query: zeros_bf16(&[batch_size, cfg.q_width()], stream)?,
+                key: zeros_bf16(&[batch_size, cfg.kv_width()], stream)?,
+                value: zeros_bf16(&[batch_size, cfg.kv_width()], stream)?,
+                rotated_query: zeros_bf16(
+                    &[batch_size, cfg.num_attention_heads, cfg.head_dim],
+                    stream,
+                )?,
+                rotated_key: zeros_bf16(
+                    &[batch_size, cfg.num_key_value_heads, cfg.head_dim],
+                    stream,
+                )?,
                 gathered_key: zeros_bf16(
-                    &[cfg.num_key_value_heads, context_bucket, cfg.head_dim],
+                    &[
+                        batch_size * cfg.num_key_value_heads,
+                        context_bucket,
+                        cfg.head_dim,
+                    ],
                     stream,
                 )?,
                 gathered_value: zeros_bf16(
-                    &[cfg.num_key_value_heads, context_bucket, cfg.head_dim],
+                    &[
+                        batch_size * cfg.num_key_value_heads,
+                        context_bucket,
+                        cfg.head_dim,
+                    ],
                     stream,
                 )?,
-                attention: zeros_bf16(&[1, cfg.num_attention_heads, cfg.head_dim], stream)?,
-                attention_flat: zeros_bf16(&[1, cfg.hidden_size], stream)?,
-                attention_output: zeros_bf16(&[1, cfg.hidden_size], stream)?,
-                mlp_input: zeros_bf16(&[1, cfg.hidden_size], stream)?,
-                hidden_after_attention: zeros_bf16(&[1, cfg.hidden_size], stream)?,
-                gate: zeros_bf16(&[1, cfg.intermediate_size], stream)?,
-                up: zeros_bf16(&[1, cfg.intermediate_size], stream)?,
-                activated: zeros_bf16(&[1, cfg.intermediate_size], stream)?,
-                down: zeros_bf16(&[1, cfg.hidden_size], stream)?,
+                attention: zeros_bf16(
+                    &[batch_size, cfg.num_attention_heads, cfg.head_dim],
+                    stream,
+                )?,
+                attention_flat: zeros_bf16(&[batch_size, cfg.hidden_size], stream)?,
+                attention_output: zeros_bf16(&[batch_size, cfg.hidden_size], stream)?,
+                mlp_input: zeros_bf16(&[batch_size, cfg.hidden_size], stream)?,
+                hidden_after_attention: zeros_bf16(&[batch_size, cfg.hidden_size], stream)?,
+                gate: zeros_bf16(&[batch_size, cfg.intermediate_size], stream)?,
+                up: zeros_bf16(&[batch_size, cfg.intermediate_size], stream)?,
+                activated: zeros_bf16(&[batch_size, cfg.intermediate_size], stream)?,
+                down: zeros_bf16(&[batch_size, cfg.hidden_size], stream)?,
             })
         }
     }
@@ -1229,43 +1330,51 @@ mod cuda_impl {
         positions: Tensor<u32>,
         current_slots: Tensor<u32>,
         context_slots: Tensor<u32>,
-        attention_metadata: Tensor<i32>,
+        context_lengths: Tensor<i32>,
         logits: Arc<Tensor<bf16>>,
         sampled_token: Tensor<u32>,
+        batch_size: usize,
         context_bucket: usize,
         _storage: DecodeGraphStorage,
     }
 
     impl DecodeGraph {
-        fn capture(runtime: &CudaLlama, context_bucket: usize) -> Result<Self, ModelError> {
+        fn capture(
+            runtime: &CudaLlama,
+            batch_size: usize,
+            context_bucket: usize,
+        ) -> Result<Self, ModelError> {
             let cfg = &runtime.model.config;
             let stream = runtime.stream.clone();
-            let token_ids = copy_u32(&[0], &stream, "graph token IDs")?;
-            let positions = copy_u32(&[0], &stream, "graph positions")?;
-            let current_slots =
-                copy_u32(&[runtime.capacity as u32], &stream, "graph current slots")?;
+            let token_ids = copy_u32(&vec![0; batch_size], &stream, "graph token IDs")?;
+            let positions = copy_u32(&vec![0; batch_size], &stream, "graph positions")?;
+            let current_slots = copy_u32(
+                &vec![runtime.capacity as u32; batch_size],
+                &stream,
+                "graph current slots",
+            )?;
             let context_slots = copy_u32(
-                &vec![runtime.capacity as u32; context_bucket],
+                &vec![runtime.capacity as u32; batch_size * context_bucket],
                 &stream,
                 "graph context slots",
             )?;
-            let attention_metadata = copy_i32(&[1, 0], &stream, "graph attention metadata")?;
-            let mut embedding_hidden = zeros_bf16(&[1, cfg.hidden_size], &stream)?;
+            let context_lengths = copy_i32(&vec![1; batch_size], &stream, "graph context lengths")?;
+            let mut embedding_hidden = zeros_bf16(&[batch_size, cfg.hidden_size], &stream)?;
             let mut layers: Vec<_> = (0..cfg.num_hidden_layers)
-                .map(|_| DecodeLayerBuffers::allocate(cfg, context_bucket, &stream))
+                .map(|_| DecodeLayerBuffers::allocate(cfg, batch_size, context_bucket, &stream))
                 .collect::<Result<_, _>>()?;
-            let mut final_hidden = zeros_bf16(&[1, cfg.hidden_size], &stream)?;
-            let mut final_residual = zeros_bf16(&[1, cfg.hidden_size], &stream)?;
-            let logits = Arc::new(zeros_bf16(&[1, cfg.vocab_size], &stream)?);
+            let mut final_hidden = zeros_bf16(&[batch_size, cfg.hidden_size], &stream)?;
+            let mut final_residual = zeros_bf16(&[batch_size, cfg.hidden_size], &stream)?;
+            let logits = Arc::new(zeros_bf16(&[batch_size, cfg.vocab_size], &stream)?);
             let argmax_blocks = cfg.vocab_size.div_ceil(ARGMAX_BLOCK);
             let argmax_reduce_block = argmax_blocks.next_power_of_two();
-            let mut argmax_block_max = api::zeros::<f32>(&[argmax_blocks])
+            let mut argmax_block_max = api::zeros::<f32>(&[batch_size, argmax_blocks])
                 .sync_on(&stream)
                 .map_err(|error| cuda_error("allocate graph argmax maxima", error))?;
-            let mut argmax_block_index = api::zeros::<u32>(&[argmax_blocks])
+            let mut argmax_block_index = api::zeros::<u32>(&[batch_size, argmax_blocks])
                 .sync_on(&stream)
                 .map_err(|error| cuda_error("allocate graph argmax indices", error))?;
-            let mut sampled_token = api::zeros::<u32>(&[1])
+            let mut sampled_token = api::zeros::<u32>(&[batch_size])
                 .sync_on(&stream)
                 .map_err(|error| cuda_error("allocate graph sampled token", error))?;
 
@@ -1320,7 +1429,7 @@ mod cuda_impl {
                         &layer.attention_input,
                         &layer.query,
                         cfg.q_width(),
-                        1,
+                        batch_size,
                         cfg.hidden_size,
                     )?;
                     record_gemm(
@@ -1329,7 +1438,7 @@ mod cuda_impl {
                         &layer.attention_input,
                         &layer.key,
                         cfg.kv_width(),
-                        1,
+                        batch_size,
                         cfg.hidden_size,
                     )?;
                     record_gemm(
@@ -1338,21 +1447,21 @@ mod cuda_impl {
                         &layer.attention_input,
                         &layer.value,
                         cfg.kv_width(),
-                        1,
+                        batch_size,
                         cfg.hidden_size,
                     )?;
 
                     let query = layer
                         .query
-                        .view(&[1, cfg.num_attention_heads, cfg.head_dim])
+                        .view(&[batch_size, cfg.num_attention_heads, cfg.head_dim])
                         .map_err(device_error)?;
                     let key = layer
                         .key
-                        .view(&[1, cfg.num_key_value_heads, cfg.head_dim])
+                        .view(&[batch_size, cfg.num_key_value_heads, cfg.head_dim])
                         .map_err(device_error)?;
                     let value = layer
                         .value
-                        .view(&[1, cfg.num_key_value_heads, cfg.head_dim])
+                        .view(&[batch_size, cfg.num_key_value_heads, cfg.head_dim])
                         .map_err(device_error)?;
                     scope.record(
                         kernels::rope_q_bf16(
@@ -1387,42 +1496,47 @@ mod cuda_impl {
                             cfg.num_key_value_heads.to_string(),
                         ]),
                     )?;
+                    let context_slots_view = context_slots
+                        .view(&[batch_size, context_bucket])
+                        .map_err(device_error)?;
                     scope.record(
-                        kernels::gather_flat_kv_bf16(
-                            &context_slots,
+                        kernels::gather_flat_kv_decode_batch_bf16(
+                            &context_slots_view,
                             &runtime.key_cache[layer_index],
                             (&mut layer.gathered_key).partition([1, 1, cfg.head_dim]),
                         )
-                        .generics(vec![cfg.head_dim.to_string()]),
+                        .generics(vec![
+                            cfg.head_dim.to_string(),
+                            cfg.num_key_value_heads.to_string(),
+                        ]),
                     )?;
                     scope.record(
-                        kernels::gather_flat_kv_bf16(
-                            &context_slots,
+                        kernels::gather_flat_kv_decode_batch_bf16(
+                            &context_slots_view,
                             &runtime.value_cache[layer_index],
                             (&mut layer.gathered_value).partition([1, 1, cfg.head_dim]),
                         )
-                        .generics(vec![cfg.head_dim.to_string()]),
+                        .generics(vec![
+                            cfg.head_dim.to_string(),
+                            cfg.num_key_value_heads.to_string(),
+                        ]),
                     )?;
                     scope.record(
                         unsafe {
-                            kernels::causal_attention_bf16(
+                            kernels::decode_attention_batch_bf16(
                                 &layer.rotated_query,
                                 &layer.gathered_key,
                                 &layer.gathered_value,
-                                &attention_metadata,
-                                (&mut layer.attention).partition([
-                                    ATTENTION_QUERY_BLOCK,
-                                    1,
-                                    cfg.head_dim,
-                                ]),
+                                &context_lengths,
+                                (&mut layer.attention).partition([1, 1, cfg.head_dim]),
                                 1.0 / (cfg.head_dim as f32).sqrt(),
                                 (cfg.num_attention_heads / cfg.num_key_value_heads) as i32,
                             )
                         }
                         .generics(vec![
-                            ATTENTION_QUERY_BLOCK.to_string(),
                             ATTENTION_KEY_BLOCK.to_string(),
                             cfg.head_dim.to_string(),
+                            cfg.num_key_value_heads.to_string(),
                         ]),
                     )?;
                     scope.record(api::memcpy(&mut layer.attention_flat, &layer.attention))?;
@@ -1432,7 +1546,7 @@ mod cuda_impl {
                         &layer.attention_flat,
                         &layer.attention_output,
                         cfg.hidden_size,
-                        1,
+                        batch_size,
                         cfg.hidden_size,
                     )?;
                     let residual = if layer_index == 0 {
@@ -1459,7 +1573,7 @@ mod cuda_impl {
                         &layer.mlp_input,
                         &layer.gate,
                         cfg.intermediate_size,
-                        1,
+                        batch_size,
                         cfg.hidden_size,
                     )?;
                     record_gemm(
@@ -1468,7 +1582,7 @@ mod cuda_impl {
                         &layer.mlp_input,
                         &layer.up,
                         cfg.intermediate_size,
-                        1,
+                        batch_size,
                         cfg.hidden_size,
                     )?;
                     scope.record(
@@ -1485,7 +1599,7 @@ mod cuda_impl {
                         &layer.activated,
                         &layer.down,
                         cfg.hidden_size,
-                        1,
+                        batch_size,
                         cfg.intermediate_size,
                     )?;
                 }
@@ -1512,21 +1626,20 @@ mod cuda_impl {
                     &final_hidden,
                     &logits,
                     cfg.vocab_size,
-                    1,
+                    batch_size,
                     cfg.hidden_size,
                 )?;
-                let flat_logits = logits.view(&[cfg.vocab_size]).map_err(device_error)?;
                 scope.record(
-                    kernels::argmax_blocks_bf16(
-                        &flat_logits,
-                        (&mut argmax_block_max).partition([1]),
-                        (&mut argmax_block_index).partition([1]),
+                    kernels::argmax_blocks_batch_bf16(
+                        &logits,
+                        (&mut argmax_block_max).partition([1, 1]),
+                        (&mut argmax_block_index).partition([1, 1]),
                         cfg.vocab_size as i32,
                     )
                     .generics(vec![ARGMAX_BLOCK.to_string()]),
                 )?;
                 scope.record(
-                    kernels::argmax_reduce_bf16(
+                    kernels::argmax_reduce_batch_bf16(
                         &argmax_block_max,
                         &argmax_block_index,
                         (&mut sampled_token).partition([1]),
@@ -1545,9 +1658,10 @@ mod cuda_impl {
                 positions,
                 current_slots,
                 context_slots,
-                attention_metadata,
+                context_lengths,
                 logits,
                 sampled_token,
+                batch_size,
                 context_bucket,
                 _storage: DecodeGraphStorage {
                     _embedding_hidden: embedding_hidden,
@@ -1562,29 +1676,52 @@ mod cuda_impl {
 
         fn forward(
             &mut self,
-            token_id: u32,
-            position: u32,
-            current_slot: u32,
-            context_slots: &[u32],
+            token_ids: &[u32],
+            positions: &[u32],
+            current_slots: &[u32],
+            contexts: &[Vec<u32>],
             sentinel_slot: u32,
             greedy: bool,
         ) -> Result<ForwardOutput, ModelError> {
-            let token_ids = copy_u32(&[token_id], &self.stream, "decode graph token")?;
-            let positions = copy_u32(&[position], &self.stream, "decode graph position")?;
-            let current_slots = copy_u32(&[current_slot], &self.stream, "decode graph KV slot")?;
-            let context_len = i32::try_from(context_slots.len())
-                .map_err(|_| ModelError::Cuda("decode context exceeds i32".into()))?;
-            let mut padded_context_slots = context_slots.to_vec();
-            padded_context_slots.resize(self.context_bucket, sentinel_slot);
+            if token_ids.len() != self.batch_size
+                || positions.len() != self.batch_size
+                || current_slots.len() != self.batch_size
+                || contexts.len() != self.batch_size
+                || contexts
+                    .iter()
+                    .any(|context| context.is_empty() || context.len() > self.context_bucket)
+                || (!greedy && self.batch_size != 1)
+            {
+                return Err(ModelError::Cuda(
+                    "invalid decode graph batch metadata".into(),
+                ));
+            }
+            let token_ids = copy_u32(token_ids, &self.stream, "decode graph tokens")?;
+            let positions = copy_u32(positions, &self.stream, "decode graph positions")?;
+            let current_slots = copy_u32(current_slots, &self.stream, "decode graph KV slots")?;
+            let mut padded_context_slots =
+                Vec::with_capacity(self.batch_size * self.context_bucket);
+            let mut context_lengths = Vec::with_capacity(self.batch_size);
+            for context in contexts {
+                context_lengths
+                    .push(i32::try_from(context.len()).map_err(|_| {
+                        ModelError::Cuda("decode graph context exceeds i32".into())
+                    })?);
+                padded_context_slots.extend_from_slice(context);
+                padded_context_slots.resize(
+                    padded_context_slots.len() + self.context_bucket - context.len(),
+                    sentinel_slot,
+                );
+            }
             let context_slots = copy_u32(
                 &padded_context_slots,
                 &self.stream,
                 "decode graph context slots",
             )?;
-            let attention_metadata = copy_i32(
-                &[context_len, position as i32],
+            let context_lengths = copy_i32(
+                &context_lengths,
                 &self.stream,
-                "decode graph attention metadata",
+                "decode graph context lengths",
             )?;
 
             self.graph
@@ -1600,11 +1737,8 @@ mod cuda_impl {
                 .update(api::memcpy(&mut self.context_slots, &context_slots))
                 .map_err(|error| cuda_error("update graph context slots", error))?;
             self.graph
-                .update(api::memcpy(
-                    &mut self.attention_metadata,
-                    &attention_metadata,
-                ))
-                .map_err(|error| cuda_error("update graph attention metadata", error))?;
+                .update(api::memcpy(&mut self.context_lengths, &context_lengths))
+                .map_err(|error| cuda_error("update graph context lengths", error))?;
             self.graph
                 .launch()
                 .sync_on(&self.stream)
@@ -1616,10 +1750,17 @@ mod cuda_impl {
                     .to_host_vec()
                     .sync_on(&self.stream)
                     .map_err(|error| cuda_error("copy graph sampled token to host", error))?;
-                let token = sampled.first().copied().ok_or_else(|| {
-                    ModelError::Cuda("graph argmax returned no sampled token".into())
-                })?;
-                return Ok(ForwardOutput::Token(token));
+                if sampled.len() != self.batch_size {
+                    return Err(ModelError::Cuda(format!(
+                        "graph argmax returned {} tokens for batch {}",
+                        sampled.len(),
+                        self.batch_size
+                    )));
+                }
+                if self.batch_size == 1 {
+                    return Ok(ForwardOutput::Token(sampled[0]));
+                }
+                return Ok(ForwardOutput::Tokens(sampled));
             }
             let logits: Vec<bf16> = self
                 .logits
@@ -1773,7 +1914,6 @@ mod cuda_impl {
                     .runtime
                     .forward_decode_batch(&token_ids, &positions, &current_slots, &contexts)
                     .map_err(execution)?;
-                self.runtime.execution_stats.eager_forwards += 1;
                 self.runtime.execution_stats.packed_decode_forwards += 1;
                 self.runtime.execution_stats.packed_decode_requests += request_ids.len() as u64;
                 if sampled.len() != request_ids.len() {
