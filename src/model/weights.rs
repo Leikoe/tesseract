@@ -15,13 +15,13 @@ struct SafetensorsIndex {
     weight_map: HashMap<String, String>,
 }
 
-pub(super) struct WeightStore {
+pub(crate) struct WeightStore {
     weight_map: HashMap<String, String>,
     shards: HashMap<String, Mmap>,
 }
 
 impl WeightStore {
-    pub(super) fn open(model_dir: &Path) -> Result<Self, ModelError> {
+    pub(crate) fn open(model_dir: &Path) -> Result<Self, ModelError> {
         let index_path = model_dir.join("model.safetensors.index.json");
         let weight_map = if index_path.exists() {
             let text = read_file(&index_path)?;
@@ -59,7 +59,7 @@ impl WeightStore {
         Ok(Self { weight_map, shards })
     }
 
-    pub(super) fn tensor<'a>(&'a self, name: &str) -> Result<TensorView<'a>, ModelError> {
+    pub(crate) fn tensor<'a>(&'a self, name: &str) -> Result<TensorView<'a>, ModelError> {
         let filename = self
             .weight_map
             .get(name)
@@ -77,19 +77,19 @@ impl WeightStore {
             .map_err(|_| ModelError::MissingTensor(name.into()))
     }
 
-    pub(super) fn tensor_count(&self) -> usize {
+    pub(crate) fn tensor_count(&self) -> usize {
         self.weight_map.len()
     }
 
     #[cfg(feature = "cuda")]
-    pub(super) fn names(&self) -> Vec<String> {
+    pub(crate) fn names(&self) -> Vec<String> {
         let mut names: Vec<_> = self.weight_map.keys().cloned().collect();
         names.sort_unstable();
         names
     }
 
     #[cfg(feature = "cuda")]
-    pub(super) fn load_device_bf16(
+    pub(crate) fn load_device_bf16(
         &self,
         name: &str,
         stream: &std::sync::Arc<cuda_core::Stream>,
@@ -121,7 +121,7 @@ impl WeightStore {
             .map_err(|error| ModelError::Cuda(format!("reshape `{name}`: {error:?}")))
     }
 
-    pub(super) fn validate_bf16(&self, name: &str, expected: &[usize]) -> Result<(), ModelError> {
+    pub(crate) fn validate_bf16(&self, name: &str, expected: &[usize]) -> Result<(), ModelError> {
         let tensor = self.tensor(name)?;
         if tensor.dtype() != Dtype::BF16 {
             return Err(ModelError::WrongDtype {

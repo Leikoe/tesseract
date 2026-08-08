@@ -1,5 +1,5 @@
 mod llama_3_2;
-mod weights;
+pub(crate) mod weights;
 
 use std::{io, path::Path, path::PathBuf, sync::Arc};
 

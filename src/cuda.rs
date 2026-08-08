@@ -18,6 +18,7 @@ use thiserror::Error;
 pub(crate) mod attention;
 pub(crate) mod batch;
 pub(crate) mod cublas;
+pub(crate) mod dense_decoder;
 pub(crate) mod executor;
 pub(crate) mod kernel_plan;
 pub(crate) mod kernels;
