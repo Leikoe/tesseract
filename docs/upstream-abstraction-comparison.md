@@ -241,7 +241,12 @@ Cold-path boundaries:
 This keeps the scheduler independent of architecture and CUDA details while
 representing the production variation that vLLM and SGLang have demonstrated.
 
-## Registries and external plugins
+## Registries and source-level implementations
+
+The relevant goal for Tesseract is making another compiled Attention, MoE,
+sampler, or cache implementation easy to add and select. Runtime-loaded plugins
+are not required. The upstream plugin mechanisms are useful evidence for where
+projects found stable behavior contracts and factory registries.
 
 vLLM has an actual package plugin loader based on Python entry points. Its
 declared groups are `vllm.general_plugins`, `vllm.io_processor_plugins`,
@@ -269,7 +274,7 @@ package-entry-point layer:
   `references/sglang/python/sglang/srt/models/registry.py:19`
 
 The important upstream idea is the combination of a behavior contract with a
-named factory and capability validation. The Python import mechanism itself is
-not appropriate to copy into Rust. Tesseract will use an explicit typed registry
-and build-time-linked plugin crates first. Runtime native plugins remain deferred
-until a versioned C ABI, GPU resource-ownership contract, and allowlist exist.
+named factory and capability validation. Tesseract uses operation-family traits,
+an explicit typed construction registry, and statically composed executors. An
+implementation may live in another crate linked into the binary; Python-style
+runtime discovery and native `.so` loading are outside this design.

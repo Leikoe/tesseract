@@ -230,8 +230,8 @@ not a trait object stored in every layer. `DenseDecoder<A>` uses static dispatch
 Prefill and decode may use different concrete backends when their capabilities
 require it.
 
-There are still no generic `Mlp`, `Norm`, `Layer`, or `Kernel` trait objects.
-Those operations are statically composed by shared program types.
+There are no per-layer trait objects or universal `Layer`/`Kernel` interfaces.
+Operation-family backends are statically composed by shared program types.
 
 ## Load-time boundary
 
@@ -287,24 +287,102 @@ attention, tied embeddings, and bias presence are data in that program. A new
 program type is warranted only when the computation or persistent state is
 fundamentally different.
 
-## Backend registries and plugins
+## Extensible layer implementations
 
-A trait, registry, and plugin loader solve different problems:
+The goal is source-level extensibility: adding another compiled implementation
+of an operation family without changing model architecture or engine code. A
+trait defines the semantic and lifecycle contract; a named factory makes the
+implementation selectable during executor construction.
 
-```text
-trait          behavioral contract
-registry       name/capability -> validated factory
-plugin loader  discovery and trust boundary for factories outside this binary
+The boundary belongs around an operation family whose implementations differ in
+more than one kernel call. Attention varies in metadata, cache addressing,
+workspace, graph preparation, and kernels. MoE varies in routing, expert weight
+layout, dispatch/combine, collective communication, workspace, and kernels.
+Those deserve separate backend traits.
+
+```rust
+pub(crate) trait FeedForwardBackend: 'static {
+    type Layer;
+    type Workspace;
+
+    fn prepare_layer(
+        &self,
+        spec: &FeedForwardSpec,
+        weights: DenseMlpWeights,
+    ) -> Result<Self::Layer, LoadError>;
+
+    fn enqueue(
+        &self,
+        layer: &Self::Layer,
+        input: HiddenStateView<'_>,
+        output: HiddenStateViewMut<'_>,
+        workspace: &mut Self::Workspace,
+        context: &mut CudaExecutionContext<'_>,
+    ) -> Result<(), ExecutionError>;
+}
+
+pub(crate) trait MoeBackend: 'static {
+    type Layer;
+    type BatchPlan;
+    type Workspace;
+
+    fn capabilities(&self) -> MoeCapabilities;
+
+    fn prepare_layer(
+        &self,
+        spec: &MoeSpec,
+        weights: MoeWeights,
+    ) -> Result<Self::Layer, LoadError>;
+
+    fn plan(
+        &self,
+        layer: &Self::Layer,
+        router_logits: RouterLogitsView<'_>,
+    ) -> Result<Self::BatchPlan, ExecutionError>;
+
+    fn enqueue(
+        &self,
+        layer: &Self::Layer,
+        plan: &Self::BatchPlan,
+        hidden: HiddenStateViewMut<'_>,
+        workspace: &mut Self::Workspace,
+        context: &mut CudaExecutionContext<'_>,
+    ) -> Result<(), ExecutionError>;
+}
 ```
 
-vLLM has Python package entry-point groups for general initialization, platform
-selection, I/O processors, statistics loggers, API endpoints, and logits
-processors. General plugins execute in every process. SGLang more often exposes
-module-level named factory registries; current examples include attention,
-sampler, and radix-cache backends.
+The program types compose these statically:
 
-Tesseract should adopt a typed registry now, without committing to an unstable
-Rust dynamic-library ABI:
+```rust
+pub(crate) struct DenseDecoder<A: AttentionBackend, F: FeedForwardBackend> {
+    // model geometry and layers
+}
+
+pub(crate) struct MoeDecoder<A: AttentionBackend, E: MoeBackend> {
+    // model geometry and layers
+}
+```
+
+There is no trait object per layer. Every layer stores the concrete associated
+`Layer` type, and calls are monomorphized. If expert-parallel dispatch later
+varies independently of expert computation, `MoeBackend` may be composed with a
+sealed `ExpertDispatcher`; it should not leak into the scheduler.
+
+RMSNorm, activation, RoPE, and elementary GEMM calls remain ordinary typed
+operations until a second implementation demonstrates a larger lifecycle or
+storage contract. We should not create a trait for every kernel merely to make
+the type graph look uniform.
+
+Adding an implementation requires four things:
+
+1. implement the operation-family trait;
+2. declare capabilities and reject incompatible geometry at construction;
+3. register a factory that closes the concrete generic types;
+4. pass the shared conformance suite: reference correctness, eager/graph parity,
+   every supported bucket, deterministic behavior where promised, and Compute
+   Sanitizer.
+
+The typed construction registry is:
 
 ```rust
 pub struct BackendDescriptor {
@@ -333,29 +411,33 @@ pub struct RegistryBuilder {
 The registry selects and validates once. A factory constructs a fully concrete
 `CudaExecutor<P, R, A, S>` behind the single outer `ModelExecutor` object, so
 hot-path component dispatch remains static. Built-ins are registered explicitly
-by the binary. Optional plugin crates are linked at build time and export a
-plain registration function; their presence never relies on linker-order global
-constructors.
+by the binary. A new implementation can live in another crate linked into the
+binary and export a plain registration function; no runtime plugin mechanism is
+required.
+
+Factories register supported backend bundles rather than promising every
+possible Cartesian product of implementations. A helper can close a new
+`AttentionBackend` with the default feed-forward, sampler, and runtime policy;
+an MoE bundle can close the same attention implementation with a new
+`MoeBackend`. This avoids existential associated types, per-layer dynamic
+dispatch, and uncontrolled monomorphization while keeping additions local.
 
 The demonstrated internal strategy interfaces are:
 
 | Strategy | Tesseract status | Why it varies |
 | --- | --- | --- |
 | `AttentionBackend` | define now | kernels, metadata, KV layout, graph legality |
+| `FeedForwardBackend` | extract with decoder | fused/unfused dense MLP execution |
+| `MoeBackend` | add with first MoE | routing, experts, dispatch/combine, collectives |
 | sampler backend | concrete generic now | greedy/random kernels and RNG handling |
 | logits processor | add with penalties/grammar | stateful batched logit transforms |
 | `StateStore`/connector | add with remote state | prefix/offload/disaggregated lifecycle |
 | quantization method | add after BF16 v1 | weight creation, packing, GEMM kernels |
-| collective/MoE dispatcher | add with TP/EP | communication topology and overlap |
+| expert dispatcher | split from MoE only if needed | communication topology and overlap |
 | platform backend | defer | CUDA is the only production platform in scope |
 
-An externally loadable `.so` plugin system is deferred. Rust has no stable Rust
-ABI, and a GPU plugin boundary must specify CUDA context/stream ownership,
-tensor layouts, synchronization, error ownership, allocator compatibility, and
-version negotiation. If runtime-loaded native plugins become a requirement,
-they need a versioned C ABI and explicit allowlist. API or untrusted processing
-extensions should prefer a process boundary. The server must never silently
-load every discovered plugin into worker processes.
+Runtime-loaded `.so` plugins are explicitly out of scope. This design concerns
+compiled implementations selected at startup.
 
 ## Typed batch contract
 

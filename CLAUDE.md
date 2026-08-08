@@ -455,3 +455,7 @@ I want you to send subagents to compare this to vllm and sglang by going inside 
 ```text
 sure. I like the AttentionBackend trait, it will help swap implementations. I think vllm and sglang have others like it ? vllm has a plugin system iirc
 ```
+
+```text
+I wasn't suggesting runtim swapping plugins but making it easy to add an implementation of a layer (e.g. Attention, MoE, ..)
+```
