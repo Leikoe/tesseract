@@ -57,6 +57,19 @@ Run all host/model/cuTile gates afterward:
 ssh ubuntu@NODE_IP '/home/ubuntu/tesseract/scripts/node/verify-a100.sh'
 ```
 
+For the slower memory-safety gate, build the CUDA smoke and next-token tools and
+run them under the CUDA toolkit's Compute Sanitizer:
+
+```bash
+cargo build --release --features cuda --bin cuda-check --bin next-token-check
+compute-sanitizer --tool memcheck --error-exitcode=99 \
+  ./target/release/cuda-check
+compute-sanitizer --tool memcheck --error-exitcode=99 \
+  ./target/release/next-token-check \
+  --model-path /home/ubuntu/models/Llama-3.2-1B-Instruct \
+  --prompt "The capital of France is"
+```
+
 For the independent pinned PyTorch/Transformers correctness gate, install the
 isolated reference environment once, then compare three fixed prompts:
 

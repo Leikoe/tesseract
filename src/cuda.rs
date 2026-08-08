@@ -3,6 +3,8 @@
 //! Architecture-specific dimensions, tensor names, prompt behavior, and
 //! forward-pass composition belong to the corresponding model module.
 
+use std::sync::Arc;
+
 use cuda_async::device_operation::DeviceOp;
 use cuda_async::{cuda_graph::CudaGraph, error::DeviceError};
 use cuda_core::Device;
@@ -10,7 +12,6 @@ use cutile::{
     api,
     core::bf16,
     tensor::{PartitionMut, Reshape, ToHostVec},
-    tile_kernel::ToHostVecOp,
 };
 use thiserror::Error;
 
@@ -101,10 +102,13 @@ pub fn validate_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaErr
         .sync_on(&stream)
         .map_err(|error| kernel_error("compile/launch add", error))?;
 
-    let host: Vec<f32> = api::convert::<bf16, f32>(out.into())
+    let out = Arc::new(out);
+    let converted = api::convert::<bf16, f32>(out.clone())
         .sync_on(&stream)
-        .map_err(|error| kernel_error("convert output to FP32", error))?
-        .dup()
+        .map_err(|error| kernel_error("convert output to FP32", error))?;
+    let converted = Arc::new(converted);
+    let host: Vec<f32> = converted
+        .clone()
         .to_host_vec()
         .sync_on(&stream)
         .map_err(|error| kernel_error("copy output to host", error))?;
@@ -144,7 +148,9 @@ pub fn validate_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaErr
     let gemm_out = cublas::gemm_bf16(matrix.clone(), rhs.clone(), gemm_out, 2, 1, 3)?
         .sync_on(&stream)
         .map_err(|error| kernel_error("execute BF16 cuBLAS GEMM", error))??;
+    let gemm_out = Arc::new(gemm_out);
     let gemm_host: Vec<bf16> = gemm_out
+        .clone()
         .to_host_vec()
         .sync_on(&stream)
         .map_err(|error| kernel_error("copy GEMM result to host", error))?;
@@ -159,9 +165,11 @@ pub fn validate_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaErr
         }
     }
 
-    let graph_out = api::zeros::<bf16>(&[1, 2])
-        .sync_on(&stream)
-        .map_err(|error| kernel_error("allocate graph GEMM output", error))?;
+    let graph_out = Arc::new(
+        api::zeros::<bf16>(&[1, 2])
+            .sync_on(&stream)
+            .map_err(|error| kernel_error("allocate graph GEMM output", error))?,
+    );
     let graph = CudaGraph::scope(&stream, |scope| {
         let result = scope.record(
             cublas::gemm_bf16_into(&matrix, &rhs, &graph_out, 2, 1, 3)
@@ -175,6 +183,7 @@ pub fn validate_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaErr
         .sync_on(&stream)
         .map_err(|error| kernel_error("replay BF16 cuBLAS graph", error))?;
     let graph_host: Vec<bf16> = graph_out
+        .clone()
         .to_host_vec()
         .sync_on(&stream)
         .map_err(|error| kernel_error("copy graph GEMM result", error))?;
@@ -244,8 +253,9 @@ fn validate_transformer_primitives(
         .generics(vec!["64".into()])
         .sync_on(stream)
         .map_err(|error| kernel_error("execute SiLU", error))?;
+    let activated = Arc::new(activated.unpartition());
     let activated_host: Vec<bf16> = activated
-        .unpartition()
+        .clone()
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| kernel_error("copy SiLU result", error))?;
@@ -321,8 +331,9 @@ fn validate_transformer_primitives(
     .generics(vec!["1".into(), "16".into(), "64".into()])
     .sync_on(stream)
     .map_err(|error| kernel_error("execute causal attention", error))?;
+    let attention = Arc::new(attention.unpartition());
     let attention_host: Vec<bf16> = attention
-        .unpartition()
+        .clone()
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| kernel_error("copy attention result", error))?;

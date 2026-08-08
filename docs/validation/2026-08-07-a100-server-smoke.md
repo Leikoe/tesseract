@@ -137,6 +137,37 @@ same France/Paris and Germany/Berlin outputs, with zero KV and running-request
 gauges afterward. A graph capture or replay failure is remembered per shape
 and routes subsequent work through the packed eager implementation.
 
+## Default-capacity and memory-safety gates
+
+The release server was also started with no capacity overrides. It prewarmed 12
+batch-1 context buckets for the default 32,768-token KV capacity, reported
+ready, and used 6,042 MiB according to `nvidia-smi`. A one-token request returned
+`Paris` with 23 prompt tokens and one completion token.
+
+Compute Sanitizer 2026.2.1 initially exposed stream-ordered lifetime hazards:
+some last-owner tensors were moved into asynchronous operations and dropped on
+cuTile's separate deallocator stream before the requested execution stream had
+synchronized. Tesseract now retains an `Arc` owner through each host copy and
+each eager cuBLAS `sync_on` call. The following gates then reported `ERROR
+SUMMARY: 0 errors`:
+
+```bash
+compute-sanitizer --tool memcheck --error-exitcode=99 \
+  ./target/release/cuda-check
+
+compute-sanitizer --tool memcheck --error-exitcode=99 \
+  ./target/release/next-token-check \
+  --model-path /home/ubuntu/models/Llama-3.2-1B-Instruct \
+  --prompt "The capital of France is"
+```
+
+The second command covered a complete 16-layer eager forward and retained next
+token `12366` (` Paris`). Finally, the HTTP server itself ran under memcheck at
+256-token capacity. Two concurrent eight-token requests exercised eager
+prefill, one batch-2 graph capture, seven packed graph replays, flat KV access,
+and GPU argmax; both responses were correct. After SIGINT shutdown, Compute
+Sanitizer again reported zero errors.
+
 ## Independent BF16 logits reference
 
 The isolated reference environment used PyTorch 2.8.0, Transformers 4.55.0,

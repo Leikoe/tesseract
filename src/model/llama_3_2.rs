@@ -288,7 +288,7 @@ mod cuda_impl {
         api,
         core::bf16,
         tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
-        tile_kernel::{PartitionOp, TileKernel, ToHostVecOp},
+        tile_kernel::{PartitionOp, TileKernel},
     };
 
     use crate::{
@@ -1025,8 +1025,9 @@ mod cuda_impl {
                 .generics(vec![reduce_block.to_string()])
                 .sync_on(stream)
                 .map_err(|error| cuda_error("reduce packed logits argmax", error))?;
+                let sampled = Arc::new(sampled.unpartition());
                 let sampled = sampled
-                    .unpartition()
+                    .clone()
                     .to_host_vec()
                     .sync_on(stream)
                     .map_err(|error| cuda_error("copy packed sampled tokens to host", error))?;
@@ -1172,11 +1173,18 @@ mod cuda_impl {
             let output = api::zeros::<bf16>(&[rows, output_size])
                 .sync_on(&self.stream)
                 .map_err(|error| cuda_error("allocate GEMM output", error))?;
-            let output = cublas::gemm_bf16(weight, input, output, output_size, rows, input_size)
-                .map_err(|error| ModelError::Cuda(format!("{operation}: {error}")))?
-                .sync_on(&self.stream)
-                .map_err(|error| cuda_error(operation, error))?
-                .map_err(|error| ModelError::Cuda(format!("{operation}: {error}")))?;
+            let output = cublas::gemm_bf16(
+                weight.clone(),
+                input.clone(),
+                output,
+                output_size,
+                rows,
+                input_size,
+            )
+            .map_err(|error| ModelError::Cuda(format!("{operation}: {error}")))?
+            .sync_on(&self.stream)
+            .map_err(|error| cuda_error(operation, error))?
+            .map_err(|error| ModelError::Cuda(format!("{operation}: {error}")))?;
             Ok(Arc::new(output))
         }
 
@@ -1332,7 +1340,7 @@ mod cuda_impl {
         context_slots: Tensor<u32>,
         context_lengths: Tensor<i32>,
         logits: Arc<Tensor<bf16>>,
-        sampled_token: Tensor<u32>,
+        sampled_token: Arc<Tensor<u32>>,
         batch_size: usize,
         context_bucket: usize,
         _storage: DecodeGraphStorage,
@@ -1660,7 +1668,7 @@ mod cuda_impl {
                 context_slots,
                 context_lengths,
                 logits,
-                sampled_token,
+                sampled_token: Arc::new(sampled_token),
                 batch_size,
                 context_bucket,
                 _storage: DecodeGraphStorage {
@@ -1746,7 +1754,7 @@ mod cuda_impl {
             if greedy {
                 let sampled: Vec<u32> = self
                     .sampled_token
-                    .dup()
+                    .clone()
                     .to_host_vec()
                     .sync_on(&self.stream)
                     .map_err(|error| cuda_error("copy graph sampled token to host", error))?;
