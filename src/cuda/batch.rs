@@ -132,7 +132,10 @@ mod tests {
             Some(sampling),
         )
         .unwrap();
-        let batch = ForwardBatch::try_from_sequences(vec![decode, prefill]).unwrap();
+        let arena_id = crate::engine::StateSchema::try_flat_kv(8)
+            .unwrap()
+            .arena_id();
+        let batch = ForwardBatch::try_from_sequences(arena_id, vec![decode, prefill]).unwrap();
 
         let lowered = CudaBatch::lower(&batch).unwrap();
 

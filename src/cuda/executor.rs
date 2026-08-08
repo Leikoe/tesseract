@@ -3,7 +3,8 @@ use std::sync::Arc;
 use crate::{
     engine::{
         BatchTicket, CompletionId, ExecutionError, ExecutionOutput, ExecutionStats, ForwardBatch,
-        GeneratedToken, HostLogitsSampler, ImmediateCompletion, ModelExecutor, TokenId,
+        GeneratedToken, HostLogitsSampler, ImmediateCompletion, ModelExecutor, StateSchema,
+        TokenId,
     },
     model::Model,
 };
@@ -14,6 +15,8 @@ use super::batch::CudaBatch;
 /// CUDA lifecycle, completion, sampling, and engine protocol stay outside it.
 pub(crate) trait ModelProgram: 'static {
     fn model(&self) -> Arc<dyn Model>;
+
+    fn state_schema(&self) -> &StateSchema;
 
     fn execute(&mut self, batch: &CudaBatch) -> Result<ProgramOutput, ExecutionError>;
 
@@ -52,8 +55,18 @@ impl<P: ModelProgram> ModelExecutor for CudaExecutor<P> {
         self.program.model()
     }
 
+    fn state_schema(&self) -> &StateSchema {
+        self.program.state_schema()
+    }
+
     fn submit(&mut self, batch: &ForwardBatch) -> Result<BatchTicket, ExecutionError> {
         self.completions.ensure_available()?;
+        if batch.arena_id() != self.program.state_schema().arena_id() {
+            return Err(ExecutionError::StateArenaMismatch {
+                batch: batch.arena_id(),
+                executor: self.program.state_schema().arena_id(),
+            });
+        }
         let batch = CudaBatch::lower(batch)?;
         let output = self.program.execute(&batch)?;
         let tokens = self.resolve_generation_output(&batch, output)?;

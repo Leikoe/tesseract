@@ -2,7 +2,7 @@ use std::{collections::HashSet, ops::Range};
 
 use thiserror::Error;
 
-use super::RequestId;
+use super::{RequestId, StateArenaId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -260,6 +260,7 @@ impl ForwardSequence {
 /// of scheduler selection priority.
 #[derive(Debug, Clone)]
 pub struct ForwardBatch {
+    arena_id: StateArenaId,
     kind: ForwardKind,
     sequences: Vec<ForwardSequence>,
     query_start_offsets: Vec<QueryRow>,
@@ -318,6 +319,7 @@ pub enum ForwardBatchError {
 
 impl ForwardBatch {
     pub(crate) fn try_from_sequences(
+        arena_id: StateArenaId,
         mut sequences: Vec<ForwardSequence>,
     ) -> Result<Self, ForwardBatchError> {
         let mut request_ids = HashSet::with_capacity(sequences.len());
@@ -375,12 +377,17 @@ impl ForwardBatch {
         debug_assert!(num_decode_tokens <= num_tokens);
 
         Ok(Self {
+            arena_id,
             kind,
             sequences,
             query_start_offsets,
             num_tokens,
             num_decode_tokens,
         })
+    }
+
+    pub const fn arena_id(&self) -> StateArenaId {
+        self.arena_id
     }
 
     pub const fn kind(&self) -> &ForwardKind {
@@ -462,14 +469,20 @@ mod tests {
 
     #[test]
     fn mixed_batch_has_an_explicit_stable_row_partition() {
+        let arena_id = crate::engine::StateSchema::try_flat_kv(32)
+            .unwrap()
+            .arena_id();
         let decode = RequestId::now_v7();
         let first_prefill = RequestId::now_v7();
         let second_prefill = RequestId::now_v7();
-        let batch = ForwardBatch::try_from_sequences(vec![
-            sequence(decode, ForwardPhase::Decode, 17, &[9]),
-            sequence(first_prefill, ForwardPhase::Prefill, 0, &[4, 5]),
-            sequence(second_prefill, ForwardPhase::Prefill, 2, &[6]),
-        ])
+        let batch = ForwardBatch::try_from_sequences(
+            arena_id,
+            vec![
+                sequence(decode, ForwardPhase::Decode, 17, &[9]),
+                sequence(first_prefill, ForwardPhase::Prefill, 0, &[4, 5]),
+                sequence(second_prefill, ForwardPhase::Prefill, 2, &[6]),
+            ],
+        )
         .unwrap();
 
         assert_eq!(
@@ -504,21 +517,30 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_requests_and_slots() {
+        let arena_id = crate::engine::StateSchema::try_flat_kv(32)
+            .unwrap()
+            .arena_id();
         let first = RequestId::now_v7();
         let second = RequestId::now_v7();
         assert_eq!(
-            ForwardBatch::try_from_sequences(vec![
-                sequence(first, ForwardPhase::Prefill, 0, &[1]),
-                sequence(first, ForwardPhase::Decode, 1, &[2]),
-            ])
+            ForwardBatch::try_from_sequences(
+                arena_id,
+                vec![
+                    sequence(first, ForwardPhase::Prefill, 0, &[1]),
+                    sequence(first, ForwardPhase::Decode, 1, &[2]),
+                ]
+            )
             .unwrap_err(),
             ForwardBatchError::DuplicateRequest { request_id: first }
         );
         assert_eq!(
-            ForwardBatch::try_from_sequences(vec![
-                sequence(first, ForwardPhase::Prefill, 0, &[1]),
-                sequence(second, ForwardPhase::Prefill, 0, &[1]),
-            ])
+            ForwardBatch::try_from_sequences(
+                arena_id,
+                vec![
+                    sequence(first, ForwardPhase::Prefill, 0, &[1]),
+                    sequence(second, ForwardPhase::Prefill, 0, &[1]),
+                ]
+            )
             .unwrap_err(),
             ForwardBatchError::DuplicateKvSlot {
                 slot: KvSlot::new(1),

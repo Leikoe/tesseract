@@ -3,6 +3,7 @@ mod executor;
 mod kv;
 mod sampling;
 mod scheduler;
+mod state;
 mod types;
 
 #[cfg(any(test, feature = "test-backend"))]
@@ -20,6 +21,7 @@ pub use executor::{
 };
 pub use sampling::{HostLogitsSampler, SamplingError};
 pub use scheduler::{EngineHandle, EngineSpawnError, RequestStream, SubmitError};
+pub use state::{StateArenaId, StateGroupKind, StateGroupSpec, StateSchema, StateSchemaError};
 pub use types::{
     FinishReason, GenerateRequest, GenerationEvent, GenerationParams, RequestId, Usage,
 };

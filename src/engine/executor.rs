@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::model::Model;
 
-use super::{ForwardBatch, RequestId, TokenId};
+use super::{ForwardBatch, RequestId, StateArenaId, StateSchema, TokenId};
 
 #[derive(Debug, Error)]
 pub enum BatchLoweringError {
@@ -45,6 +45,11 @@ pub enum ExecutionError {
     Unavailable(String),
     #[error("completion {0} is not pending")]
     InvalidCompletion(u64),
+    #[error("batch belongs to state arena {batch}; executor owns arena {executor}")]
+    StateArenaMismatch {
+        batch: StateArenaId,
+        executor: StateArenaId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +158,8 @@ pub struct ExecutionStats {
 pub trait ModelExecutor: 'static {
     fn model(&self) -> Arc<dyn Model>;
 
+    fn state_schema(&self) -> &StateSchema;
+
     fn submit(&mut self, batch: &ForwardBatch) -> Result<BatchTicket, ExecutionError>;
 
     fn poll(&mut self, completion: CompletionId)
@@ -170,6 +177,10 @@ pub trait ModelExecutor: 'static {
 impl<T: ModelExecutor + ?Sized> ModelExecutor for Box<T> {
     fn model(&self) -> Arc<dyn Model> {
         (**self).model()
+    }
+
+    fn state_schema(&self) -> &StateSchema {
+        (**self).state_schema()
     }
 
     fn submit(&mut self, batch: &ForwardBatch) -> Result<BatchTicket, ExecutionError> {

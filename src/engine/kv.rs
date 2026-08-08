@@ -1,22 +1,28 @@
 use std::collections::HashMap;
 
-use super::{KvSlot, RequestId};
+use super::{KvSlot, RequestId, StateArenaId};
 
 #[derive(Debug)]
 pub struct KvSlots {
+    arena_id: StateArenaId,
     free: Vec<KvSlot>,
     allocations: HashMap<RequestId, Vec<KvSlot>>,
     reserved_remaining: HashMap<RequestId, usize>,
 }
 
 impl KvSlots {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(arena_id: StateArenaId, capacity: usize) -> Self {
         assert!(capacity <= u32::MAX as usize);
         Self {
+            arena_id,
             free: (0..capacity as u32).rev().map(KvSlot::new).collect(),
             allocations: HashMap::new(),
             reserved_remaining: HashMap::new(),
         }
+    }
+
+    pub const fn arena_id(&self) -> StateArenaId {
+        self.arena_id
     }
 
     pub fn capacity(&self) -> usize {
@@ -85,7 +91,12 @@ mod tests {
     fn reservations_prevent_overcommit_and_slots_never_alias() {
         let a = RequestId::now_v7();
         let b = RequestId::now_v7();
-        let mut kv = KvSlots::new(8);
+        let mut kv = KvSlots::new(
+            crate::engine::StateSchema::try_flat_kv(8)
+                .unwrap()
+                .arena_id(),
+            8,
+        );
 
         assert!(kv.reserve(a, 5));
         assert!(!kv.reserve(b, 4));
@@ -106,7 +117,12 @@ mod tests {
     #[test]
     fn allocation_must_stay_within_a_requests_reservation() {
         let id = RequestId::now_v7();
-        let mut kv = KvSlots::new(4);
+        let mut kv = KvSlots::new(
+            crate::engine::StateSchema::try_flat_kv(4)
+                .unwrap()
+                .arena_id(),
+            4,
+        );
         assert!(kv.reserve(id, 2));
         assert!(kv.allocate(id, 3).is_none());
         assert_eq!(kv.used(), 0);

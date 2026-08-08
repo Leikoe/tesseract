@@ -115,12 +115,17 @@ impl EngineHandle {
         thread::Builder::new()
             .name("tesseract-engine".into())
             .spawn(move || match factory() {
-                Ok(executor) => {
-                    let model = executor.model();
-                    if initialized_tx.send(Ok(model)).is_ok() {
-                        EngineWorker::new(executor, config, worker_metrics).run(commands_rx);
+                Ok(executor) => match EngineWorker::try_new(executor, config, worker_metrics) {
+                    Ok(worker) => {
+                        let model = Arc::clone(&worker.model);
+                        if initialized_tx.send(Ok(model)).is_ok() {
+                            worker.run(commands_rx);
+                        }
                     }
-                }
+                    Err(error) => {
+                        let _ = initialized_tx.send(Err(error));
+                    }
+                },
                 Err(error) => {
                     let _ = initialized_tx.send(Err(error.to_string()));
                 }
@@ -351,12 +356,30 @@ struct EngineWorker<B> {
 }
 
 impl<B: ModelExecutor> EngineWorker<B> {
+    #[cfg(test)]
     fn new(executor: B, config: EngineConfig, metrics: Arc<Metrics>) -> Self {
+        Self::try_new(executor, config, metrics)
+            .expect("test executor must provide compatible state")
+    }
+
+    fn try_new(executor: B, config: EngineConfig, metrics: Arc<Metrics>) -> Result<Self, String> {
+        let state_schema = executor.state_schema();
+        let physical_capacity = state_schema
+            .flat_kv_capacity()
+            .ok_or_else(|| "executor state schema has no flat-KV group".to_owned())?;
+        if config.kv_capacity_tokens > physical_capacity {
+            return Err(format!(
+                "engine requests {} KV slots but executor arena {} provides {physical_capacity}",
+                config.kv_capacity_tokens,
+                state_schema.arena_id()
+            ));
+        }
         let model = executor.model();
-        Self {
+        let kv = KvSlots::new(state_schema.arena_id(), config.kv_capacity_tokens);
+        Ok(Self {
             executor,
             model,
-            kv: KvSlots::new(config.kv_capacity_tokens),
+            kv,
             config,
             metrics,
             requests: HashMap::new(),
@@ -366,7 +389,7 @@ impl<B: ModelExecutor> EngineWorker<B> {
             deferred_cancellations: HashSet::new(),
             shutting_down: false,
             shutdown_ack: None,
-        }
+        })
     }
 
     fn run(mut self, mut commands: mpsc::Receiver<Command>) {
@@ -664,7 +687,7 @@ impl<B: ModelExecutor> EngineWorker<B> {
         if self.running.len() > 1 {
             self.running.rotate_left(1);
         }
-        ForwardBatch::try_from_sequences(batch)
+        ForwardBatch::try_from_sequences(self.kv.arena_id(), batch)
             .expect("scheduler must construct a valid non-aliasing batch")
     }
 
@@ -885,6 +908,22 @@ mod tests {
                 stop: vec![],
             },
         }
+    }
+
+    #[test]
+    fn startup_rejects_an_executor_with_insufficient_physical_state() {
+        let metrics = Arc::new(Metrics::default());
+        let result = EngineHandle::spawn(
+            DeterministicExecutor::new("test-model").with_state_capacity(8),
+            config(),
+            8,
+            metrics,
+        );
+        assert!(matches!(
+            result,
+            Err(EngineSpawnError::ExecutorInitialization(message))
+                if message.contains("provides 8")
+        ));
     }
 
     #[tokio::test]

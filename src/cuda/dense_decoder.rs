@@ -23,7 +23,7 @@ use crate::{
         kernel_plan::{ComputeCapability, DecoderKernelRequirement, KernelCatalog, KernelPlan},
         kernels,
     },
-    engine::{ExecutionError, ExecutionStats, ModelExecutor, TokenId},
+    engine::{ExecutionError, ExecutionStats, ModelExecutor, StateSchema, TokenId},
     model::{
         CudaForwardReport, CudaModelReport, CudaTokenLogit, Model, ModelError,
         weights::{WeightDtype, WeightSource},
@@ -270,6 +270,7 @@ struct DenseDecoder<A> {
     decode_graphs: HashMap<(usize, usize), DecodeGraph>,
     failed_decode_graphs: HashSet<(usize, usize)>,
     execution_stats: ExecutionStats,
+    state_schema: StateSchema,
 }
 
 pub(super) enum ForwardOutput {
@@ -388,6 +389,8 @@ impl DenseDecoder<DirectFlatKvAttention> {
             sine,
             kernel_plan.attention,
         )?;
+        let state_schema = StateSchema::try_flat_kv(capacity)
+            .map_err(|error| ModelError::InvalidConfig(error.to_string()))?;
         Ok(Self {
             model,
             config,
@@ -401,6 +404,7 @@ impl DenseDecoder<DirectFlatKvAttention> {
             decode_graphs: HashMap::new(),
             failed_decode_graphs: HashSet::new(),
             execution_stats: ExecutionStats::default(),
+            state_schema,
         })
     }
 }
@@ -1351,6 +1355,10 @@ fn device_error(error: impl std::fmt::Debug) -> DeviceError {
 impl<A: AttentionBackend<Error = ModelError>> ModelProgram for DenseDecoder<A> {
     fn model(&self) -> Arc<dyn Model> {
         self.model.clone()
+    }
+
+    fn state_schema(&self) -> &StateSchema {
+        &self.state_schema
     }
 
     fn execute(&mut self, batch: &CudaBatch) -> Result<ProgramOutput, ExecutionError> {
