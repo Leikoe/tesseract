@@ -285,16 +285,18 @@ mod tile {
         query: &Tensor<bf16, { [-1, -1, D] }>,
         key: &Tensor<bf16, { [-1, -1, D] }>,
         value: &Tensor<bf16, { [-1, -1, D] }>,
+        metadata: &Tensor<i32, { [2] }>,
         out: &mut Tensor<bf16, { [BM, 1, D] }>,
         scale: f32,
         group_size: i32,
-        context_len: i32,
-        query_start: i32,
     ) {
         let pid = get_tile_block_id();
         let query_block = pid.0;
         let query_head = pid.1;
         let kv_head = query_head / group_size;
+        let metadata = metadata.partition(const_shape![1]);
+        let context_len: i32 = tile_to_scalar(metadata.load([0i32]).reshape(const_shape![]));
+        let query_start: i32 = tile_to_scalar(metadata.load([1i32]).reshape(const_shape![]));
         let query = query.partition(const_shape![BM, 1, D]);
         let query: Tile<f32, { [BM, D] }> = convert_tile(
             query

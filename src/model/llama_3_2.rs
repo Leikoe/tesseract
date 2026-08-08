@@ -413,7 +413,9 @@ mod cuda_impl {
             let mut key_cache = Vec::with_capacity(model.config.num_hidden_layers);
             let mut value_cache = Vec::with_capacity(model.config.num_hidden_layers);
             let cache_shape = [
-                capacity,
+                capacity.checked_add(1).ok_or_else(|| {
+                    ModelError::Cuda("KV cache sentinel allocation overflowed".into())
+                })?,
                 model.config.num_key_value_heads,
                 model.config.head_dim,
             ];
@@ -469,7 +471,16 @@ mod cuda_impl {
             let token_ids = copy_u32(token_ids, stream, "token IDs")?;
             let positions = copy_u32(positions, stream, "positions")?;
             let current_slots = copy_u32(current_slots, stream, "current KV slots")?;
-            let context_slots = copy_u32(context_slots, stream, "context KV slots")?;
+            let context_len = context_slots.len();
+            let context_bucket = context_len.next_power_of_two().max(16);
+            let mut padded_context_slots = context_slots.to_vec();
+            padded_context_slots.resize(context_bucket, self.capacity as u32);
+            let context_slots = copy_u32(&padded_context_slots, stream, "padded context KV slots")?;
+            let attention_metadata = copy_i32(
+                &[context_len as i32, query_start],
+                stream,
+                "attention metadata",
+            )?;
 
             let hidden = api::zeros::<bf16>(&[rows, cfg.hidden_size])
                 .partition([1, HIDDEN_BLOCK])
@@ -577,14 +588,13 @@ mod cuda_impl {
                 .map_err(|error| cuda_error("key RoPE and flat KV write", error))?;
                 drop(rotated_key);
 
-                let context_len = context_slots.shape()[0] as usize;
                 let gathered_key =
-                    api::zeros::<bf16>(&[cfg.num_key_value_heads, context_len, cfg.head_dim])
+                    api::zeros::<bf16>(&[cfg.num_key_value_heads, context_bucket, cfg.head_dim])
                         .partition([1, 1, cfg.head_dim])
                         .sync_on(stream)
                         .map_err(|error| cuda_error("allocate gathered key", error))?;
                 let gathered_value =
-                    api::zeros::<bf16>(&[cfg.num_key_value_heads, context_len, cfg.head_dim])
+                    api::zeros::<bf16>(&[cfg.num_key_value_heads, context_bucket, cfg.head_dim])
                         .partition([1, 1, cfg.head_dim])
                         .sync_on(stream)
                         .map_err(|error| cuda_error("allocate gathered value", error))?;
@@ -611,16 +621,15 @@ mod cuda_impl {
                     .partition([ATTENTION_QUERY_BLOCK, 1, cfg.head_dim])
                     .sync_on(stream)
                     .map_err(|error| cuda_error("allocate attention output", error))?;
-                let (_, _, _, attention, _, _, _, _) = unsafe {
+                let (_, _, _, _, attention, _, _) = unsafe {
                     kernels::causal_attention_bf16(
                         &rotated_query,
                         &gathered_key,
                         &gathered_value,
+                        &attention_metadata,
                         attention,
                         1.0 / (cfg.head_dim as f32).sqrt(),
                         (cfg.num_attention_heads / cfg.num_key_value_heads) as i32,
-                        context_len as i32,
-                        query_start,
                     )
                 }
                 .generics(vec![
@@ -1184,6 +1193,16 @@ mod cuda_impl {
         stream: &Arc<Stream>,
         operation: &'static str,
     ) -> Result<Tensor<u32>, ModelError> {
+        api::copy_host_vec_to_device(&Arc::new(values.to_vec()))
+            .sync_on(stream)
+            .map_err(|error| cuda_error(operation, error))
+    }
+
+    fn copy_i32(
+        values: &[i32],
+        stream: &Arc<Stream>,
+        operation: &'static str,
+    ) -> Result<Tensor<i32>, ModelError> {
         api::copy_host_vec_to_device(&Arc::new(values.to_vec()))
             .sync_on(stream)
             .map_err(|error| cuda_error(operation, error))

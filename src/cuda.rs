@@ -286,8 +286,11 @@ fn validate_transformer_primitives(
         .partition([1, 1, 64])
         .sync_on(stream)
         .map_err(|error| kernel_error("allocate attention output", error))?;
-    let (_, _, _, attention, _, _, _, _) = unsafe {
-        kernels::causal_attention_bf16(&rotated, &key, &value, attention, 0.125, 2, 2, 0)
+    let metadata = api::copy_host_vec_to_device(&std::sync::Arc::new(vec![2i32, 0i32]))
+        .sync_on(stream)
+        .map_err(|error| kernel_error("upload attention metadata", error))?;
+    let (_, _, _, _, attention, _, _) = unsafe {
+        kernels::causal_attention_bf16(&rotated, &key, &value, &metadata, attention, 0.125, 2)
     }
     .generics(vec!["1".into(), "16".into(), "64".into()])
     .sync_on(stream)
