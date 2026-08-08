@@ -810,8 +810,13 @@ The refactor should remain runnable after every step:
    `AttentionBackend` and fixed-shape graph policy live in separate decoder
    submodules rather than in either the architecture adapter or transformer
    program.
-9. Add the architecture registry and independent `WeightSource`; remove
-   model-name and checkpoint-format switches from serving code.
+9. **Implemented:** the startup registry probes `config.json` architecture
+   metadata rather than deployment/model IDs, then delegates construction to a
+   registered `ArchitectureFactory`. The format-neutral, read-only
+   `WeightSource` exposes named tensor metadata and bytes; sharded or monolithic
+   SafeTensors is its first implementation, while CUDA materialization now
+   belongs to the decoder runtime. Neither boundary dispatches in the token hot
+   path.
 10. Run property tests, strict Clippy, CUDA differential tests, Compute
    Sanitizer, and the retained A100 benchmark after each performance-sensitive
    extraction.
