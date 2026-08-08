@@ -91,6 +91,10 @@ impl CudaBatch {
         self.contexts.len()
     }
 
+    pub fn num_tokens(&self) -> usize {
+        self.token_ids.len()
+    }
+
     pub fn is_packed_greedy_decode(&self) -> bool {
         self.num_prefill_tokens == 0
             && self.all_samples_greedy

@@ -29,6 +29,18 @@ pub enum ExecutionError {
     Sampling(#[from] super::SamplingError),
     #[error("model execution failed: {0}")]
     Execution(String),
+    #[error("model program omitted output for {samples} sampled rows")]
+    MissingOutput { samples: usize },
+    #[error("model program returned {actual} tokens for {expected} sampled rows")]
+    TokenOutputCount { expected: usize, actual: usize },
+    #[error(
+        "model program returned {actual} logits for {samples} sampled rows and vocabulary size {vocab_size}"
+    )]
+    LogitOutputShape {
+        samples: usize,
+        vocab_size: usize,
+        actual: usize,
+    },
     #[error("executor is unavailable: {0}")]
     Unavailable(String),
     #[error("completion {0} is not pending")]

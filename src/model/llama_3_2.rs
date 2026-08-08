@@ -325,12 +325,13 @@ mod cuda_impl {
     };
 
     use crate::{
-        cuda::{batch::CudaBatch, cublas, kernels},
-        engine::{
-            BatchTicket, CompletionId, ExecutionError, ExecutionOutput, ExecutionStats,
-            ForwardBatch, GeneratedToken, HostLogitsSampler, ImmediateCompletion, ModelExecutor,
-            TokenId,
+        cuda::{
+            batch::CudaBatch,
+            cublas,
+            executor::{CudaExecutor, ModelProgram, ProgramOutput},
+            kernels,
         },
+        engine::{ExecutionError, ExecutionStats, ModelExecutor, TokenId},
         model::Model,
     };
 
@@ -2089,111 +2090,66 @@ mod cuda_impl {
         DeviceError::Internal(format!("decode graph tensor view: {error:?}"))
     }
 
-    struct LlamaCudaExecutor {
-        runtime: CudaLlama,
-        completions: ImmediateCompletion,
-    }
-
-    impl ModelExecutor for LlamaCudaExecutor {
+    impl ModelProgram for CudaLlama {
         fn model(&self) -> Arc<dyn Model> {
-            self.runtime.model.clone()
+            self.model.clone()
         }
 
-        fn submit(&mut self, batch: &ForwardBatch) -> Result<BatchTicket, ExecutionError> {
-            self.completions.ensure_available()?;
-            let lowered = CudaBatch::lower(batch)?;
-
+        fn execute(&mut self, batch: &CudaBatch) -> Result<ProgramOutput, ExecutionError> {
             let started = Instant::now();
-            let forward = if lowered.is_packed_greedy_decode() {
+            let forward = if batch.is_packed_greedy_decode() {
                 let output = self
-                    .runtime
                     .forward_decode_batch(
-                        &lowered.token_ids,
-                        &lowered.positions,
-                        &lowered.current_slots,
-                        &lowered.contexts,
+                        &batch.token_ids,
+                        &batch.positions,
+                        &batch.current_slots,
+                        &batch.contexts,
                     )
                     .map_err(execution)?;
-                self.runtime.execution_stats.packed_decode_forwards += 1;
-                self.runtime.execution_stats.packed_decode_requests +=
-                    lowered.request_count() as u64;
+                self.execution_stats.packed_decode_forwards += 1;
+                self.execution_stats.packed_decode_requests += batch.request_count() as u64;
                 ForwardOutput::Tokens(output)
             } else {
                 let output = self
-                    .runtime
                     .forward_eager_impl(EagerBatch {
-                        token_ids: &lowered.token_ids,
-                        positions: &lowered.positions,
-                        current_slots: &lowered.current_slots,
-                        contexts: &lowered.contexts,
-                        request_indices: &lowered.request_indices,
-                        context_lengths: &lowered.context_lengths,
-                        sample_rows: &lowered.sample_rows,
-                        greedy: lowered.all_samples_greedy,
+                        token_ids: &batch.token_ids,
+                        positions: &batch.positions,
+                        current_slots: &batch.current_slots,
+                        contexts: &batch.contexts,
+                        request_indices: &batch.request_indices,
+                        context_lengths: &batch.context_lengths,
+                        sample_rows: &batch.sample_rows,
+                        greedy: batch.all_samples_greedy,
                     })
                     .map_err(execution)?;
-                self.runtime.execution_stats.eager_forwards += 1;
+                self.execution_stats.eager_forwards += 1;
                 output
             };
             tracing::debug!(
-                requests = batch.len(),
+                requests = batch.request_count(),
                 tokens = batch.num_tokens(),
-                prefill_tokens = batch.num_prefill_tokens(),
+                prefill_tokens = batch.num_prefill_tokens,
                 elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
                 "model batch executed"
             );
 
-            let sampled_tokens = match forward {
-                ForwardOutput::None if lowered.samples.is_empty() => Vec::new(),
-                ForwardOutput::Token(token) if lowered.samples.len() == 1 => vec![token],
-                ForwardOutput::Tokens(tokens) if tokens.len() == lowered.samples.len() => tokens,
-                ForwardOutput::Logits(logits) if lowered.samples.len() == 1 => {
-                    let sampling = lowered.samples[0].sampling;
-                    vec![HostLogitsSampler.sample(&logits, sampling)?.get()]
+            match forward {
+                ForwardOutput::None => Ok(ProgramOutput::None),
+                ForwardOutput::Token(token) => Ok(ProgramOutput::Tokens(vec![TokenId::new(token)])),
+                ForwardOutput::Tokens(tokens) => Ok(ProgramOutput::Tokens(
+                    tokens.into_iter().map(TokenId::new).collect(),
+                )),
+                ForwardOutput::Logits(values) | ForwardOutput::BatchLogits(values) => {
+                    Ok(ProgramOutput::HostLogits {
+                        values,
+                        vocab_size: self.model.config.vocab_size,
+                    })
                 }
-                ForwardOutput::BatchLogits(logits) => {
-                    let vocab_size = self.runtime.model.config.vocab_size;
-                    if logits.len() != lowered.samples.len() * vocab_size {
-                        return Err(ExecutionError::Execution(format!(
-                            "ragged logits returned {} values for {} samples and vocab {vocab_size}",
-                            logits.len(),
-                            lowered.samples.len()
-                        )));
-                    }
-                    let mut tokens = Vec::with_capacity(lowered.samples.len());
-                    for (sample, row) in lowered.samples.iter().zip(logits.chunks_exact(vocab_size))
-                    {
-                        tokens.push(HostLogitsSampler.sample(row, sample.sampling)?.get());
-                    }
-                    tokens
-                }
-                _ => {
-                    return Err(ExecutionError::Execution(
-                        "ragged forward returned output inconsistent with sampling rows".into(),
-                    ));
-                }
-            };
-
-            let mut outputs = Vec::with_capacity(sampled_tokens.len());
-            for (sample, token_id) in lowered.samples.into_iter().zip(sampled_tokens) {
-                outputs.push(GeneratedToken {
-                    request_id: sample.request_id,
-                    token_id: TokenId::new(token_id),
-                });
             }
-            self.completions
-                .submit(ExecutionOutput::Generation { tokens: outputs })
-        }
-
-        fn poll(
-            &mut self,
-            completion: CompletionId,
-        ) -> Result<Option<ExecutionOutput>, ExecutionError> {
-            self.completions.poll(completion)
         }
 
         fn take_execution_stats(&mut self) -> ExecutionStats {
-            std::mem::take(&mut self.runtime.execution_stats)
+            std::mem::take(&mut self.execution_stats)
         }
     }
 
@@ -2225,10 +2181,7 @@ mod cuda_impl {
             max_running,
             "Llama CUDA executor loaded and execution buckets warmed"
         );
-        Ok(Box::new(LlamaCudaExecutor {
-            runtime,
-            completions: ImmediateCompletion::default(),
-        }))
+        Ok(Box::new(CudaExecutor::new(runtime)))
     }
 
     pub(super) fn validate(

@@ -17,6 +17,7 @@ use thiserror::Error;
 
 pub(crate) mod batch;
 pub(crate) mod cublas;
+pub(crate) mod executor;
 pub(crate) mod kernels;
 
 #[cutile::module]
