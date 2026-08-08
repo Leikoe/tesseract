@@ -326,6 +326,7 @@ mod cuda_impl {
 
     use crate::{
         cuda::{
+            attention::{AttentionBackend, DecodeGraphAttention, EagerAttention},
             batch::CudaBatch,
             cublas,
             executor::{CudaExecutor, ModelProgram, ProgramOutput},
@@ -430,20 +431,31 @@ mod cuda_impl {
         }
     }
 
-    struct CudaLlama {
+    struct CudaLlama<A> {
         model: Arc<Llama32>,
         stream: Arc<Stream>,
         weights: RuntimeWeights,
-        cosine: Arc<Tensor<f32>>,
-        sine: Arc<Tensor<f32>>,
-        key_cache: Vec<Bf16Tensor>,
-        value_cache: Vec<Bf16Tensor>,
+        attention: A,
         capacity: usize,
         max_decode_batch_bucket: usize,
         max_query_bucket: usize,
         decode_graphs: HashMap<(usize, usize), DecodeGraph>,
         failed_decode_graphs: HashSet<(usize, usize)>,
         execution_stats: ExecutionStats,
+    }
+
+    struct FlatKvLayerState {
+        key_cache: Bf16Tensor,
+        value_cache: Bf16Tensor,
+    }
+
+    struct DirectFlatKvAttention {
+        layers: Vec<FlatKvLayerState>,
+        cosine: Arc<Tensor<f32>>,
+        sine: Arc<Tensor<f32>>,
+        num_attention_heads: usize,
+        num_key_value_heads: usize,
+        head_dim: usize,
     }
 
     enum ForwardOutput {
@@ -501,7 +513,212 @@ mod cuda_impl {
         }
     }
 
-    impl CudaLlama {
+    impl DirectFlatKvAttention {
+        fn load(
+            config: &super::Config,
+            stream: &Arc<Stream>,
+            capacity: usize,
+            scratch_slots: usize,
+            cosine: Arc<Tensor<f32>>,
+            sine: Arc<Tensor<f32>>,
+        ) -> Result<Self, ModelError> {
+            let cache_shape = [
+                capacity
+                    .checked_add(1)
+                    .and_then(|slots| slots.checked_add(scratch_slots))
+                    .ok_or_else(|| {
+                        ModelError::Cuda("KV cache sentinel allocation overflowed".into())
+                    })?,
+                config.num_key_value_heads,
+                config.head_dim,
+            ];
+            let mut layers = Vec::with_capacity(config.num_hidden_layers);
+            for layer in 0..config.num_hidden_layers {
+                let key_cache =
+                    api::zeros::<bf16>(&cache_shape)
+                        .sync_on(stream)
+                        .map_err(|error| {
+                            ModelError::Cuda(format!("allocate layer {layer} key cache: {error:?}"))
+                        })?;
+                let value_cache =
+                    api::zeros::<bf16>(&cache_shape)
+                        .sync_on(stream)
+                        .map_err(|error| {
+                            ModelError::Cuda(format!(
+                                "allocate layer {layer} value cache: {error:?}"
+                            ))
+                        })?;
+                layers.push(FlatKvLayerState {
+                    key_cache: Arc::new(key_cache),
+                    value_cache: Arc::new(value_cache),
+                });
+            }
+            Ok(Self {
+                layers,
+                cosine,
+                sine,
+                num_attention_heads: config.num_attention_heads,
+                num_key_value_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+            })
+        }
+    }
+
+    impl AttentionBackend for DirectFlatKvAttention {
+        type LayerState = FlatKvLayerState;
+        type Error = ModelError;
+
+        fn layer_state(&self, layer: usize) -> Result<&Self::LayerState, Self::Error> {
+            self.layers
+                .get(layer)
+                .ok_or_else(|| ModelError::Cuda(format!("attention layer {layer} is out of range")))
+        }
+
+        fn enqueue_eager(&self, input: EagerAttention<'_>) -> Result<Tensor<bf16>, Self::Error> {
+            let state = self.layer_state(input.layer)?;
+            let rotated_query = output_buffer_async::<bf16>(
+                &[input.rows, self.num_attention_heads, self.head_dim],
+                input.stream,
+                "rotated query",
+            )?
+            .partition([1, 1, self.head_dim]);
+            let (_, _, _, _, rotated_query) = enqueue(
+                kernels::rope_q_bf16(
+                    input.query,
+                    input.positions,
+                    &self.cosine,
+                    &self.sine,
+                    rotated_query,
+                )
+                .generics(vec![
+                    self.head_dim.to_string(),
+                    (self.head_dim / 2).to_string(),
+                ]),
+                input.stream,
+                "query RoPE",
+            )?;
+            let rotated_query = Arc::new(rotated_query.unpartition());
+
+            let rotated_key = output_buffer_async::<bf16>(
+                &[input.rows, self.num_key_value_heads, self.head_dim],
+                input.stream,
+                "rotated key",
+            )?
+            .partition([1, 1, self.head_dim]);
+            let (_, _, _, _, _, _, _, _, _rotated_key) = enqueue(
+                unsafe {
+                    kernels::rope_kv_write_bf16(
+                        input.key,
+                        input.value,
+                        input.positions,
+                        input.current_slots,
+                        &self.cosine,
+                        &self.sine,
+                        state.key_cache.device_pointer(),
+                        state.value_cache.device_pointer(),
+                        rotated_key,
+                    )
+                }
+                .generics(vec![
+                    self.head_dim.to_string(),
+                    (self.head_dim / 2).to_string(),
+                    self.num_key_value_heads.to_string(),
+                ]),
+                input.stream,
+                "key RoPE and flat KV write",
+            )?;
+
+            let attention = output_buffer_async::<bf16>(
+                &[input.rows, self.num_attention_heads, self.head_dim],
+                input.stream,
+                "ragged attention output",
+            )?
+            .partition([1, 1, self.head_dim]);
+            let (_, _, _, _, _, _, attention, _, _) = enqueue(
+                unsafe {
+                    kernels::ragged_attention_bf16(
+                        &rotated_query,
+                        input.request_indices,
+                        input.context_slots,
+                        input.context_lengths,
+                        state.key_cache.device_pointer(),
+                        state.value_cache.device_pointer(),
+                        attention,
+                        1.0 / (self.head_dim as f32).sqrt(),
+                        (self.num_attention_heads / self.num_key_value_heads) as i32,
+                    )
+                }
+                .generics(vec![
+                    ATTENTION_KEY_BLOCK.to_string(),
+                    self.head_dim.to_string(),
+                    self.num_key_value_heads.to_string(),
+                ]),
+                input.stream,
+                "ragged flat-KV attention",
+            )?;
+            Ok(attention.unpartition())
+        }
+
+        fn record_decode(&self, input: DecodeGraphAttention<'_>) -> Result<(), Self::Error> {
+            let state = self.layer_state(input.layer)?;
+            input.scope.record(
+                kernels::rope_q_bf16(
+                    input.query,
+                    input.positions,
+                    &self.cosine,
+                    &self.sine,
+                    input.rotated_query.partition([1, 1, self.head_dim]),
+                )
+                .generics(vec![
+                    self.head_dim.to_string(),
+                    (self.head_dim / 2).to_string(),
+                ]),
+            )?;
+            input.scope.record(
+                unsafe {
+                    kernels::rope_kv_write_bf16(
+                        input.key,
+                        input.value,
+                        input.positions,
+                        input.current_slots,
+                        &self.cosine,
+                        &self.sine,
+                        state.key_cache.device_pointer(),
+                        state.value_cache.device_pointer(),
+                        input.rotated_key.partition([1, 1, self.head_dim]),
+                    )
+                }
+                .generics(vec![
+                    self.head_dim.to_string(),
+                    (self.head_dim / 2).to_string(),
+                    self.num_key_value_heads.to_string(),
+                ]),
+            )?;
+            input.scope.record(
+                unsafe {
+                    kernels::ragged_attention_bf16(
+                        input.rotated_query,
+                        input.request_indices,
+                        input.context_slots,
+                        input.context_lengths,
+                        state.key_cache.device_pointer(),
+                        state.value_cache.device_pointer(),
+                        input.attention.partition([1, 1, self.head_dim]),
+                        1.0 / (self.head_dim as f32).sqrt(),
+                        (self.num_attention_heads / self.num_key_value_heads) as i32,
+                    )
+                }
+                .generics(vec![
+                    ATTENTION_KEY_BLOCK.to_string(),
+                    self.head_dim.to_string(),
+                    self.num_key_value_heads.to_string(),
+                ]),
+            )?;
+            Ok(())
+        }
+    }
+
+    impl CudaLlama<DirectFlatKvAttention> {
         fn load(
             model: Arc<Llama32>,
             device_id: usize,
@@ -517,46 +734,23 @@ mod cuda_impl {
                 .map_err(|error| ModelError::Cuda(format!("create stream: {error:?}")))?;
             let weights = RuntimeWeights::load(&model, &stream)?;
             let (cosine, sine) = rope_tables(&model.config, &stream)?;
-            let mut key_cache = Vec::with_capacity(model.config.num_hidden_layers);
-            let mut value_cache = Vec::with_capacity(model.config.num_hidden_layers);
             let max_decode_batch_bucket = execution_bucket(max_running, 1)
                 .ok_or_else(|| ModelError::Cuda("max running batch bucket overflowed".into()))?;
             let max_query_bucket = execution_bucket(max_batch_tokens, 1)
                 .ok_or_else(|| ModelError::Cuda("max query bucket overflowed".into()))?;
-            let cache_shape = [
-                capacity
-                    .checked_add(1)
-                    .and_then(|slots| {
-                        slots.checked_add(max_decode_batch_bucket.max(max_query_bucket))
-                    })
-                    .ok_or_else(|| {
-                        ModelError::Cuda("KV cache sentinel allocation overflowed".into())
-                    })?,
-                model.config.num_key_value_heads,
-                model.config.head_dim,
-            ];
-            for layer in 0..model.config.num_hidden_layers {
-                let key = api::zeros::<bf16>(&cache_shape)
-                    .sync_on(&stream)
-                    .map_err(|error| {
-                        ModelError::Cuda(format!("allocate layer {layer} key cache: {error:?}"))
-                    })?;
-                let value = api::zeros::<bf16>(&cache_shape)
-                    .sync_on(&stream)
-                    .map_err(|error| {
-                        ModelError::Cuda(format!("allocate layer {layer} value cache: {error:?}"))
-                    })?;
-                key_cache.push(Arc::new(key));
-                value_cache.push(Arc::new(value));
-            }
+            let attention = DirectFlatKvAttention::load(
+                &model.config,
+                &stream,
+                capacity,
+                max_decode_batch_bucket.max(max_query_bucket),
+                cosine,
+                sine,
+            )?;
             Ok(Self {
                 model,
                 stream,
                 weights,
-                cosine,
-                sine,
-                key_cache,
-                value_cache,
+                attention,
                 capacity,
                 max_decode_batch_bucket,
                 max_query_bucket,
@@ -565,7 +759,9 @@ mod cuda_impl {
                 execution_stats: ExecutionStats::default(),
             })
         }
+    }
 
+    impl<A: AttentionBackend<Error = ModelError>> CudaLlama<A> {
         fn forward(
             &mut self,
             token_ids: &[u32],
@@ -863,87 +1059,19 @@ mod cuda_impl {
                     .view(&[rows, cfg.num_key_value_heads, cfg.head_dim])
                     .map_err(|error| cuda_error("view value heads", error))?;
 
-                let rotated_query = output_buffer_async::<bf16>(
-                    &[rows, cfg.num_attention_heads, cfg.head_dim],
+                let attention = self.attention.enqueue_eager(EagerAttention {
+                    layer: layer_index,
+                    query: &query,
+                    key: &key,
+                    value: &value,
+                    positions: &positions,
+                    current_slots: &current_slots,
+                    request_indices: &request_indices,
+                    context_slots: &context_slots,
+                    context_lengths: &context_lengths,
+                    rows,
                     stream,
-                    "rotated query",
-                )?
-                .partition([1, 1, cfg.head_dim]);
-                let (_, _, _, _, rotated_query) = enqueue(
-                    kernels::rope_q_bf16(
-                        &query,
-                        &positions,
-                        &self.cosine,
-                        &self.sine,
-                        rotated_query,
-                    )
-                    .generics(vec![
-                        cfg.head_dim.to_string(),
-                        (cfg.head_dim / 2).to_string(),
-                    ]),
-                    stream,
-                    "query RoPE",
-                )?;
-                let rotated_query = Arc::new(rotated_query.unpartition());
-
-                let rotated_key = output_buffer_async::<bf16>(
-                    &[rows, cfg.num_key_value_heads, cfg.head_dim],
-                    stream,
-                    "rotated key",
-                )?
-                .partition([1, 1, cfg.head_dim]);
-                let (_, _, _, _, _, _, _, _, rotated_key) = enqueue(
-                    unsafe {
-                        kernels::rope_kv_write_bf16(
-                            &key,
-                            &value,
-                            &positions,
-                            &current_slots,
-                            &self.cosine,
-                            &self.sine,
-                            self.key_cache[layer_index].device_pointer(),
-                            self.value_cache[layer_index].device_pointer(),
-                            rotated_key,
-                        )
-                    }
-                    .generics(vec![
-                        cfg.head_dim.to_string(),
-                        (cfg.head_dim / 2).to_string(),
-                        cfg.num_key_value_heads.to_string(),
-                    ]),
-                    stream,
-                    "key RoPE and flat KV write",
-                )?;
-
-                let attention = output_buffer_async::<bf16>(
-                    &[rows, cfg.num_attention_heads, cfg.head_dim],
-                    stream,
-                    "ragged attention output",
-                )?
-                .partition([1, 1, cfg.head_dim]);
-                let (_, _, _, _, _, _, attention, _, _) = enqueue(
-                    unsafe {
-                        kernels::ragged_attention_bf16(
-                            &rotated_query,
-                            &request_indices,
-                            &context_slots,
-                            &context_lengths,
-                            self.key_cache[layer_index].device_pointer(),
-                            self.value_cache[layer_index].device_pointer(),
-                            attention,
-                            1.0 / (cfg.head_dim as f32).sqrt(),
-                            (cfg.num_attention_heads / cfg.num_key_value_heads) as i32,
-                        )
-                    }
-                    .generics(vec![
-                        ATTENTION_KEY_BLOCK.to_string(),
-                        cfg.head_dim.to_string(),
-                        cfg.num_key_value_heads.to_string(),
-                    ]),
-                    stream,
-                    "ragged flat-KV attention",
-                )?;
-                let attention = attention.unpartition();
+                })?;
                 let attention = Arc::new(
                     attention
                         .reshape(&[rows, cfg.hidden_size])
@@ -1490,8 +1618,8 @@ mod cuda_impl {
     }
 
     impl DecodeGraph {
-        fn capture(
-            runtime: &CudaLlama,
+        fn capture<A: AttentionBackend<Error = ModelError>>(
+            runtime: &CudaLlama<A>,
             batch_size: usize,
             context_bucket: usize,
         ) -> Result<Self, ModelError> {
@@ -1623,62 +1751,27 @@ mod cuda_impl {
                         .value
                         .view(&[batch_size, cfg.num_key_value_heads, cfg.head_dim])
                         .map_err(device_error)?;
-                    scope.record(
-                        kernels::rope_q_bf16(
-                            &query,
-                            &positions,
-                            &runtime.cosine,
-                            &runtime.sine,
-                            (&mut layer.rotated_query).partition([1, 1, cfg.head_dim]),
-                        )
-                        .generics(vec![
-                            cfg.head_dim.to_string(),
-                            (cfg.head_dim / 2).to_string(),
-                        ]),
-                    )?;
-                    scope.record(
-                        unsafe {
-                            kernels::rope_kv_write_bf16(
-                                &key,
-                                &value,
-                                &positions,
-                                &current_slots,
-                                &runtime.cosine,
-                                &runtime.sine,
-                                runtime.key_cache[layer_index].device_pointer(),
-                                runtime.value_cache[layer_index].device_pointer(),
-                                (&mut layer.rotated_key).partition([1, 1, cfg.head_dim]),
-                            )
-                        }
-                        .generics(vec![
-                            cfg.head_dim.to_string(),
-                            (cfg.head_dim / 2).to_string(),
-                            cfg.num_key_value_heads.to_string(),
-                        ]),
-                    )?;
                     let context_slots_view = context_slots
                         .view(&[batch_size, context_bucket])
                         .map_err(device_error)?;
-                    scope.record(
-                        unsafe {
-                            kernels::ragged_attention_bf16(
-                                &layer.rotated_query,
-                                &request_indices,
-                                &context_slots_view,
-                                &context_lengths,
-                                runtime.key_cache[layer_index].device_pointer(),
-                                runtime.value_cache[layer_index].device_pointer(),
-                                (&mut layer.attention).partition([1, 1, cfg.head_dim]),
-                                1.0 / (cfg.head_dim as f32).sqrt(),
-                                (cfg.num_attention_heads / cfg.num_key_value_heads) as i32,
-                            )
-                        }
-                        .generics(vec![
-                            ATTENTION_KEY_BLOCK.to_string(),
-                            cfg.head_dim.to_string(),
-                            cfg.num_key_value_heads.to_string(),
-                        ]),
-                    )?;
+                    runtime
+                        .attention
+                        .record_decode(DecodeGraphAttention {
+                            scope,
+                            layer: layer_index,
+                            query: &query,
+                            key: &key,
+                            value: &value,
+                            positions: &positions,
+                            current_slots: &current_slots,
+                            request_indices: &request_indices,
+                            context_slots: &context_slots_view,
+                            context_lengths: &context_lengths,
+                            rotated_query: &mut layer.rotated_query,
+                            rotated_key: &mut layer.rotated_key,
+                            attention: &mut layer.attention,
+                        })
+                        .map_err(|error| DeviceError::Internal(error.to_string()))?;
                     scope.record(api::memcpy(&mut layer.attention_flat, &layer.attention))?;
                     record_gemm(
                         scope,
@@ -2090,7 +2183,7 @@ mod cuda_impl {
         DeviceError::Internal(format!("decode graph tensor view: {error:?}"))
     }
 
-    impl ModelProgram for CudaLlama {
+    impl<A: AttentionBackend<Error = ModelError>> ModelProgram for CudaLlama<A> {
         fn model(&self) -> Arc<dyn Model> {
             self.model.clone()
         }
