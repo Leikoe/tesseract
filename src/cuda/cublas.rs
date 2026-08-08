@@ -1,7 +1,6 @@
 use std::{cell::RefCell, ffi::c_void, sync::Arc};
 
 use cuda_async::device_operation::{DeviceOp, value, with_context};
-use cuda_core::IntoResult;
 use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 use cutile::{core::bf16, tensor::Tensor};
 use thiserror::Error;
@@ -21,7 +20,7 @@ pub enum CublasError {
     Operation(String),
 }
 
-unsafe fn handle(
+fn handle(
     device_id: usize,
     stream: cublas_sys::cudaStream_t,
 ) -> Result<cublas_sys::cublasHandle_t, CublasError> {
@@ -34,7 +33,7 @@ unsafe fn handle(
         }
         let handle = cublas_result::create_handle()
             .map_err(|error| CublasError::Operation(format!("create handle: {error:?}")))?;
-        cublas_result::set_stream(handle, stream)
+        unsafe { cublas_result::set_stream(handle, stream) }
             .map_err(|error| CublasError::Operation(format!("set stream: {error:?}")))?;
         *cached.borrow_mut() = Some((key, handle as usize));
         Ok(handle)
@@ -52,7 +51,7 @@ unsafe fn launch(
     n: i32,
     k: i32,
 ) -> Result<(), CublasError> {
-    let handle = unsafe { handle(device_id, stream)? };
+    let handle = handle(device_id, stream)?;
     let alpha = 1.0f32;
     let beta = 0.0f32;
     unsafe {

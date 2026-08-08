@@ -8,7 +8,7 @@ use cuda_core::Device;
 use cutile::{
     api,
     core::bf16,
-    tensor::{PartitionMut, Reshape},
+    tensor::{PartitionMut, Reshape, ToHostVec},
     tile_kernel::ToHostVecOp,
 };
 use thiserror::Error;
