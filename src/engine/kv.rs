@@ -67,8 +67,7 @@ impl KvSlots {
         }
     }
 
-    #[cfg(test)]
-    fn request_slots(&self, request_id: RequestId) -> &[KvSlot] {
+    pub(crate) fn request_slots(&self, request_id: RequestId) -> &[KvSlot] {
         self.allocations
             .get(&request_id)
             .map(Vec::as_slice)

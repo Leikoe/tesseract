@@ -4,29 +4,20 @@ use thiserror::Error;
 
 use crate::model::Model;
 
-use super::{ForwardBatch, GenerateRequest, RequestId};
+use super::{ForwardBatch, RequestId, TokenId};
 
 #[derive(Debug, Error)]
 pub enum BackendError {
-    #[error("invalid request: {0}")]
-    InvalidRequest(String),
     #[error("model execution failed: {0}")]
     Execution(String),
     #[error("backend is unavailable: {0}")]
     Unavailable(String),
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct PreparedRequest {
-    pub prompt_tokens: usize,
-}
-
 #[derive(Debug, Clone)]
 pub struct StepOutput {
     pub request_id: RequestId,
-    pub token_id: Option<u32>,
-    pub text: String,
-    pub is_eos: bool,
+    pub token_id: TokenId,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -43,11 +34,7 @@ pub struct BackendExecutionStats {
 pub trait Backend: 'static {
     fn model(&self) -> Arc<dyn Model>;
 
-    fn add_request(&mut self, request: &GenerateRequest) -> Result<PreparedRequest, BackendError>;
-
     fn step(&mut self, batch: &ForwardBatch) -> Result<Vec<StepOutput>, BackendError>;
-
-    fn remove_request(&mut self, request_id: RequestId);
 
     fn take_execution_stats(&mut self) -> BackendExecutionStats {
         BackendExecutionStats::default()
@@ -63,16 +50,8 @@ impl<T: Backend + ?Sized> Backend for Box<T> {
         (**self).model()
     }
 
-    fn add_request(&mut self, request: &GenerateRequest) -> Result<PreparedRequest, BackendError> {
-        (**self).add_request(request)
-    }
-
     fn step(&mut self, batch: &ForwardBatch) -> Result<Vec<StepOutput>, BackendError> {
         (**self).step(batch)
-    }
-
-    fn remove_request(&mut self, request_id: RequestId) {
-        (**self).remove_request(request_id);
     }
 
     fn take_execution_stats(&mut self) -> BackendExecutionStats {

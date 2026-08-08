@@ -6,6 +6,20 @@ use super::RequestId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
+pub struct TokenId(u32);
+
+impl TokenId {
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
 pub struct Position(usize);
 
 impl Position {
@@ -80,6 +94,52 @@ pub enum ForwardPhase {
     Decode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplingInput {
+    temperature: f32,
+    top_p: f32,
+    random_sample: f64,
+}
+
+impl SamplingInput {
+    pub(crate) fn try_new(
+        temperature: f32,
+        top_p: f32,
+        random_sample: f64,
+    ) -> Result<Self, ForwardBatchError> {
+        if !temperature.is_finite() || temperature < 0.0 {
+            return Err(ForwardBatchError::InvalidSamplingTemperature);
+        }
+        if !top_p.is_finite() || !(0.0 < top_p && top_p <= 1.0) {
+            return Err(ForwardBatchError::InvalidTopP);
+        }
+        if !random_sample.is_finite() || !(0.0..1.0).contains(&random_sample) {
+            return Err(ForwardBatchError::InvalidRandomSample);
+        }
+        Ok(Self {
+            temperature,
+            top_p,
+            random_sample,
+        })
+    }
+
+    pub const fn temperature(self) -> f32 {
+        self.temperature
+    }
+
+    pub const fn top_p(self) -> f32 {
+        self.top_p
+    }
+
+    pub const fn random_sample(self) -> f64 {
+        self.random_sample
+    }
+
+    pub const fn is_greedy(self) -> bool {
+        self.temperature == 0.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardKind {
     Empty,
@@ -96,8 +156,10 @@ pub struct ForwardSequence {
     request_id: RequestId,
     phase: ForwardPhase,
     position: Position,
+    token_ids: Vec<TokenId>,
     kv_slots: Vec<KvSlot>,
-    sample: bool,
+    context_slots: Vec<KvSlot>,
+    sampling: Option<SamplingInput>,
 }
 
 impl ForwardSequence {
@@ -105,11 +167,20 @@ impl ForwardSequence {
         request_id: RequestId,
         phase: ForwardPhase,
         position: Position,
+        token_ids: Vec<TokenId>,
         kv_slots: Vec<KvSlot>,
-        sample: bool,
+        context_slots: Vec<KvSlot>,
+        sampling: Option<SamplingInput>,
     ) -> Result<Self, ForwardBatchError> {
         if kv_slots.is_empty() {
             return Err(ForwardBatchError::EmptySequence { request_id });
+        }
+        if token_ids.len() != kv_slots.len() {
+            return Err(ForwardBatchError::QueryTokenCountMismatch {
+                request_id,
+                tokens: token_ids.len(),
+                slots: kv_slots.len(),
+            });
         }
         if phase == ForwardPhase::Decode && kv_slots.len() != 1 {
             return Err(ForwardBatchError::WrongDecodeTokenCount {
@@ -117,19 +188,31 @@ impl ForwardSequence {
                 tokens: kv_slots.len(),
             });
         }
-        if phase == ForwardPhase::Decode && !sample {
+        if phase == ForwardPhase::Decode && sampling.is_none() {
             return Err(ForwardBatchError::DecodeMustSample { request_id });
         }
-        position
+        let context_len = position
             .checked_advance(kv_slots.len())
             .ok_or(ForwardBatchError::PositionOverflow { request_id })?;
+        if context_slots.len() != context_len.get() {
+            return Err(ForwardBatchError::ContextLengthMismatch {
+                request_id,
+                expected: context_len.get(),
+                actual: context_slots.len(),
+            });
+        }
+        if !context_slots.ends_with(&kv_slots) {
+            return Err(ForwardBatchError::ContextTailMismatch { request_id });
+        }
 
         Ok(Self {
             request_id,
             phase,
             position,
+            token_ids,
             kv_slots,
-            sample,
+            context_slots,
+            sampling,
         })
     }
 
@@ -149,12 +232,24 @@ impl ForwardSequence {
         self.kv_slots.len()
     }
 
+    pub fn token_ids(&self) -> &[TokenId] {
+        &self.token_ids
+    }
+
     pub fn kv_slots(&self) -> &[KvSlot] {
         &self.kv_slots
     }
 
+    pub fn context_slots(&self) -> &[KvSlot] {
+        &self.context_slots
+    }
+
     pub const fn should_sample(&self) -> bool {
-        self.sample
+        self.sampling.is_some()
+    }
+
+    pub const fn sampling(&self) -> Option<SamplingInput> {
+        self.sampling
     }
 }
 
@@ -183,8 +278,32 @@ pub enum ForwardBatchError {
         request_id: RequestId,
         tokens: usize,
     },
+    #[error(
+        "forward sequence for request {request_id} has {tokens} query tokens but {slots} destination slots"
+    )]
+    QueryTokenCountMismatch {
+        request_id: RequestId,
+        tokens: usize,
+        slots: usize,
+    },
     #[error("decode sequence for request {request_id} must sample its scheduled token")]
     DecodeMustSample { request_id: RequestId },
+    #[error(
+        "forward sequence for request {request_id} has context length {actual}, expected {expected}"
+    )]
+    ContextLengthMismatch {
+        request_id: RequestId,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("forward sequence for request {request_id} does not end with its destination slots")]
+    ContextTailMismatch { request_id: RequestId },
+    #[error("sampling temperature must be finite and non-negative")]
+    InvalidSamplingTemperature,
+    #[error("top_p must be finite and in (0, 1]")]
+    InvalidTopP,
+    #[error("sampling random value must be finite and in [0, 1)")]
+    InvalidRandomSample,
     #[error("request {request_id} appears more than once in one forward batch")]
     DuplicateRequest { request_id: RequestId },
     #[error("physical KV slot {slot} is assigned more than once in one forward batch")]
@@ -324,12 +443,19 @@ mod tests {
         position: usize,
         slot_values: &[u32],
     ) -> ForwardSequence {
+        let current_slots = slots(slot_values);
+        let mut context_slots = (0..position)
+            .map(|index| KvSlot::new(10_000 + index as u32))
+            .collect::<Vec<_>>();
+        context_slots.extend_from_slice(&current_slots);
         ForwardSequence::try_new(
             request_id,
             phase,
             Position::new(position),
-            slots(slot_values),
-            phase == ForwardPhase::Decode,
+            (0..slot_values.len() as u32).map(TokenId::new).collect(),
+            current_slots,
+            context_slots,
+            (phase == ForwardPhase::Decode).then(|| SamplingInput::try_new(0.0, 1.0, 0.0).unwrap()),
         )
         .unwrap()
     }
@@ -409,7 +535,9 @@ mod tests {
                 ForwardPhase::Prefill,
                 Position::new(0),
                 vec![],
-                false,
+                vec![],
+                vec![],
+                None,
             )
             .unwrap_err(),
             ForwardBatchError::EmptySequence { request_id }
@@ -419,8 +547,10 @@ mod tests {
                 request_id,
                 ForwardPhase::Decode,
                 Position::new(1),
+                vec![TokenId::new(1), TokenId::new(2)],
                 slots(&[3, 4]),
-                true,
+                slots(&[9, 3, 4]),
+                Some(SamplingInput::try_new(0.0, 1.0, 0.0).unwrap()),
             )
             .unwrap_err(),
             ForwardBatchError::WrongDecodeTokenCount {
@@ -433,11 +563,77 @@ mod tests {
                 request_id,
                 ForwardPhase::Decode,
                 Position::new(1),
+                vec![TokenId::new(1)],
                 slots(&[3]),
-                false,
+                slots(&[9, 3]),
+                None,
             )
             .unwrap_err(),
             ForwardBatchError::DecodeMustSample { request_id }
+        );
+
+        assert_eq!(
+            ForwardSequence::try_new(
+                request_id,
+                ForwardPhase::Prefill,
+                Position::new(0),
+                vec![TokenId::new(1), TokenId::new(2)],
+                slots(&[3]),
+                slots(&[3]),
+                None,
+            )
+            .unwrap_err(),
+            ForwardBatchError::QueryTokenCountMismatch {
+                request_id,
+                tokens: 2,
+                slots: 1,
+            }
+        );
+        assert_eq!(
+            ForwardSequence::try_new(
+                request_id,
+                ForwardPhase::Prefill,
+                Position::new(2),
+                vec![TokenId::new(1)],
+                slots(&[3]),
+                slots(&[8, 3]),
+                None,
+            )
+            .unwrap_err(),
+            ForwardBatchError::ContextLengthMismatch {
+                request_id,
+                expected: 3,
+                actual: 2,
+            }
+        );
+        assert_eq!(
+            ForwardSequence::try_new(
+                request_id,
+                ForwardPhase::Prefill,
+                Position::new(1),
+                vec![TokenId::new(1)],
+                slots(&[3]),
+                slots(&[8, 9]),
+                None,
+            )
+            .unwrap_err(),
+            ForwardBatchError::ContextTailMismatch { request_id }
+        );
+    }
+
+    #[test]
+    fn sampling_inputs_reject_values_outside_their_contract() {
+        assert_eq!(
+            SamplingInput::try_new(f32::NAN, 1.0, 0.0).unwrap_err(),
+            ForwardBatchError::InvalidSamplingTemperature
+        );
+        assert_eq!(
+            SamplingInput::try_new(1.0, 0.0, 0.0).unwrap_err(),
+            ForwardBatchError::InvalidTopP
+        );
+        assert_eq!(
+            SamplingInput::try_new(1.0, 1.0, 1.0).unwrap_err(),
+            ForwardBatchError::InvalidRandomSample
         );
     }
 }

@@ -1,21 +1,14 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use crate::model::{ChatMessage, IncrementalDecoder, Model, ModelError, ModelSummary};
 
-use super::{
-    Backend, BackendError, ForwardBatch, GenerateRequest, PreparedRequest, RequestId, StepOutput,
-};
+use super::{Backend, BackendError, ForwardBatch, StepOutput, TokenId};
 
 /// Deterministic token backend used only by API and scheduler tests.
 pub struct DeterministicBackend {
     model: Arc<TestModel>,
-    requests: HashMap<RequestId, TestRequest>,
     step_delay: Duration,
     fail_next_step: bool,
-}
-
-struct TestRequest {
-    generated: usize,
 }
 
 impl DeterministicBackend {
@@ -24,7 +17,6 @@ impl DeterministicBackend {
             model: Arc::new(TestModel {
                 id: model_id.into(),
             }),
-            requests: HashMap::new(),
             step_delay: Duration::ZERO,
             fail_next_step: false,
         }
@@ -46,13 +38,6 @@ impl Backend for DeterministicBackend {
         self.model.clone()
     }
 
-    fn add_request(&mut self, request: &GenerateRequest) -> Result<PreparedRequest, BackendError> {
-        let prompt_tokens = request.prompt.split_whitespace().count().max(1);
-        self.requests
-            .insert(request.id, TestRequest { generated: 0 });
-        Ok(PreparedRequest { prompt_tokens })
-    }
-
     fn step(&mut self, batch: &ForwardBatch) -> Result<Vec<StepOutput>, BackendError> {
         if std::mem::take(&mut self.fail_next_step) {
             return Err(BackendError::Execution("injected step failure".into()));
@@ -65,26 +50,25 @@ impl Backend for DeterministicBackend {
             if !sequence.should_sample() {
                 continue;
             }
-            let request = self
-                .requests
-                .get_mut(&sequence.request_id())
-                .ok_or_else(|| {
-                    BackendError::Execution(format!("unknown request {}", sequence.request_id()))
+            let previous =
+                sequence.token_ids().last().copied().ok_or_else(|| {
+                    BackendError::Execution("sampled sequence has no token".into())
                 })?;
-            let index = request.generated;
-            request.generated += 1;
+            let token_id = if previous.get() >= 1000 {
+                previous
+                    .get()
+                    .checked_add(1)
+                    .map(TokenId::new)
+                    .ok_or_else(|| BackendError::Execution("test token overflowed".into()))?
+            } else {
+                TokenId::new(1000)
+            };
             outputs.push(StepOutput {
                 request_id: sequence.request_id(),
-                token_id: Some(1000 + index as u32),
-                text: format!(" token{index}"),
-                is_eos: false,
+                token_id,
             });
         }
         Ok(outputs)
-    }
-
-    fn remove_request(&mut self, request_id: RequestId) {
-        self.requests.remove(&request_id);
     }
 }
 
@@ -141,6 +125,6 @@ struct TestDecoder;
 
 impl IncrementalDecoder for TestDecoder {
     fn push(&mut self, token_id: u32) -> Result<String, ModelError> {
-        Ok(format!(" token{token_id}"))
+        Ok(format!(" token{}", token_id.saturating_sub(1000)))
     }
 }

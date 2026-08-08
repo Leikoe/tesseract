@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     fmt::Display,
     sync::{
@@ -13,12 +13,13 @@ use std::{
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::model::Model;
+use crate::model::{IncrementalDecoder, Model};
 use crate::{config::EngineConfig, metrics::Metrics};
 
 use super::{
     Backend, FinishReason, ForwardBatch, ForwardPhase, ForwardSequence, GenerateRequest,
-    GenerationEvent, Position, RequestId, StepOutput, Usage, kv::KvSlots,
+    GenerationEvent, GenerationParams, Position, RequestId, SamplingInput, StepOutput, TokenId,
+    Usage, kv::KvSlots,
 };
 
 #[derive(Debug, Error)]
@@ -248,11 +249,13 @@ impl Drop for RequestStream {
 }
 
 struct RequestState {
-    request: GenerateRequest,
+    params: GenerationParams,
     output: mpsc::Sender<GenerationEvent>,
-    prompt_tokens: usize,
+    prompt: Vec<TokenId>,
+    generated: Vec<TokenId>,
+    decoder: Box<dyn IncrementalDecoder>,
+    rng: SplitMix64,
     computed_tokens: usize,
-    generated_tokens: usize,
     pending_text: String,
     started_at: Instant,
     last_token_at: Option<Instant>,
@@ -260,21 +263,30 @@ struct RequestState {
 
 impl RequestState {
     fn target_tokens(&self) -> usize {
-        self.prompt_tokens + self.generated_tokens
+        self.prompt.len() + self.generated.len()
     }
 
     fn reservation_tokens(&self) -> usize {
-        self.prompt_tokens + self.request.params.max_tokens
+        self.prompt.len() + self.params.max_tokens
+    }
+
+    fn token_range(&self, range: std::ops::Range<usize>) -> Vec<TokenId> {
+        self.prompt
+            .iter()
+            .chain(&self.generated)
+            .copied()
+            .skip(range.start)
+            .take(range.len())
+            .collect()
     }
 
     fn consume_text(&mut self, text: &str) -> (String, bool) {
         self.pending_text.push_str(text);
-        if self.request.params.stop.is_empty() {
+        if self.params.stop.is_empty() {
             return (std::mem::take(&mut self.pending_text), false);
         }
 
         let stop_at = self
-            .request
             .params
             .stop
             .iter()
@@ -291,7 +303,7 @@ impl RequestState {
             .find(|&suffix_len| {
                 self.pending_text
                     .is_char_boundary(self.pending_text.len() - suffix_len)
-                    && self.request.params.stop.iter().any(|stop| {
+                    && self.params.stop.iter().any(|stop| {
                         stop.starts_with(&self.pending_text[self.pending_text.len() - suffix_len..])
                     })
             })
@@ -303,8 +315,29 @@ impl RequestState {
     }
 }
 
+#[derive(Debug)]
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    const fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn unit_f64(&mut self) -> f64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        ((value >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+    }
+}
+
 struct EngineWorker<B> {
     backend: B,
+    model: Arc<dyn Model>,
     config: EngineConfig,
     metrics: Arc<Metrics>,
     kv: KvSlots,
@@ -317,8 +350,10 @@ struct EngineWorker<B> {
 
 impl<B: Backend> EngineWorker<B> {
     fn new(backend: B, config: EngineConfig, metrics: Arc<Metrics>) -> Self {
+        let model = backend.model();
         Self {
             backend,
+            model,
             kv: KvSlots::new(config.kv_capacity_tokens),
             config,
             metrics,
@@ -419,8 +454,9 @@ impl<B: Backend> EngineWorker<B> {
         }
 
         let id = request.id;
-        let prepared = match self.backend.add_request(&request) {
-            Ok(prepared) => prepared,
+        let started = Instant::now();
+        let prompt = match self.model.encode(&request.prompt) {
+            Ok(prompt) => prompt.into_iter().map(TokenId::new).collect::<Vec<_>>(),
             Err(error) => {
                 let _ = output.try_send(GenerationEvent::Failed {
                     message: error.to_string(),
@@ -429,17 +465,16 @@ impl<B: Backend> EngineWorker<B> {
                 return;
             }
         };
-        if prepared.prompt_tokens == 0 {
-            self.backend.remove_request(id);
+        if prompt.is_empty() {
             let _ = output.try_send(GenerationEvent::Failed {
                 message: "the rendered prompt is empty".into(),
             });
             self.metrics.request_failed();
             return;
         }
-        let total = prepared.prompt_tokens + request.params.max_tokens;
+        let prompt_tokens = prompt.len();
+        let total = prompt_tokens + request.params.max_tokens;
         if total > self.config.max_sequence_length || total > self.kv.capacity() {
-            self.backend.remove_request(id);
             let _ = output.try_send(GenerationEvent::Failed {
                 message: format!(
                     "prompt plus max_tokens ({total}) exceeds the configured capacity"
@@ -450,15 +485,25 @@ impl<B: Backend> EngineWorker<B> {
         }
 
         self.metrics.request_started();
-        self.metrics.add_prompt_tokens(prepared.prompt_tokens);
+        self.metrics.add_prompt_tokens(prompt_tokens);
+        tracing::debug!(
+            request_id = %id,
+            prompt_tokens,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            "prompt tokenized"
+        );
+        let decoder = self.model.decoder();
+        let rng = SplitMix64::new(request.params.seed);
         self.requests.insert(
             id,
             RequestState {
-                request,
+                params: request.params,
                 output,
-                prompt_tokens: prepared.prompt_tokens,
+                prompt,
+                generated: Vec::with_capacity(total - prompt_tokens),
+                decoder,
+                rng,
                 computed_tokens: 0,
-                generated_tokens: 0,
                 pending_text: String::new(),
                 started_at: Instant::now(),
                 last_token_at: None,
@@ -502,7 +547,7 @@ impl<B: Backend> EngineWorker<B> {
                 let Some(state) = self.requests.get(id) else {
                     continue;
                 };
-                let is_decode = state.computed_tokens >= state.prompt_tokens;
+                let is_decode = state.computed_tokens >= state.prompt.len();
                 if is_decode != decode_phase {
                     continue;
                 }
@@ -519,6 +564,29 @@ impl<B: Backend> EngineWorker<B> {
                 let Some(kv_slots) = self.kv.allocate(*id, num_tokens) else {
                     continue;
                 };
+                let context_slots = self.kv.request_slots(*id).to_vec();
+                let state = self
+                    .requests
+                    .get_mut(id)
+                    .expect("scheduled request must remain present");
+                let end = state
+                    .computed_tokens
+                    .checked_add(num_tokens)
+                    .expect("validated sequence length must not overflow");
+                let token_ids = state.token_range(state.computed_tokens..end);
+                let sampling = (end == state.target_tokens()).then(|| {
+                    let random_sample = if state.params.temperature == 0.0 {
+                        0.0
+                    } else {
+                        state.rng.unit_f64()
+                    };
+                    SamplingInput::try_new(
+                        state.params.temperature,
+                        state.params.top_p,
+                        random_sample,
+                    )
+                    .expect("validated generation parameters must form sampling input")
+                });
                 batch.push(
                     ForwardSequence::try_new(
                         *id,
@@ -528,8 +596,10 @@ impl<B: Backend> EngineWorker<B> {
                             ForwardPhase::Prefill
                         },
                         Position::new(state.computed_tokens),
+                        token_ids,
                         kv_slots,
-                        state.computed_tokens + num_tokens == state.target_tokens(),
+                        context_slots,
+                        sampling,
                     )
                     .expect("scheduler must construct a valid forward sequence"),
                 );
@@ -547,10 +617,32 @@ impl<B: Backend> EngineWorker<B> {
     }
 
     fn apply_step(&mut self, batch: &ForwardBatch, outputs: Vec<StepOutput>) {
-        let mut outputs: HashMap<_, _> = outputs
-            .into_iter()
-            .map(|output| (output.request_id, output))
-            .collect();
+        let expected_outputs = batch
+            .sequences()
+            .iter()
+            .filter(|sequence| sequence.should_sample())
+            .map(ForwardSequence::request_id)
+            .collect::<HashSet<_>>();
+        let mut output_map = HashMap::with_capacity(outputs.len());
+        let malformed = outputs.into_iter().any(|output| {
+            let request_id = output.request_id;
+            !expected_outputs.contains(&request_id)
+                || output_map.insert(request_id, output).is_some()
+        });
+        if malformed {
+            let request_ids = batch
+                .sequences()
+                .iter()
+                .map(ForwardSequence::request_id)
+                .collect::<Vec<_>>();
+            for request_id in request_ids {
+                self.fail_request(
+                    request_id,
+                    "backend returned a duplicate or unexpected sampled output".into(),
+                );
+            }
+            return;
+        }
         let mut finish = Vec::new();
         let mut failed = Vec::new();
 
@@ -562,7 +654,7 @@ impl<B: Backend> EngineWorker<B> {
             if !sequence.should_sample() {
                 continue;
             }
-            let Some(output) = outputs.remove(&sequence.request_id()) else {
+            let Some(output) = output_map.remove(&sequence.request_id()) else {
                 failed.push((
                     sequence.request_id(),
                     "backend omitted output for a sampled request".to_string(),
@@ -570,7 +662,15 @@ impl<B: Backend> EngineWorker<B> {
                 continue;
             };
 
-            state.generated_tokens += 1;
+            let token_id = output.token_id;
+            let text = match state.decoder.push(token_id.get()) {
+                Ok(text) => text,
+                Err(error) => {
+                    failed.push((sequence.request_id(), error.to_string()));
+                    continue;
+                }
+            };
+            state.generated.push(token_id);
             self.metrics.token_generated();
             let now = Instant::now();
             match state.last_token_at {
@@ -580,13 +680,13 @@ impl<B: Backend> EngineWorker<B> {
                 }
             }
             state.last_token_at = Some(now);
-            let (text, hit_stop) = state.consume_text(&output.text);
+            let (text, hit_stop) = state.consume_text(&text);
             if !text.is_empty()
                 && state
                     .output
                     .try_send(GenerationEvent::Delta {
                         text,
-                        token_id: output.token_id,
+                        token_id: Some(token_id.get()),
                     })
                     .is_err()
             {
@@ -594,9 +694,9 @@ impl<B: Backend> EngineWorker<B> {
                 continue;
             }
 
-            let reason = if hit_stop || output.is_eos {
+            let reason = if hit_stop || self.model.eos_token_ids().contains(&token_id.get()) {
                 Some(FinishReason::Stop)
-            } else if state.generated_tokens >= state.request.params.max_tokens {
+            } else if state.generated.len() >= state.params.max_tokens {
                 Some(FinishReason::Length)
             } else {
                 None
@@ -621,7 +721,6 @@ impl<B: Backend> EngineWorker<B> {
         self.waiting.retain(|candidate| *candidate != id);
         self.running.retain(|candidate| *candidate != id);
         self.kv.release(id);
-        self.backend.remove_request(id);
         let elapsed = state.started_at.elapsed();
         self.metrics.observe_request_duration(elapsed);
 
@@ -631,7 +730,7 @@ impl<B: Backend> EngineWorker<B> {
                 token_id: None,
             });
         }
-        let usage = Usage::new(state.prompt_tokens, state.generated_tokens);
+        let usage = Usage::new(state.prompt.len(), state.generated.len());
         let _ = state
             .output
             .try_send(GenerationEvent::Finished { reason, usage });
@@ -643,8 +742,8 @@ impl<B: Backend> EngineWorker<B> {
         tracing::info!(
             request_id = %id,
             finish_reason = ?reason,
-            prompt_tokens = state.prompt_tokens,
-            generated_tokens = state.generated_tokens,
+            prompt_tokens = state.prompt.len(),
+            generated_tokens = state.generated.len(),
             latency_ms = elapsed.as_secs_f64() * 1_000.0,
             "request finished"
         );
@@ -658,7 +757,6 @@ impl<B: Backend> EngineWorker<B> {
         self.waiting.retain(|candidate| *candidate != id);
         self.running.retain(|candidate| *candidate != id);
         self.kv.release(id);
-        self.backend.remove_request(id);
         let _ = state.output.try_send(GenerationEvent::Failed { message });
         self.metrics.request_failed();
         tracing::warn!(
@@ -933,6 +1031,32 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_backend_outputs_fail_without_leaking_request_state() {
+        let metrics = Arc::new(Metrics::default());
+        let backend = DeterministicBackend::new("test-model");
+        let mut worker = EngineWorker::new(backend, config(), metrics);
+        let (output, _receiver) = mpsc::channel(8);
+        let request = request(1);
+        let request_id = request.id;
+        worker.add_request(request, output);
+        worker.admit_waiting();
+
+        let first = worker.build_batch();
+        assert!(!first[0].should_sample());
+        worker.apply_step(&first, Vec::new());
+        let sampled = worker.build_batch();
+        assert!(sampled[0].should_sample());
+        let duplicate = StepOutput {
+            request_id,
+            token_id: TokenId::new(1000),
+        };
+        worker.apply_step(&sampled, vec![duplicate.clone(), duplicate]);
+
+        assert!(worker.requests.is_empty());
+        assert_eq!(worker.kv.used(), 0);
+    }
+
+    #[test]
     fn batch_builder_preserves_budget_chunk_and_slot_invariants() {
         for budget in 3..=9 {
             for chunk in 1..=4 {
@@ -991,9 +1115,14 @@ mod tests {
         let prefill_id = prefill.id;
         worker.add_request(prefill, prefill_output);
         worker.admit_waiting();
+        let prompt_len = worker.requests[&decode_id].prompt.len();
+        worker
+            .kv
+            .allocate(decode_id, prompt_len)
+            .expect("decode fixture must materialize its prompt KV");
         let decode_state = worker.requests.get_mut(&decode_id).unwrap();
-        decode_state.computed_tokens = decode_state.prompt_tokens;
-        decode_state.generated_tokens = 1;
+        decode_state.computed_tokens = prompt_len;
+        decode_state.generated.push(TokenId::new(1000));
 
         let batch = worker.build_batch();
         assert_eq!(batch.len(), 1);
@@ -1092,6 +1221,10 @@ mod tests {
                 prop_assert!(phases_are_partitioned);
                 let work_is_valid = batch.sequences().iter().all(|sequence| {
                     sequence.kv_slots().len() == sequence.num_tokens()
+                        && sequence.token_ids().len() == sequence.num_tokens()
+                        && sequence.context_slots().len()
+                            == sequence.position().get() + sequence.num_tokens()
+                        && sequence.context_slots().ends_with(sequence.kv_slots())
                         && match sequence.phase() {
                             ForwardPhase::Prefill => sequence.num_tokens() <= prefill_chunk,
                             ForwardPhase::Decode => {

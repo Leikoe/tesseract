@@ -7,10 +7,10 @@ mod types;
 #[cfg(any(test, feature = "test-backend"))]
 pub mod testing;
 
-pub use backend::{Backend, BackendError, BackendExecutionStats, PreparedRequest, StepOutput};
+pub use backend::{Backend, BackendError, BackendExecutionStats, StepOutput};
 pub use batch::{
     ForwardBatch, ForwardBatchError, ForwardKind, ForwardPhase, ForwardSequence, KvSlot, Position,
-    QueryRow, SequenceIndex,
+    QueryRow, SamplingInput, SequenceIndex, TokenId,
 };
 pub use scheduler::{EngineHandle, EngineSpawnError, RequestStream, SubmitError};
 pub use types::{
