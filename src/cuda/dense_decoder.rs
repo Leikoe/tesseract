@@ -226,7 +226,7 @@ struct RuntimeWeights {
 
 impl RuntimeWeights {
     fn load(artifact: &DenseDecoderArtifact, stream: &Arc<Stream>) -> Result<Self, ModelError> {
-        let all = DeviceWeights::load(&artifact.weights, stream)?;
+        let all = DeviceWeights::load(artifact.weights.as_ref(), stream)?;
         let names = &artifact.weight_names;
         let embedding = all.get(&names.embedding)?;
         let final_norm = all.get(&names.final_norm)?;
