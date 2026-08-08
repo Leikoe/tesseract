@@ -36,6 +36,7 @@ pub(crate) enum ProgramOutput {
 /// when model programs become asynchronously enqueued.
 pub(crate) struct CudaExecutor<P> {
     program: P,
+    batch: CudaBatch,
     completions: ImmediateCompletion,
     host_sampler: HostLogitsSampler,
 }
@@ -44,6 +45,7 @@ impl<P> CudaExecutor<P> {
     pub fn new(program: P) -> Self {
         Self {
             program,
+            batch: CudaBatch::default(),
             completions: ImmediateCompletion::default(),
             host_sampler: HostLogitsSampler,
         }
@@ -67,9 +69,9 @@ impl<P: ModelProgram> ModelExecutor for CudaExecutor<P> {
                 executor: self.program.state_schema().arena_id(),
             });
         }
-        let batch = CudaBatch::lower(batch)?;
-        let output = self.program.execute(&batch)?;
-        let tokens = self.resolve_generation_output(&batch, output)?;
+        self.batch.lower_into(batch)?;
+        let output = self.program.execute(&self.batch)?;
+        let tokens = self.resolve_generation_output(&self.batch, output)?;
         self.completions
             .submit(ExecutionOutput::Generation { requests: tokens })
     }
@@ -150,7 +152,8 @@ mod tests {
             current_slots: vec![0; samples],
             request_indices: (0..samples as u32).collect(),
             context_lengths: vec![1; samples],
-            contexts: vec![vec![0]; samples],
+            context_storage: vec![vec![0]; samples],
+            num_requests: samples,
             sample_rows: (0..samples as u32).collect(),
             samples: (0..samples)
                 .map(|_| SampleTarget {

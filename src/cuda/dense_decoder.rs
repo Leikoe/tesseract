@@ -496,13 +496,11 @@ impl<A: AttentionBackend<Error = ModelError>> DenseDecoder<A> {
         })
     }
 
-    fn forward_decode_batch(
-        &mut self,
-        token_ids: &[u32],
-        positions: &[u32],
-        current_slots: &[u32],
-        contexts: &[Vec<u32>],
-    ) -> Result<Vec<u32>, ModelError> {
+    fn forward_decode_batch(&mut self, batch: &CudaBatch) -> Result<Vec<u32>, ModelError> {
+        let token_ids = &batch.token_ids;
+        let positions = &batch.positions;
+        let current_slots = &batch.current_slots;
+        let contexts = batch.contexts();
         let batch_bucket = self
             .kernel_plan
             .shapes
@@ -514,29 +512,15 @@ impl<A: AttentionBackend<Error = ModelError>> DenseDecoder<A> {
             .context_bucket(contexts.iter().map(Vec::len).max().unwrap_or(0))
             .ok_or_else(|| ModelError::Cuda("decode context bucket overflowed".into()))?;
         let key = (batch_bucket, context_bucket);
-        let request_indices: Vec<u32> = (0..token_ids.len())
-            .map(|index| {
-                u32::try_from(index)
-                    .map_err(|_| ModelError::Cuda("decode batch exceeds u32".into()))
-            })
-            .collect::<Result<_, _>>()?;
-        let context_lengths: Vec<i32> = contexts
-            .iter()
-            .map(|context| {
-                i32::try_from(context.len())
-                    .map_err(|_| ModelError::Cuda("decode context exceeds i32".into()))
-            })
-            .collect::<Result<_, _>>()?;
-        let sample_rows: Vec<u32> = request_indices.clone();
         let output = if self.failed_decode_graphs.contains(&key) {
             self.forward_eager_impl(EagerBatch {
                 token_ids,
                 positions,
                 current_slots,
                 contexts,
-                request_indices: &request_indices,
-                context_lengths: &context_lengths,
-                sample_rows: &sample_rows,
+                request_indices: &batch.request_indices,
+                context_lengths: &batch.context_lengths,
+                sample_rows: &batch.sample_rows,
                 greedy: true,
             })?
         } else {
@@ -558,9 +542,9 @@ impl<A: AttentionBackend<Error = ModelError>> DenseDecoder<A> {
                         positions,
                         current_slots,
                         contexts,
-                        request_indices: &request_indices,
-                        context_lengths: &context_lengths,
-                        sample_rows: &sample_rows,
+                        request_indices: &batch.request_indices,
+                        context_lengths: &batch.context_lengths,
+                        sample_rows: &batch.sample_rows,
                         greedy: true,
                     })?
                 }
@@ -1364,14 +1348,7 @@ impl<A: AttentionBackend<Error = ModelError>> ModelProgram for DenseDecoder<A> {
     fn execute(&mut self, batch: &CudaBatch) -> Result<ProgramOutput, ExecutionError> {
         let started = Instant::now();
         let forward = if batch.is_packed_greedy_decode() {
-            let output = self
-                .forward_decode_batch(
-                    &batch.token_ids,
-                    &batch.positions,
-                    &batch.current_slots,
-                    &batch.contexts,
-                )
-                .map_err(execution)?;
+            let output = self.forward_decode_batch(batch).map_err(execution)?;
             self.execution_stats.packed_decode_forwards += 1;
             self.execution_stats.packed_decode_requests += batch.request_count() as u64;
             ForwardOutput::Tokens(output)
@@ -1381,7 +1358,7 @@ impl<A: AttentionBackend<Error = ModelError>> ModelProgram for DenseDecoder<A> {
                     token_ids: &batch.token_ids,
                     positions: &batch.positions,
                     current_slots: &batch.current_slots,
-                    contexts: &batch.contexts,
+                    contexts: batch.contexts(),
                     request_indices: &batch.request_indices,
                     context_lengths: &batch.context_lengths,
                     sample_rows: &batch.sample_rows,
