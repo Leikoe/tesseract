@@ -551,6 +551,7 @@ declares a validated schema:
 
 ```rust
 pub struct StateSchema {
+    arena_id: StateArenaId,
     groups: Vec<StateGroupSpec>,
 }
 
@@ -571,6 +572,14 @@ The engine-owned `StateCoordinator` owns allocation and prefix-cache policy.
 The executor owns the corresponding physical `StateArena`. They are constructed
 as a matched pair and share an `ArenaId`; leases from one arena cannot be sent
 to another executor.
+
+The first implemented slice uses one `FlatKv` group. `ModelExecutor` exposes
+its immutable schema at startup, the engine refuses to configure more logical
+slots than that physical group provides, and every `ForwardBatch` carries the
+schema's process-unique `StateArenaId`. Both the deterministic conformance
+executor and CUDA executor reject a foreign arena before execution. Multiple
+group allocators, paged addressing, recurrent groups, and shared-prefix lease
+types remain later extensions of the same contract.
 
 Prefix sharing distinguishes immutable shared prefix references from
 exclusively writable tail reservations. Copy-on-write is used for partial tails.
@@ -796,8 +805,10 @@ The refactor should remain runnable after every step:
 6. **Partially implemented:** extract a crate-private `AttentionBackend` with
    associated per-layer state and both eager and graph-recording contracts. The
    current direct flat-KV path is its first static implementation and owns K/V
-   tensors plus RoPE tables. Moving that implementation out of the Llama module
-   and generalizing physical state into grouped `StateSchema` remain.
+   tensors plus RoPE tables in its own module. A first grouped `StateSchema`
+   now binds the engine allocator, batches, and executor storage with a typed
+   arena identity and validates physical capacity at startup. Paged/recurrent
+   groups and group-specific allocation remain.
 7. **Implemented:** add the typed construction-time `KernelCatalog`; every
    current dense, attention, and sampling leaf has a stable descriptor and
    validated compile-time geometry in one immutable `KernelPlan`. Prefill/mixed
