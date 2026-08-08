@@ -661,59 +661,68 @@ mod cuda_impl {
 
         fn record_decode(&self, input: DecodeGraphAttention<'_>) -> Result<(), Self::Error> {
             let state = self.layer_state(input.layer)?;
-            input.scope.record(
-                kernels::rope_q_bf16(
-                    input.query,
-                    input.positions,
-                    &self.cosine,
-                    &self.sine,
-                    input.rotated_query.partition([1, 1, self.head_dim]),
-                )
-                .generics(vec![
-                    self.head_dim.to_string(),
-                    (self.head_dim / 2).to_string(),
-                ]),
-            )?;
-            input.scope.record(
-                unsafe {
-                    kernels::rope_kv_write_bf16(
-                        input.key,
-                        input.value,
+            input
+                .scope
+                .record(
+                    kernels::rope_q_bf16(
+                        input.query,
                         input.positions,
-                        input.current_slots,
                         &self.cosine,
                         &self.sine,
-                        state.key_cache.device_pointer(),
-                        state.value_cache.device_pointer(),
-                        input.rotated_key.partition([1, 1, self.head_dim]),
+                        input.rotated_query.partition([1, 1, self.head_dim]),
                     )
-                }
-                .generics(vec![
-                    self.head_dim.to_string(),
-                    (self.head_dim / 2).to_string(),
-                    self.num_key_value_heads.to_string(),
-                ]),
-            )?;
-            input.scope.record(
-                unsafe {
-                    kernels::ragged_attention_bf16(
-                        input.rotated_query,
-                        input.request_indices,
-                        input.context_slots,
-                        input.context_lengths,
-                        state.key_cache.device_pointer(),
-                        state.value_cache.device_pointer(),
-                        input.attention.partition([1, 1, self.head_dim]),
-                        1.0 / (self.head_dim as f32).sqrt(),
-                        (self.num_attention_heads / self.num_key_value_heads) as i32,
-                    )
-                }
-                .generics(vec![
-                    ATTENTION_KEY_BLOCK.to_string(),
-                    self.head_dim.to_string(),
-                    self.num_key_value_heads.to_string(),
-                ]),
-            )?;
+                    .generics(vec![
+                        self.head_dim.to_string(),
+                        (self.head_dim / 2).to_string(),
+                    ]),
+                )
+                .map_err(|error| cuda_error("record query RoPE", error))?;
+            input
+                .scope
+                .record(
+                    unsafe {
+                        kernels::rope_kv_write_bf16(
+                            input.key,
+                            input.value,
+                            input.positions,
+                            input.current_slots,
+                            &self.cosine,
+                            &self.sine,
+                            state.key_cache.device_pointer(),
+                            state.value_cache.device_pointer(),
+                            input.rotated_key.partition([1, 1, self.head_dim]),
+                        )
+                    }
+                    .generics(vec![
+                        self.head_dim.to_string(),
+                        (self.head_dim / 2).to_string(),
+                        self.num_key_value_heads.to_string(),
+                    ]),
+                )
+                .map_err(|error| cuda_error("record key RoPE and flat KV write", error))?;
+            input
+                .scope
+                .record(
+                    unsafe {
+                        kernels::ragged_attention_bf16(
+                            &*input.rotated_query,
+                            input.request_indices,
+                            input.context_slots,
+                            input.context_lengths,
+                            state.key_cache.device_pointer(),
+                            state.value_cache.device_pointer(),
+                            input.attention.partition([1, 1, self.head_dim]),
+                            1.0 / (self.head_dim as f32).sqrt(),
+                            (self.num_attention_heads / self.num_key_value_heads) as i32,
+                        )
+                    }
+                    .generics(vec![
+                        ATTENTION_KEY_BLOCK.to_string(),
+                        self.head_dim.to_string(),
+                        self.num_key_value_heads.to_string(),
+                    ]),
+                )
+                .map_err(|error| cuda_error("record ragged flat-KV attention", error))?;
             Ok(())
         }
     }
@@ -1131,7 +1140,6 @@ mod cuda_impl {
                 // layer. This collapses dozens of synchronization points into
                 // one without permitting cross-stream lifetime races.
                 synchronize_stream(stream, "complete transformer layer")?;
-                drop(rotated_key);
             }
 
             if sample_rows.is_empty() {

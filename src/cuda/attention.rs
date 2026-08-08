@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use cuda_async::cuda_graph::Scope;
 use cuda_core::Stream;
-use cutile::{core::bf16, tensor::Tensor};
+use cutile::{
+    core::bf16,
+    tensor::{Tensor, TensorView},
+};
 
 /// Stateful, statically composed attention implementation.
 ///
@@ -22,13 +25,13 @@ pub(crate) trait AttentionBackend: 'static {
 
 pub(crate) struct EagerAttention<'a> {
     pub layer: usize,
-    pub query: &'a Tensor<bf16>,
-    pub key: &'a Tensor<bf16>,
-    pub value: &'a Tensor<bf16>,
+    pub query: &'a TensorView<'a, bf16>,
+    pub key: &'a TensorView<'a, bf16>,
+    pub value: &'a TensorView<'a, bf16>,
     pub positions: &'a Tensor<u32>,
     pub current_slots: &'a Tensor<u32>,
     pub request_indices: &'a Tensor<u32>,
-    pub context_slots: &'a Tensor<u32>,
+    pub context_slots: &'a TensorView<'a, u32>,
     pub context_lengths: &'a Tensor<i32>,
     pub rows: usize,
     pub stream: &'a Arc<Stream>,
@@ -37,13 +40,13 @@ pub(crate) struct EagerAttention<'a> {
 pub(crate) struct DecodeGraphAttention<'a> {
     pub scope: &'a Scope,
     pub layer: usize,
-    pub query: &'a Tensor<bf16>,
-    pub key: &'a Tensor<bf16>,
-    pub value: &'a Tensor<bf16>,
+    pub query: &'a TensorView<'a, bf16>,
+    pub key: &'a TensorView<'a, bf16>,
+    pub value: &'a TensorView<'a, bf16>,
     pub positions: &'a Tensor<u32>,
     pub current_slots: &'a Tensor<u32>,
     pub request_indices: &'a Tensor<u32>,
-    pub context_slots: &'a Tensor<u32>,
+    pub context_slots: &'a TensorView<'a, u32>,
     pub context_lengths: &'a Tensor<i32>,
     pub rotated_query: &'a mut Tensor<bf16>,
     pub rotated_key: &'a mut Tensor<bf16>,
