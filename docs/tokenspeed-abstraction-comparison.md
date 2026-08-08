@@ -45,16 +45,17 @@ important:
 | Concern | Current Tesseract | Target confirmed by TokenSpeed |
 | --- | --- | --- |
 | Scheduled work | private, validated `ForwardBatch` with typed positions/KV slots and an explicit mixed partition | retain this boundary and extend it with request-slot generations, output selection, and grouped state views |
-| Engine/executor protocol | synchronous `Backend::step` over a fully materialized batch | submission tickets, completion events, and epoch-fenced reclamation |
+| Engine/executor protocol | `ModelExecutor::{submit,poll}` with typed completion tickets and one in-flight synchronous CUDA submission | enable event-backed overlap, multiple tickets, and epoch-fenced reclamation without changing the boundary |
 | Executor request state | the engine owns prompt/generated/decoder/sampling state; the executor consumes batch-local materializations and owns physical KV | retain engine authority while allowing explicit versioned, non-authoritative device mirrors when they are performance-justified |
 | Physical state | one flat `KvSlot` domain | a schema of attention/recurrent/cache groups with typed arena identity |
-| Model program | Llama architecture, batching, graphs, sampling, and CUDA lifecycle remain combined in a 2,756-line file | small private architecture adapter constructing a shared decoder program |
+| Model program | Llama architecture, batching, graphs, sampling, and CUDA lifecycle remain combined in a 2,770-line file | small private architecture adapter constructing a shared decoder program |
 | Operation implementations | direct concrete kernels | stateful `AttentionBackend`, planned `MoeBackend`, and construction-time leaf-kernel plans |
 
-The typed mixed batch and engine-owned request record are the first two realized
-slices of the design. They remove semantic request authority from the Llama
-backend, but do not by themselves solve model isolation or asynchronous
-executor lifecycle.
+The typed mixed batch, engine-owned request record, and ticketed executor are
+the first three realized slices of the design. They remove semantic request
+authority from the Llama executor and make completion-gated reclamation
+explicit. Device execution is still synchronous and one-at-a-time, so overlap
+and model isolation remain later steps.
 
 ## The three levels must remain distinct
 

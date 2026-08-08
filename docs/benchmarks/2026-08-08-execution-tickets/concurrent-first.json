@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "git_revision": "dea5e06a8e4a32be8393f81f692b8c519df1cbff",
+  "requests": 16,
+  "completion_tokens": 212,
+  "wall_seconds": 0.13064068399944517,
+  "completion_tokens_per_second": 1622.771662776202,
+  "mean_ttft_seconds": 0.012442194500067671,
+  "p99_ttft_seconds": 0.01669523234886583,
+  "mean_inter_token_seconds": 0.0034311653214336687,
+  "p99_request_latency_seconds": 0.07199406644913324
+}

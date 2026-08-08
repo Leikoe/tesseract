@@ -779,12 +779,15 @@ The refactor should remain runnable after every step:
 2. **Implemented:** introduce semantic newtypes and validated `ForwardBatch`
    without changing execution.
 3. **Implemented:** move authoritative prompt/generated tokens, decoder,
-   sampling state, and logical slot history from `LlamaCudaBackend` into engine
+   sampling state, and logical slot history from the Llama CUDA executor into engine
    request state. The current executor needs no persistent per-request mirror;
    add one later only as an explicit, versioned optimization.
-4. Replace synchronous `Backend::step` with mode-aware
-   `ModelExecutor::{submit,poll}` and execution tickets. Start with one in-flight
-   ticket while proving the API, then enable overlap without redesign.
+4. **Partially implemented:** replace synchronous `Backend::step` with
+   mode-aware `ModelExecutor::{submit,poll}` and typed execution tickets. The
+   first implementation enforces one in-flight ticket and defers cancellation
+   and KV reclamation until completion. CUDA submission itself remains
+   synchronous; event-backed overlap and epoch fencing are the next extension
+   of this boundary.
 5. Extract sampling, device batching, workspaces, and graph management into
    `CudaExecutor` while the existing Llama computation becomes its initial
    `ModelProgram`.
