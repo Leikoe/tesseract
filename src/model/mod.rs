@@ -1,4 +1,5 @@
 mod llama_3_2;
+mod qwen3_5_moe;
 mod tokenizer;
 pub(crate) mod weights;
 
@@ -117,7 +118,7 @@ trait ArchitectureFactory: Send + Sync {
     ) -> Result<CudaForwardReport, ModelError>;
 }
 
-static ARCHITECTURES: [&dyn ArchitectureFactory; 1] = [&llama_3_2::FACTORY];
+static ARCHITECTURES: [&dyn ArchitectureFactory; 2] = [&llama_3_2::FACTORY, &qwen3_5_moe::FACTORY];
 
 fn architecture_factory(
     model_id: &str,
@@ -201,6 +202,8 @@ pub fn validate_cuda_next_token(
 pub enum ModelError {
     #[error("unsupported model `{0}`")]
     UnsupportedModel(String),
+    #[error("unsupported execution path: {0}")]
+    UnsupportedExecution(String),
     #[error(
         "model `{model_id}` declares unsupported architecture(s) {architectures:?} and model type `{model_type}`"
     )]
@@ -270,6 +273,18 @@ mod tests {
             model_type: "llama".into(),
         };
         assert_eq!(resolve_architecture(&manifest).unwrap().name(), "llama");
+    }
+
+    #[test]
+    fn registry_resolves_qwen_text_from_the_outer_conditional_architecture() {
+        let manifest = ModelManifest {
+            architectures: vec!["Qwen3_5MoeForConditionalGeneration".into()],
+            model_type: "qwen3_5_moe".into(),
+        };
+        assert_eq!(
+            resolve_architecture(&manifest).unwrap().name(),
+            "qwen3_5_moe_text"
+        );
     }
 
     #[test]
