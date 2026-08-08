@@ -48,14 +48,15 @@ important:
 | Engine/executor protocol | `ModelExecutor::{submit,poll}` with typed completion tickets and one in-flight synchronous CUDA submission | enable event-backed overlap, multiple tickets, and epoch-fenced reclamation without changing the boundary |
 | Executor request state | the engine owns prompt/generated/decoder/sampling state; the executor consumes batch-local materializations and owns physical KV | retain engine authority while allowing explicit versioned, non-authoritative device mirrors when they are performance-justified |
 | Physical state | one flat `KvSlot` domain | a schema of attention/recurrent/cache groups with typed arena identity |
-| Model program | Llama architecture, graphs, and most CUDA lifecycle remain combined in a 2,658-line file; flat batch lowering and host-logits sampling are model-neutral modules | small private architecture adapter constructing a shared decoder program |
+| Model program | a generic statically composed `CudaExecutor<P>` owns lowering, completion, output validation, and sampling; Llama is the initial whole-batch `ModelProgram`, with graph/workspace internals still in its 2,611-line file | small private architecture adapter constructing a shared decoder program |
 | Operation implementations | direct concrete kernels plus an explicit model-neutral `HostLogitsSampler` | stateful `AttentionBackend`, planned `MoeBackend`, and construction-time leaf-kernel plans |
 
-The typed mixed batch, engine-owned request record, and ticketed executor are
-the first three realized slices of the design. They remove semantic request
-authority from the Llama executor and make completion-gated reclamation
-explicit. Device execution is still synchronous and one-at-a-time, so overlap
-and model isolation remain later steps.
+The typed mixed batch, engine-owned request record, ticketed executor, and
+statically composed CUDA program are realized slices of the design. They remove
+semantic request authority and generic execution mechanics from Llama while
+making completion-gated reclamation explicit. Device execution is still
+synchronous and one-at-a-time, and graph/workspace ownership remains in the
+initial program, so overlap and full model isolation remain later steps.
 
 ## The three levels must remain distinct
 

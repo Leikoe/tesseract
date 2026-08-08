@@ -788,11 +788,11 @@ The refactor should remain runnable after every step:
    and KV reclamation until completion. CUDA submission itself remains
    synchronous; event-backed overlap and epoch fencing are the next extension
    of this boundary.
-5. **Partially implemented:** extract sampling and flat CUDA batch lowering into
-   model-neutral modules with typed errors and property/shape tests. Workspaces,
-   graph management, and executor lifecycle still need to move into
-   `CudaExecutor` while the existing Llama computation becomes its initial
-   `ModelProgram`.
+5. **Partially implemented:** `CudaExecutor<P>` now owns flat batch lowering,
+   completion, output-cardinality validation, and sampling, while the existing
+   Llama computation is its statically composed initial `ModelProgram`.
+   Workspaces, graph management, and execution-shape policy still need to move
+   out of that program and into the generic executor.
 6. Extract a sealed `AttentionBackend` and grouped `StateSchema`, initially
    implemented only by the current direct flat-KV path.
 7. Add the typed construction-time `KernelCatalog`; resolve the current kernels
