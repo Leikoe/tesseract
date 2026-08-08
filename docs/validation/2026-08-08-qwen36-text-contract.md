@@ -39,3 +39,10 @@ The actual public `config.json` from the model repository passed config and
 quantization validation; a metadata-only `model-check` proceeded to opening the
 first absent weight shard, proving that architecture/config validation—not a
 fixture approximation—accepted the published config.
+
+The complete pinned 23.5 GB checkpoint was then downloaded to the A100 node.
+`model-check --model nvidia/Qwen3.6-35B-A3B-NVFP4` validated all three mapped
+shards and reported 124,468 source tensors, 40 layers, and `validation=ok` in
+6.38 seconds with 557,432 KiB peak resident memory. This is real checkpoint
+validation; CUDA execution remains explicitly unavailable until the hybrid and
+SM80 quantized programs land.

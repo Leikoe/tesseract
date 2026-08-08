@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(about = "Load and validate a complete BF16 model on CUDA")]
+#[command(about = "Load and validate a complete model checkpoint on CUDA")]
 struct Args {
     #[arg(long, default_value = tesseract::config::DEFAULT_MODEL_ID)]
     model: String,

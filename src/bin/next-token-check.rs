@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(about = "Run one real BF16 Llama forward pass on CUDA")]
+#[command(about = "Run one real model forward pass on CUDA")]
 struct Args {
     #[arg(long, default_value = tesseract::config::DEFAULT_MODEL_ID)]
     model: String,

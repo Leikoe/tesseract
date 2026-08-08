@@ -13,13 +13,15 @@ use tesseract::{
     about = "Validate a Tesseract model checkpoint without allocating GPU memory"
 )]
 struct Args {
+    #[arg(long, default_value = DEFAULT_MODEL_ID)]
+    model: String,
     #[arg(long)]
     model_path: PathBuf,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let model = model::load(DEFAULT_MODEL_ID, &args.model_path)
+    let model = model::load(&args.model, &args.model_path)
         .context("model validation and loading failed")?;
     let prompt = model
         .render_chat(&[ChatMessage {
