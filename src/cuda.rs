@@ -173,7 +173,7 @@ fn validate_transformer_primitives(
         .partition([1, 64])
         .sync_on(stream)
         .map_err(|error| kernel_error("allocate transformer hidden state", error))?;
-    let (hidden, _, _) = kernels::embedding_bf16(&token_ids, &table, hidden)
+    let (_, _, hidden) = kernels::embedding_bf16(&token_ids, &table, hidden)
         .generics(vec!["128".into(), "64".into()])
         .sync_on(stream)
         .map_err(|error| kernel_error("execute embedding", error))?;
