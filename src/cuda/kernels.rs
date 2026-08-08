@@ -39,7 +39,7 @@ mod tile {
         let sum: Tile<f32, { [] }> = sum.reshape(const_shape![]);
         let sum: f32 = tile_to_scalar(sum);
         let n: f32 = convert_scalar(N);
-        let inverse = rsqrt(scalar_to_tile(sum / n + epsilon), ftz::Disabled);
+        let inverse: Tile<f32, { [] }> = rsqrt(scalar_to_tile(sum / n + epsilon), ftz::Disabled);
         let inverse: f32 = tile_to_scalar(inverse);
         let inverse: Tile<f32, { [1, BLOCK] }> = inverse.broadcast(shape);
         let weight = weight.partition(const_shape![BLOCK]);
@@ -77,7 +77,7 @@ mod tile {
         let sum: Tile<f32, { [] }> = sum.reshape(const_shape![]);
         let sum: f32 = tile_to_scalar(sum);
         let n: f32 = convert_scalar(N);
-        let inverse = rsqrt(scalar_to_tile(sum / n + epsilon), ftz::Disabled);
+        let inverse: Tile<f32, { [] }> = rsqrt(scalar_to_tile(sum / n + epsilon), ftz::Disabled);
         let inverse: f32 = tile_to_scalar(inverse);
         let inverse: Tile<f32, { [1, BLOCK] }> = inverse.broadcast(shape);
         let weight = weight.partition(const_shape![BLOCK]);
@@ -289,10 +289,12 @@ mod tile {
                 scores * scale,
                 constant(-1.0e30f32, const_shape![BM, BN]),
             );
-            let block_max = reduce_max(scores, 1i32).reshape(const_shape![BM, 1]);
+            let block_max: Tile<f32, { [BM] }> = reduce_max(scores, 1i32);
+            let block_max: Tile<f32, { [BM, 1] }> = block_max.reshape(const_shape![BM, 1]);
             let next_max = max_tile(row_max, block_max);
             let probabilities = exp(scores - next_max.broadcast(const_shape![BM, BN]));
-            let block_sum = reduce_sum(probabilities, 1i32).reshape(const_shape![BM, 1]);
+            let block_sum: Tile<f32, { [BM] }> = reduce_sum(probabilities, 1i32);
+            let block_sum: Tile<f32, { [BM, 1] }> = block_sum.reshape(const_shape![BM, 1]);
             let correction = exp(row_max - next_max);
             row_sum = row_sum * correction + block_sum;
             accumulator = accumulator * correction.broadcast(const_shape![BM, D]);
