@@ -45,11 +45,11 @@ api -> ModelFrontend -> authoritative engine request state
                     CudaExecutor<P, R, A, S>
                        /       |       \
              ModelProgram  RuntimePolicy  Sampler
-                       \       /
-                 AttentionBackend
-                         ^
-                         |
-        architecture factory + independent weight source
+                  |            |             |
+          Attention/MoE backends + immutable KernelPlan
+                              ^
+                              |
+       architecture factory + KernelCatalog + independent weight source
 ```
 
 Dependencies only point downward. The scheduler cannot import CUDA or model
@@ -301,32 +301,12 @@ layout, dispatch/combine, collective communication, workspace, and kernels.
 Those deserve separate backend traits.
 
 ```rust
-pub(crate) trait FeedForwardBackend: 'static {
-    type Layer;
-    type Workspace;
-
-    fn prepare_layer(
-        &self,
-        spec: &FeedForwardSpec,
-        weights: DenseMlpWeights,
-    ) -> Result<Self::Layer, LoadError>;
-
-    fn enqueue(
-        &self,
-        layer: &Self::Layer,
-        input: HiddenStateView<'_>,
-        output: HiddenStateViewMut<'_>,
-        workspace: &mut Self::Workspace,
-        context: &mut CudaExecutionContext<'_>,
-    ) -> Result<(), ExecutionError>;
-}
-
 pub(crate) trait MoeBackend: 'static {
     type Layer;
     type BatchPlan;
     type Workspace;
 
-    fn capabilities(&self) -> MoeCapabilities;
+    fn capabilities(&self) -> MoePipelineCapabilities;
 
     fn prepare_layer(
         &self,
@@ -337,7 +317,7 @@ pub(crate) trait MoeBackend: 'static {
     fn plan(
         &self,
         layer: &Self::Layer,
-        router_logits: RouterLogitsView<'_>,
+        input: MoeBatchInput<'_>,
     ) -> Result<Self::BatchPlan, ExecutionError>;
 
     fn enqueue(
@@ -351,10 +331,23 @@ pub(crate) trait MoeBackend: 'static {
 }
 ```
 
+`MoePipelineCapabilities` declares whether the backend owns routing, its expert
+weight layout, collective topology, graph legality, overlap support, and whether
+finalization may be deferred. `BatchPlan` represents the semantic pipeline
+`route -> dispatch -> experts -> combine -> finalize`; an implementation may
+fuse any adjacent phases, including the whole pipeline. This keeps fusion an
+implementation property without making the model or scheduler understand it.
+
+Dense feed-forward is initially a concrete `DenseMlp<KernelPlan>`, not a peer
+backend trait. Fused and unfused GEMM/activation choices are resolved in its
+construction-time kernel plan. Extract a `FeedForwardBackend` only when a second
+implementation demonstrates shared lifecycle, workspace, or graph behavior
+beyond leaf-kernel selection.
+
 The program types compose these statically:
 
 ```rust
-pub(crate) struct DenseDecoder<A: AttentionBackend, F: FeedForwardBackend> {
+pub(crate) struct DenseDecoder<A: AttentionBackend> {
     // model geometry and layers
 }
 
@@ -373,7 +366,7 @@ operations until a second implementation demonstrates a larger lifecycle or
 storage contract. We should not create a trait for every kernel merely to make
 the type graph look uniform.
 
-Adding an implementation requires four things:
+Adding a lifecycle-bearing backend implementation requires four things:
 
 1. implement the operation-family trait;
 2. declare capabilities and reject incompatible geometry at construction;
@@ -417,17 +410,46 @@ required.
 
 Factories register supported backend bundles rather than promising every
 possible Cartesian product of implementations. A helper can close a new
-`AttentionBackend` with the default feed-forward, sampler, and runtime policy;
+`AttentionBackend` with the default dense kernel plan, sampler, and runtime
+policy;
 an MoE bundle can close the same attention implementation with a new
 `MoeBackend`. This avoids existential associated types, per-layer dynamic
 dispatch, and uncontrolled monomorphization while keeping additions local.
+
+Layer backends and leaf kernels are separate levels. During construction, a
+typed `KernelCatalog` resolves closed `KernelRequirement` values over operation,
+mode, tensor formats, device capability, geometry, and required semantics. It
+must resolve the complete set or fail before executor capture. The result is an
+immutable `KernelPlan` stored by the concrete program or backend:
+
+```rust
+pub enum KernelRequirement {
+    Gemm(GemmRequirement),
+    Norm(NormRequirement),
+    Activation(ActivationRequirement),
+    AttentionLeaf(AttentionKernelRequirement),
+    MoeLeaf(MoeKernelRequirement),
+    Sampling(SamplingKernelRequirement),
+}
+
+pub struct KernelPlan {
+    descriptor: KernelPlanDescriptor,
+    // concrete, already-validated operation handles
+}
+```
+
+This catalog is a cold construction mechanism, not a universal hot-path
+`Kernel` trait. There is no registry lookup, string matching, capability
+filtering, or dynamic dispatch in the transformer loop. Explicit development
+overrides alter `BuildRequest` and are recorded in `KernelPlanDescriptor`, so
+profiles and failures always report the exact selected implementation.
 
 The demonstrated internal strategy interfaces are:
 
 | Strategy | Tesseract status | Why it varies |
 | --- | --- | --- |
 | `AttentionBackend` | define now | kernels, metadata, KV layout, graph legality |
-| `FeedForwardBackend` | extract with decoder | fused/unfused dense MLP execution |
+| dense `KernelPlan` | define with decoder | fused/unfused GEMM and activation selection |
 | `MoeBackend` | add with first MoE | routing, experts, dispatch/combine, collectives |
 | sampler backend | concrete generic now | greedy/random kernels and RNG handling |
 | logits processor | add with penalties/grammar | stateful batched logit transforms |
@@ -475,10 +497,16 @@ pub struct SequenceView<'a> {
 pub enum ForwardKind<'a> {
     Prefill(TokenBatch<'a>),
     Decode(TokenBatch<'a>),
+    Mixed(MixedBatch<'a>),
     TargetVerify(VerificationBatch<'a>),
     Draft(DraftBatch<'a>),
     Encode(EncoderBatch<'a>),
     Pool(PoolingBatch<'a>),
+}
+
+pub struct MixedBatch<'a> {
+    prefill: TokenBatch<'a>,
+    decode: TokenBatch<'a>,
 }
 
 pub enum OutputSelection {
@@ -492,7 +520,8 @@ pub enum OutputSelection {
 Construction proves the invariants already documented in
 `batching-architecture.md`: aligned token metadata, non-aliasing destination
 slots, increasing selected rows, valid sequence indices, causal context bounds,
-and mode-specific output cardinality. CUDA code receives a valid value rather
+mode-specific output cardinality, and the prefill-before-decode row partition of
+mixed batches. CUDA code receives a valid value rather
 than revalidating parallel vectors on every execution branch. Closed mode and
 output enums avoid the giant mutable structure of unrelated optional tensors
 seen in mature upstream runners.
@@ -683,7 +712,9 @@ every transition they prove:
 8. lowering preserves query ranges and causal context lengths;
 9. stale request-slot generations and cross-arena leases are rejected;
 10. completed reclamation epochs restore allocator state, while unresolved
-    fences keep their locations unavailable.
+    fences keep their locations unavailable;
+11. mixed-batch lowering preserves the validated prefill-before-decode row
+    partition and agrees with separate execution where equivalence is promised.
 
 CUDA differential tests then compare eager and graph results for every supported
 bucket and compare shared-program outputs with the trusted Llama path.
@@ -718,6 +749,7 @@ src/
     graph.rs            generic graph cache and capture/replay
     state_arena.rs      grouped physical KV/recurrent storage
     attention.rs        sealed graph-aware backend strategy
+    kernel_catalog.rs   cold typed selection into immutable kernel plans
     sampler.rs          model-neutral device sampling
     kernels.rs
     cublas.rs
@@ -742,11 +774,13 @@ The refactor should remain runnable after every step:
    `ModelProgram`.
 6. Extract a sealed `AttentionBackend` and grouped `StateSchema`, initially
    implemented only by the current direct flat-KV path.
-7. Extract the common transformer computation into `DenseDecoder`; make the
+7. Add the typed construction-time `KernelCatalog`; resolve the current kernels
+   into one immutable default `KernelPlan` without changing their execution.
+8. Extract the common transformer computation into `DenseDecoder`; make the
    Llama module validate and construct it.
-8. Add the architecture registry and independent `WeightSource`; remove
+9. Add the architecture registry and independent `WeightSource`; remove
    model-name and checkpoint-format switches from serving code.
-9. Run property tests, strict Clippy, CUDA differential tests, Compute
+10. Run property tests, strict Clippy, CUDA differential tests, Compute
    Sanitizer, and the retained A100 benchmark after each performance-sensitive
    extraction.
 

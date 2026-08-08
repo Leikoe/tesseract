@@ -463,3 +463,7 @@ I wasn't suggesting runtim swapping plugins but making it easy to add an impleme
 ```text
 I want you to clone tokenspeed in references/ too
 ```
+
+```text
+I want you to explore tokenspeed vs our ideas so far
+```

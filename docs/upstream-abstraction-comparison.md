@@ -5,6 +5,10 @@ Date: 2026-08-08.
 This review compares `engine-abstraction-design.md` against the checked-in
 upstream sources, not documentation or remembered architecture.
 
+The later source-level TokenSpeed review is in
+`tokenspeed-abstraction-comparison.md`; its findings have also been folded into
+the engine design.
+
 | Project | Local revision |
 | --- | --- |
 | vLLM | `f7ef489e93cf92b8d6ce7403b49f1db867bcc35e` |
