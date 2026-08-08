@@ -459,3 +459,7 @@ sure. I like the AttentionBackend trait, it will help swap implementations. I th
 ```text
 I wasn't suggesting runtim swapping plugins but making it easy to add an implementation of a layer (e.g. Attention, MoE, ..)
 ```
+
+```text
+I want you to clone tokenspeed in references/ too
+```
