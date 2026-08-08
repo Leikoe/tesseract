@@ -95,6 +95,8 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 
 please ush
 
+do vllm and sglang implement that much for each model as we do in llama 3.2's file ?
+
 you can use this new box: ssh ubuntu@216.81.245.69
 
 ```text
@@ -440,4 +442,8 @@ Blocked audit:
 Do not call update_goal unless the goal is complete or the strict blocked audit above is satisfied. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.
 
 </codex_internal_context>
+```
+
+```text
+could we design the cleanest abstractions (and thus traits) to have the cleanest engine of all ?
 ```
