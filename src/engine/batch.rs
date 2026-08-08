@@ -110,7 +110,7 @@ impl SamplingInput {
         if !temperature.is_finite() || temperature < 0.0 {
             return Err(ForwardBatchError::InvalidSamplingTemperature);
         }
-        if !top_p.is_finite() || !(0.0 < top_p && top_p <= 1.0) {
+        if !(top_p.is_finite() && 0.0 < top_p && top_p <= 1.0) {
             return Err(ForwardBatchError::InvalidTopP);
         }
         if !random_sample.is_finite() || !(0.0..1.0).contains(&random_sample) {
