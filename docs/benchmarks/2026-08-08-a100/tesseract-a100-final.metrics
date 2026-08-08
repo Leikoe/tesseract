@@ -1,0 +1,69 @@
+# HELP tesseract_ready Whether the model worker is ready
+# TYPE tesseract_ready gauge
+tesseract_ready 1
+# HELP tesseract_queue_depth Requests waiting for execution
+# TYPE tesseract_queue_depth gauge
+tesseract_queue_depth 0
+# HELP tesseract_running_requests Requests in the running batch
+# TYPE tesseract_running_requests gauge
+tesseract_running_requests 0
+# HELP tesseract_kv_tokens_used Allocated physical KV token slots
+# TYPE tesseract_kv_tokens_used gauge
+tesseract_kv_tokens_used 0
+# HELP tesseract_requests_total Admitted generation requests
+# TYPE tesseract_requests_total counter
+tesseract_requests_total 46
+# HELP tesseract_requests_completed_total Successfully completed generation requests
+# TYPE tesseract_requests_completed_total counter
+tesseract_requests_completed_total 46
+# HELP tesseract_requests_failed_total Failed generation requests
+# TYPE tesseract_requests_failed_total counter
+tesseract_requests_failed_total 0
+# HELP tesseract_requests_cancelled_total Cancelled generation requests
+# TYPE tesseract_requests_cancelled_total counter
+tesseract_requests_cancelled_total 0
+# HELP tesseract_prompt_tokens_total Prompt tokens admitted
+# TYPE tesseract_prompt_tokens_total counter
+tesseract_prompt_tokens_total 1014
+# HELP tesseract_generated_tokens_total Tokens generated
+# TYPE tesseract_generated_tokens_total counter
+tesseract_generated_tokens_total 554
+# HELP tesseract_engine_steps_total Model execution steps
+# TYPE tesseract_engine_steps_total counter
+tesseract_engine_steps_total 199
+# HELP tesseract_engine_batches_total Backend execution batches
+# TYPE tesseract_engine_batches_total counter
+tesseract_engine_batches_total 199
+# HELP tesseract_batch_items_total Scheduled request items across backend batches
+# TYPE tesseract_batch_items_total counter
+tesseract_batch_items_total 554
+# HELP tesseract_max_batch_size Largest scheduled backend batch
+# TYPE tesseract_max_batch_size gauge
+tesseract_max_batch_size 8
+# HELP tesseract_eager_forwards_total Model forwards executed through the eager fallback
+# TYPE tesseract_eager_forwards_total counter
+tesseract_eager_forwards_total 46
+# HELP tesseract_cuda_graph_replays_total Model forwards executed by CUDA graph replay
+# TYPE tesseract_cuda_graph_replays_total counter
+tesseract_cuda_graph_replays_total 183
+# HELP tesseract_cuda_graph_captures_total Full-model CUDA decode graphs captured
+# TYPE tesseract_cuda_graph_captures_total counter
+tesseract_cuda_graph_captures_total 22
+# HELP tesseract_packed_decode_forwards_total Packed multi-request decode forwards executed
+# TYPE tesseract_packed_decode_forwards_total counter
+tesseract_packed_decode_forwards_total 65
+# HELP tesseract_packed_decode_requests_total Request rows executed by packed multi-request decode
+# TYPE tesseract_packed_decode_requests_total counter
+tesseract_packed_decode_requests_total 390
+# HELP tesseract_time_to_first_token_seconds Time from admission to first generated token
+# TYPE tesseract_time_to_first_token_seconds summary
+tesseract_time_to_first_token_seconds_sum 7.185261
+tesseract_time_to_first_token_seconds_count 46
+# HELP tesseract_inter_token_seconds Time between generated tokens
+# TYPE tesseract_inter_token_seconds summary
+tesseract_inter_token_seconds_sum 24.623346
+tesseract_inter_token_seconds_count 508
+# HELP tesseract_request_duration_seconds End-to-end request lifetime
+# TYPE tesseract_request_duration_seconds summary
+tesseract_request_duration_seconds_sum 31.809261
+tesseract_request_duration_seconds_count 46
