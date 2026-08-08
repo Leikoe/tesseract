@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
+    convert::Infallible,
+    fmt::Display,
     sync::Arc,
     thread,
     time::Duration,
@@ -20,6 +22,10 @@ use super::{
 pub enum EngineSpawnError {
     #[error("failed to spawn engine thread: {0}")]
     Thread(#[from] std::io::Error),
+    #[error("failed to initialize inference backend: {0}")]
+    BackendInitialization(String),
+    #[error("engine thread exited during initialization")]
+    InitializationChannelClosed,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -55,14 +61,49 @@ impl EngineHandle {
         command_capacity: usize,
         metrics: Arc<Metrics>,
     ) -> Result<Self, EngineSpawnError> {
-        let model = backend.model();
-        let model_id: Arc<str> = Arc::from(model.id());
+        Self::spawn_with_factory(
+            move || Ok::<B, Infallible>(backend),
+            config,
+            command_capacity,
+            metrics,
+        )
+    }
+
+    /// Builds the backend on the dedicated engine thread, then returns only
+    /// after model loading and backend initialization have succeeded.
+    pub fn spawn_with_factory<B, F, E>(
+        factory: F,
+        config: EngineConfig,
+        command_capacity: usize,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self, EngineSpawnError>
+    where
+        B: Backend,
+        F: FnOnce() -> Result<B, E> + Send + 'static,
+        E: Display,
+    {
         let output_buffer = config.output_buffer;
         let (commands_tx, commands_rx) = mpsc::channel(command_capacity);
         let worker_metrics = Arc::clone(&metrics);
+        let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
         thread::Builder::new()
             .name("tesseract-engine".into())
-            .spawn(move || EngineWorker::new(backend, config, worker_metrics).run(commands_rx))?;
+            .spawn(move || match factory() {
+                Ok(backend) => {
+                    let model = backend.model();
+                    if initialized_tx.send(Ok(model)).is_ok() {
+                        EngineWorker::new(backend, config, worker_metrics).run(commands_rx);
+                    }
+                }
+                Err(error) => {
+                    let _ = initialized_tx.send(Err(error.to_string()));
+                }
+            })?;
+        let model = initialized_rx
+            .recv()
+            .map_err(|_| EngineSpawnError::InitializationChannelClosed)?
+            .map_err(EngineSpawnError::BackendInitialization)?;
+        let model_id: Arc<str> = Arc::from(model.id());
 
         Ok(Self {
             commands: commands_tx,

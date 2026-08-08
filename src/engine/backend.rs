@@ -51,3 +51,25 @@ pub trait Backend: Send + 'static {
         Ok(())
     }
 }
+
+impl<T: Backend + ?Sized> Backend for Box<T> {
+    fn model(&self) -> Arc<dyn Model> {
+        (**self).model()
+    }
+
+    fn add_request(&mut self, request: &GenerateRequest) -> Result<PreparedRequest, BackendError> {
+        (**self).add_request(request)
+    }
+
+    fn step(&mut self, batch: &[ScheduledWork]) -> Result<Vec<StepOutput>, BackendError> {
+        (**self).step(batch)
+    }
+
+    fn remove_request(&mut self, request_id: RequestId) {
+        (**self).remove_request(request_id);
+    }
+
+    fn shutdown(&mut self) -> Result<(), BackendError> {
+        (**self).shutdown()
+    }
+}

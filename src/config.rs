@@ -24,6 +24,9 @@ pub struct ServerConfig {
     )]
     pub model_path: PathBuf,
 
+    #[arg(long, env = "TESSERACT_DEVICE", default_value_t = 0)]
+    pub device: usize,
+
     #[arg(long, env = "TESSERACT_MAX_QUEUE", default_value_t = 256)]
     pub max_queue: usize,
 
@@ -76,8 +79,16 @@ impl ServerConfig {
             "max_sequence_length must be positive"
         );
         anyhow::ensure!(
+            self.max_sequence_length <= u32::MAX as usize,
+            "max_sequence_length must fit in a u32 position"
+        );
+        anyhow::ensure!(
             self.kv_capacity_tokens >= self.max_running,
             "kv_capacity_tokens must be at least max_running"
+        );
+        anyhow::ensure!(
+            self.kv_capacity_tokens <= u32::MAX as usize,
+            "kv_capacity_tokens must fit in a u32 slot ID"
         );
         anyhow::ensure!(self.output_buffer > 0, "output_buffer must be positive");
         Ok(())

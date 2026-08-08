@@ -39,6 +39,16 @@ pub(super) fn validate_cuda_next_token(
     cuda_impl::validate_next_token(model_id, model_dir, device_id, prompt)
 }
 
+#[cfg(feature = "cuda")]
+pub(super) fn load_cuda_backend(
+    model_id: &str,
+    model_dir: &Path,
+    device_id: usize,
+    kv_capacity_tokens: usize,
+) -> Result<Box<dyn crate::engine::Backend>, ModelError> {
+    cuda_impl::load_backend(model_id, model_dir, device_id, kv_capacity_tokens)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RopeScaling {
     factor: f32,
@@ -272,7 +282,14 @@ mod cuda_impl {
         tile_kernel::{PartitionOp, TileKernel},
     };
 
-    use crate::cuda::{cublas, kernels};
+    use crate::{
+        cuda::{cublas, kernels},
+        engine::{
+            Backend, BackendError, GenerateRequest, PreparedRequest, RequestId, ScheduledWork,
+            StepOutput,
+        },
+        model::{IncrementalDecoder, Model},
+    };
 
     use super::{CudaForwardReport, CudaModelReport, Llama32, ModelError, WeightStore};
 
@@ -367,7 +384,7 @@ mod cuda_impl {
     }
 
     struct CudaLlama {
-        model: Llama32,
+        model: Arc<Llama32>,
         stream: Arc<Stream>,
         weights: RuntimeWeights,
         cosine: Arc<Tensor<f32>>,
@@ -378,7 +395,11 @@ mod cuda_impl {
     }
 
     impl CudaLlama {
-        fn load(model: Llama32, device_id: usize, capacity: usize) -> Result<Self, ModelError> {
+        fn load(
+            model: Arc<Llama32>,
+            device_id: usize,
+            capacity: usize,
+        ) -> Result<Self, ModelError> {
             let device = Device::new(device_id).map_err(|error| {
                 ModelError::Cuda(format!("initialize device {device_id}: {error:?}"))
             })?;
@@ -420,13 +441,14 @@ mod cuda_impl {
             })
         }
 
-        fn next_token(
+        fn forward(
             &self,
             token_ids: &[u32],
             positions: &[u32],
             current_slots: &[u32],
             context_slots: &[u32],
-        ) -> Result<u32, ModelError> {
+            return_logits: bool,
+        ) -> Result<Option<Vec<f32>>, ModelError> {
             let rows = token_ids.len();
             if rows == 0
                 || positions.len() != rows
@@ -658,6 +680,10 @@ mod cuda_impl {
                 pending = Some((hidden_after_attention, down));
             }
 
+            if !return_logits {
+                return Ok(None);
+            }
+
             let (residual, update) = pending
                 .ok_or_else(|| ModelError::Cuda("model has no transformer layers".into()))?;
             let (final_hidden, _) =
@@ -684,12 +710,7 @@ mod cuda_impl {
                 .to_host_vec()
                 .sync_on(stream)
                 .map_err(|error| cuda_error("copy logits to host", error))?;
-            logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| left.to_f32().total_cmp(&right.to_f32()))
-                .map(|(token, _)| token as u32)
-                .ok_or_else(|| ModelError::Cuda("language-model head returned no logits".into()))
+            Ok(Some(logits.into_iter().map(bf16::to_f32).collect()))
         }
 
         fn gemm(
@@ -772,6 +793,255 @@ mod cuda_impl {
         }
     }
 
+    struct LlamaCudaBackend {
+        runtime: CudaLlama,
+        requests: HashMap<RequestId, CudaRequest>,
+    }
+
+    struct CudaRequest {
+        prompt: Vec<u32>,
+        generated: Vec<u32>,
+        slots: Vec<u32>,
+        decoder: Box<dyn IncrementalDecoder>,
+        temperature: f32,
+        top_p: f32,
+        rng: SplitMix64,
+    }
+
+    impl Backend for LlamaCudaBackend {
+        fn model(&self) -> Arc<dyn Model> {
+            self.runtime.model.clone()
+        }
+
+        fn add_request(
+            &mut self,
+            request: &GenerateRequest,
+        ) -> Result<PreparedRequest, BackendError> {
+            if self.requests.contains_key(&request.id) {
+                return Err(BackendError::InvalidRequest(format!(
+                    "duplicate request {}",
+                    request.id
+                )));
+            }
+            let prompt = self
+                .runtime
+                .model
+                .encode(&request.prompt)
+                .map_err(invalid_request)?;
+            if prompt.is_empty() {
+                return Err(BackendError::InvalidRequest(
+                    "prompt must encode to at least one token".into(),
+                ));
+            }
+            let prompt_tokens = prompt.len();
+            self.requests.insert(
+                request.id,
+                CudaRequest {
+                    prompt,
+                    generated: Vec::with_capacity(request.params.max_tokens),
+                    slots: Vec::with_capacity(prompt_tokens + request.params.max_tokens),
+                    decoder: self.runtime.model.decoder(),
+                    temperature: request.params.temperature,
+                    top_p: request.params.top_p,
+                    rng: SplitMix64::new(request.params.seed),
+                },
+            );
+            Ok(PreparedRequest { prompt_tokens })
+        }
+
+        fn step(&mut self, batch: &[ScheduledWork]) -> Result<Vec<StepOutput>, BackendError> {
+            let mut outputs = Vec::with_capacity(batch.len());
+            for work in batch {
+                let request = self.requests.get_mut(&work.request_id).ok_or_else(|| {
+                    BackendError::Execution(format!("unknown request {}", work.request_id))
+                })?;
+                if work.num_tokens == 0
+                    || work.kv_slots.len() != work.num_tokens
+                    || work.position != request.slots.len()
+                {
+                    return Err(BackendError::Execution(format!(
+                        "invalid schedule metadata for request {}",
+                        work.request_id
+                    )));
+                }
+
+                let end = work
+                    .position
+                    .checked_add(work.num_tokens)
+                    .ok_or_else(|| BackendError::Execution("token position overflowed".into()))?;
+                let available = request.prompt.len() + request.generated.len();
+                if end > available {
+                    return Err(BackendError::Execution(format!(
+                        "scheduled tokens {end} exceed request token state {available}"
+                    )));
+                }
+                let token_ids: Vec<u32> = (work.position..end)
+                    .map(|position| {
+                        if position < request.prompt.len() {
+                            request.prompt[position]
+                        } else {
+                            request.generated[position - request.prompt.len()]
+                        }
+                    })
+                    .collect();
+                let positions: Vec<u32> = (work.position..end)
+                    .map(|position| {
+                        u32::try_from(position).map_err(|_| {
+                            BackendError::Execution("token position exceeds u32".into())
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                request.slots.extend_from_slice(&work.kv_slots);
+
+                let logits = self
+                    .runtime
+                    .forward(
+                        &token_ids,
+                        &positions,
+                        &work.kv_slots,
+                        &request.slots,
+                        work.sample,
+                    )
+                    .map_err(execution)?;
+                if !work.sample {
+                    continue;
+                }
+                let logits = logits.ok_or_else(|| {
+                    BackendError::Execution("sampled forward omitted logits".into())
+                })?;
+                let token_id = sample_token(
+                    &logits,
+                    request.temperature,
+                    request.top_p,
+                    &mut request.rng,
+                )?;
+                request.generated.push(token_id);
+                let text = request.decoder.push(token_id).map_err(execution)?;
+                outputs.push(StepOutput {
+                    request_id: work.request_id,
+                    token_id: Some(token_id),
+                    text,
+                    is_eos: self.runtime.model.eos_token_ids().contains(&token_id),
+                });
+            }
+            Ok(outputs)
+        }
+
+        fn remove_request(&mut self, request_id: RequestId) {
+            self.requests.remove(&request_id);
+        }
+    }
+
+    #[derive(Debug)]
+    struct SplitMix64 {
+        state: u64,
+    }
+
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn unit_f64(&mut self) -> f64 {
+            self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut value = self.state;
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            value ^= value >> 31;
+            ((value >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+        }
+    }
+
+    fn sample_token(
+        logits: &[f32],
+        temperature: f32,
+        top_p: f32,
+        rng: &mut SplitMix64,
+    ) -> Result<u32, BackendError> {
+        if logits.is_empty() || logits.iter().any(|logit| !logit.is_finite()) {
+            return Err(BackendError::Execution(
+                "sampler received empty or non-finite logits".into(),
+            ));
+        }
+        if temperature == 0.0 {
+            return logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(token, _)| token as u32)
+                .ok_or_else(|| BackendError::Execution("sampler received no logits".into()));
+        }
+
+        let inverse_temperature = 1.0 / temperature;
+        let max = logits
+            .iter()
+            .copied()
+            .map(|logit| logit * inverse_temperature)
+            .max_by(f32::total_cmp)
+            .ok_or_else(|| BackendError::Execution("sampler received no logits".into()))?;
+        let mut candidates: Vec<(u32, f64)> = logits
+            .iter()
+            .enumerate()
+            .map(|(token, logit)| {
+                (
+                    token as u32,
+                    ((*logit * inverse_temperature - max) as f64).exp(),
+                )
+            })
+            .collect();
+        candidates.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+        let total: f64 = candidates.iter().map(|(_, weight)| weight).sum();
+        if !total.is_finite() || total <= 0.0 {
+            return Err(BackendError::Execution(
+                "sampler probability mass is invalid".into(),
+            ));
+        }
+
+        let cutoff = total * top_p as f64;
+        let mut retained_mass = 0.0;
+        let mut retained = 0usize;
+        for (_, weight) in &candidates {
+            retained_mass += weight;
+            retained += 1;
+            if retained_mass >= cutoff {
+                break;
+            }
+        }
+        let draw = rng.unit_f64() * retained_mass;
+        let mut cumulative = 0.0;
+        for (token, weight) in candidates.into_iter().take(retained) {
+            cumulative += weight;
+            if draw < cumulative {
+                return Ok(token);
+            }
+        }
+        Err(BackendError::Execution(
+            "sampler failed to select a token".into(),
+        ))
+    }
+
+    fn invalid_request(error: ModelError) -> BackendError {
+        BackendError::InvalidRequest(error.to_string())
+    }
+
+    fn execution(error: ModelError) -> BackendError {
+        BackendError::Execution(error.to_string())
+    }
+
+    pub(super) fn load_backend(
+        model_id: &str,
+        model_dir: &Path,
+        device_id: usize,
+        kv_capacity_tokens: usize,
+    ) -> Result<Box<dyn Backend>, ModelError> {
+        let model = Arc::new(Llama32::load(model_id, model_dir)?);
+        let runtime = CudaLlama::load(model, device_id, kv_capacity_tokens)?;
+        Ok(Box::new(LlamaCudaBackend {
+            runtime,
+            requests: HashMap::new(),
+        }))
+    }
+
     pub(super) fn validate(
         model_id: &str,
         model_dir: &Path,
@@ -828,8 +1098,16 @@ mod cuda_impl {
         let slots: Vec<u32> = (0..token_ids.len())
             .map(|index| (capacity - 1 - index) as u32)
             .collect();
-        let runtime = CudaLlama::load(model, device_id, capacity)?;
-        let next_token_id = runtime.next_token(&token_ids, &positions, &slots, &slots)?;
+        let runtime = CudaLlama::load(Arc::new(model), device_id, capacity)?;
+        let logits = runtime
+            .forward(&token_ids, &positions, &slots, &slots, true)?
+            .ok_or_else(|| ModelError::Cuda("forward omitted requested logits".into()))?;
+        let next_token_id = logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(token, _)| token as u32)
+            .ok_or_else(|| ModelError::Cuda("language-model head returned no logits".into()))?;
         let next_token_text = runtime.model.tokenizer.decode(&[next_token_id])?;
         Ok(CudaForwardReport {
             model_id: runtime.model.id.clone(),
