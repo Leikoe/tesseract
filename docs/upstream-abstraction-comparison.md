@@ -240,3 +240,36 @@ Cold-path boundaries:
 
 This keeps the scheduler independent of architecture and CUDA details while
 representing the production variation that vLLM and SGLang have demonstrated.
+
+## Registries and external plugins
+
+vLLM has an actual package plugin loader based on Python entry points. Its
+declared groups are `vllm.general_plugins`, `vllm.io_processor_plugins`,
+`vllm.platform_plugins`, `vllm.stat_logger_plugins`, and
+`vllm.endpoint_plugins`
+(`references/vllm/vllm/plugins/__init__.py:16`). Logits processors use an
+additional `vllm.logits_processors` group
+(`references/vllm/vllm/v1/sample/logits_processor/__init__.py:48`). General
+plugins execute their registration functions in every process at
+`references/vllm/vllm/plugins/__init__.py:77`; the project's own general
+plugins register filesystem and Hugging Face LoRA resolvers
+(`references/vllm/pyproject.toml:46`). Endpoint plugins are more strictly
+allowlisted because they add network routes (`plugins/__init__.py:93`).
+
+SGLang primarily uses explicit Python registries rather than one universal
+package-entry-point layer:
+
+- attention factories:
+  `references/sglang/python/sglang/srt/layers/attention/attention_registry.py:31`
+- sampler factories:
+  `references/sglang/python/sglang/srt/layers/sampler.py:527`
+- prefix-cache factories:
+  `references/sglang/python/sglang/srt/mem_cache/registry.py:49`
+- model entry classes:
+  `references/sglang/python/sglang/srt/models/registry.py:19`
+
+The important upstream idea is the combination of a behavior contract with a
+named factory and capability validation. The Python import mechanism itself is
+not appropriate to copy into Rust. Tesseract will use an explicit typed registry
+and build-time-linked plugin crates first. Runtime native plugins remain deferred
+until a versioned C ABI, GPU resource-ownership contract, and allowlist exist.

@@ -287,6 +287,76 @@ attention, tied embeddings, and bias presence are data in that program. A new
 program type is warranted only when the computation or persistent state is
 fundamentally different.
 
+## Backend registries and plugins
+
+A trait, registry, and plugin loader solve different problems:
+
+```text
+trait          behavioral contract
+registry       name/capability -> validated factory
+plugin loader  discovery and trust boundary for factories outside this binary
+```
+
+vLLM has Python package entry-point groups for general initialization, platform
+selection, I/O processors, statistics loggers, API endpoints, and logits
+processors. General plugins execute in every process. SGLang more often exposes
+module-level named factory registries; current examples include attention,
+sampler, and radix-cache backends.
+
+Tesseract should adopt a typed registry now, without committing to an unstable
+Rust dynamic-library ABI:
+
+```rust
+pub struct BackendDescriptor {
+    pub name: BackendName,
+    pub version: BackendVersion,
+    pub capabilities: Capabilities,
+}
+
+pub trait ExecutorFactory: Send + Sync {
+    fn descriptor(&self) -> &BackendDescriptor;
+
+    fn build(
+        &self,
+        request: &BuildRequest,
+    ) -> Result<Box<dyn ModelExecutor>, LoadError>;
+}
+
+pub struct RegistryBuilder {
+    architectures: BTreeMap<ArchitectureName, Arc<dyn ArchitectureFactory>>,
+    weight_sources: BTreeMap<FormatName, Arc<dyn WeightSourceFactory>>,
+    executors: BTreeMap<BackendName, Arc<dyn ExecutorFactory>>,
+    frontends: BTreeMap<ProcessorName, Arc<dyn FrontendFactory>>,
+}
+```
+
+The registry selects and validates once. A factory constructs a fully concrete
+`CudaExecutor<P, R, A, S>` behind the single outer `ModelExecutor` object, so
+hot-path component dispatch remains static. Built-ins are registered explicitly
+by the binary. Optional plugin crates are linked at build time and export a
+plain registration function; their presence never relies on linker-order global
+constructors.
+
+The demonstrated internal strategy interfaces are:
+
+| Strategy | Tesseract status | Why it varies |
+| --- | --- | --- |
+| `AttentionBackend` | define now | kernels, metadata, KV layout, graph legality |
+| sampler backend | concrete generic now | greedy/random kernels and RNG handling |
+| logits processor | add with penalties/grammar | stateful batched logit transforms |
+| `StateStore`/connector | add with remote state | prefix/offload/disaggregated lifecycle |
+| quantization method | add after BF16 v1 | weight creation, packing, GEMM kernels |
+| collective/MoE dispatcher | add with TP/EP | communication topology and overlap |
+| platform backend | defer | CUDA is the only production platform in scope |
+
+An externally loadable `.so` plugin system is deferred. Rust has no stable Rust
+ABI, and a GPU plugin boundary must specify CUDA context/stream ownership,
+tensor layouts, synchronization, error ownership, allocator compatibility, and
+version negotiation. If runtime-loaded native plugins become a requirement,
+they need a versioned C ABI and explicit allowlist. API or untrusted processing
+extensions should prefer a process boundary. The server must never silently
+load every discovered plugin into worker processes.
+
 ## Typed batch contract
 
 The current batch path passes several unrelated `u32` and `usize` arrays. Use

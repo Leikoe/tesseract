@@ -451,3 +451,7 @@ could we design the cleanest abstractions (and thus traits) to have the cleanest
 ```text
 I want you to send subagents to compare this to vllm and sglang by going inside their references/<repo> and comparing how they do it
 ```
+
+```text
+sure. I like the AttentionBackend trait, it will help swap implementations. I think vllm and sglang have others like it ? vllm has a plugin system iirc
+```
