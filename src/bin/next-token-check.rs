@@ -13,6 +13,8 @@ struct Args {
     device: usize,
     #[arg(long, default_value = "The capital of France is")]
     prompt: String,
+    #[arg(long, default_value_t = false)]
+    json: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -23,10 +25,15 @@ fn main() -> anyhow::Result<()> {
         args.device,
         &args.prompt,
     )?;
+    if args.json {
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(());
+    }
     println!("model_id={}", report.model_id);
     println!("prompt_tokens={}", report.prompt_tokens);
     println!("next_token_id={}", report.next_token_id);
     println!("next_token_text={:?}", report.next_token_text);
+    println!("top_logits={}", serde_json::to_string(&report.top_logits)?);
     println!("cuda_forward_validation=ok");
     Ok(())
 }

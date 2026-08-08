@@ -76,3 +76,27 @@ required to remove shape-specific JIT work from steady-state decoding. The
 current backend also executes scheduled requests serially inside a scheduler
 step rather than packing them into one GPU batch. These are explicit remaining
 acceptance gaps, not hidden by this smoke result.
+
+## Independent BF16 logits reference
+
+The isolated reference environment used PyTorch 2.8.0, Transformers 4.55.0,
+BF16 weights/compute, and eager attention. `scripts/reference/llama_logits.py`
+compared Tesseract against the reference for three raw prompts. In every case:
+
+- tokenizer input IDs and prompt-token counts matched;
+- greedy next-token IDs matched;
+- every reference top-10 token appeared in Tesseract's top-20;
+- the top-20 overlap was 20, 19, and 20 tokens respectively;
+- maximum absolute differences over shared top logits were 0.125, 0.4375,
+  and 0.125.
+
+The gate uses a documented maximum absolute tolerance of 0.5. This accounts
+for BF16 logit quantization and different reduction order between cuTile/cuBLAS
+and PyTorch eager; it does not permit a different greedy token. The prompts and
+results were:
+
+| Prompt | Input IDs | Reference/Tesseract next token | Max abs logit diff |
+| --- | --- | ---: | ---: |
+| `The capital of France is` | `128000,791,6864,315,9822,374` | `12366` | 0.125 |
+| `2 + 2 =` | `128000,17,489,220,17,284` | `220` | 0.4375 |
+| `Rust is a programming` | `128000,49,592,374,264,15840` | `4221` | 0.125 |

@@ -8,7 +8,7 @@ use super::{
 };
 
 #[cfg(feature = "cuda")]
-use super::{CudaForwardReport, CudaModelReport};
+use super::{CudaForwardReport, CudaModelReport, CudaTokenLogit};
 
 const MODEL_ID: &str = "meta-llama/Llama-3.2-1B-Instruct";
 
@@ -291,7 +291,9 @@ mod cuda_impl {
         model::{IncrementalDecoder, Model},
     };
 
-    use super::{CudaForwardReport, CudaModelReport, Llama32, ModelError, WeightStore};
+    use super::{
+        CudaForwardReport, CudaModelReport, CudaTokenLogit, Llama32, ModelError, WeightStore,
+    };
 
     const HIDDEN_BLOCK: usize = 512;
     const MLP_BLOCK: usize = 512;
@@ -1102,11 +1104,19 @@ mod cuda_impl {
         let logits = runtime
             .forward(&token_ids, &positions, &slots, &slots, true)?
             .ok_or_else(|| ModelError::Cuda("forward omitted requested logits".into()))?;
-        let next_token_id = logits
+        let mut ranked: Vec<_> = logits
             .iter()
             .enumerate()
-            .max_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(token, _)| token as u32)
+            .map(|(token_id, logit)| CudaTokenLogit {
+                token_id: token_id as u32,
+                logit: *logit,
+            })
+            .collect();
+        ranked.sort_unstable_by(|left, right| right.logit.total_cmp(&left.logit));
+        ranked.truncate(20);
+        let next_token_id = ranked
+            .first()
+            .map(|entry| entry.token_id)
             .ok_or_else(|| ModelError::Cuda("language-model head returned no logits".into()))?;
         let next_token_text = runtime.model.tokenizer.decode(&[next_token_id])?;
         Ok(CudaForwardReport {
@@ -1114,6 +1124,7 @@ mod cuda_impl {
             prompt_tokens: token_ids.len(),
             next_token_id,
             next_token_text,
+            top_logits: ranked,
         })
     }
 

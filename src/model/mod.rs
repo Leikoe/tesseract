@@ -41,12 +41,20 @@ pub struct CudaModelReport {
 }
 
 #[cfg(feature = "cuda")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CudaForwardReport {
     pub model_id: String,
     pub prompt_tokens: usize,
     pub next_token_id: u32,
     pub next_token_text: String,
+    pub top_logits: Vec<CudaTokenLogit>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct CudaTokenLogit {
+    pub token_id: u32,
+    pub logit: f32,
 }
 
 pub trait IncrementalDecoder: Send {

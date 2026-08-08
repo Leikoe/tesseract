@@ -57,6 +57,19 @@ Run all host/model/cuTile gates afterward:
 ssh ubuntu@NODE_IP '/home/ubuntu/tesseract/scripts/node/verify-a100.sh'
 ```
 
+For the independent pinned PyTorch/Transformers correctness gate, install the
+isolated reference environment once, then compare three fixed prompts:
+
+```bash
+scripts/node/setup-reference.sh
+~/.venvs/tesseract-reference/bin/python scripts/reference/llama_logits.py \
+  --model-path /home/ubuntu/models/Llama-3.2-1B-Instruct \
+  --tesseract-bin target/release/next-token-check
+```
+
+The reference packages are deliberately isolated from the production server;
+they are not runtime dependencies.
+
 ## Normal development cycle
 
 ```text
