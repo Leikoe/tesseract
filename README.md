@@ -1,11 +1,63 @@
 # tesseract
 
-The inference server of the agentic era. Built for maximum interactivity.
+Tesseract is a production-oriented, BF16 inference server for NVIDIA A100
+GPUs. v1 serves `meta-llama/Llama-3.2-1B-Instruct` through an OpenAI-compatible
+chat-completions API while keeping model-specific behavior behind the model
+backend boundary.
 
+## Architecture
 
-## Design
+Tokio, Axum, and Tower own the HTTP control plane. A dedicated engine thread
+owns scheduling and every CUDA resource, so model execution never blocks a
+Tokio worker. The scheduler provides bounded admission, chunked prefill,
+continuous batching, decode priority, deterministic cancellation, and a flat
+preallocated BF16 KV cache with explicit logical-to-physical slot maps.
 
-Each step is a single megakernel.
+Linear algebra uses cuBLAS. cuTile Rust kernels implement embedding,
+normalization, RoPE, flat-KV writes/gathers, attention, activation, residuals,
+and greedy argmax. Stable decode shapes use full-model CUDA graph replay with a
+correct eager fallback. Aligned greedy requests are packed into one batched GPU
+forward. cuTile's persistent CUBIN cache is enabled at startup.
+
+## Run on the validated A100 stack
+
+The canonical, idempotent setup is documented in
+[`docs/a100-node-setup.md`](docs/a100-node-setup.md). After downloading the
+pinned model revision, start the release server with:
+
+```bash
+cargo +1.89.0 run --release --features cuda -- \
+  --model-path /home/ubuntu/models/Llama-3.2-1B-Instruct
+```
+
+The default listener is `0.0.0.0:8000`. Liveness, readiness, and Prometheus
+metrics are available at `/health/live`, `/health/ready`, and `/metrics`.
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "meta-llama/Llama-3.2-1B-Instruct",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "temperature": 0,
+    "max_tokens": 8
+  }'
+```
+
+## Validation
+
+Run CPU-independent tests and lint locally:
+
+```bash
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+```
+
+On the documented A100 image, `scripts/node/verify-a100.sh` additionally runs
+strict CUDA lint, model/SafeTensors validation, project-owned cuTile kernels,
+the full next-token path, the persistent-CUBIN-cache check, and a pinned
+upstream cuTile smoke test. Retained correctness, sanitizer, API, and benchmark
+evidence lives under `docs/validation/` and `docs/benchmarks/`.
 
 
 ## Research notes

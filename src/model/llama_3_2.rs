@@ -2484,4 +2484,13 @@ mod tests {
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nBe terse.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         );
     }
+
+    #[test]
+    fn rejects_empty_chat() {
+        assert!(matches!(
+            render_chat(&[]),
+            Err(ModelError::InvalidInput(message))
+                if message.contains("messages must contain at least one item")
+        ));
+    }
 }

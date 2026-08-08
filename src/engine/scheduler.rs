@@ -608,8 +608,8 @@ impl<B: Backend> EngineWorker<B> {
         self.running.retain(|candidate| *candidate != id);
         self.kv.release(id);
         self.backend.remove_request(id);
-        self.metrics
-            .observe_request_duration(state.started_at.elapsed());
+        let elapsed = state.started_at.elapsed();
+        self.metrics.observe_request_duration(elapsed);
 
         if !state.pending_text.is_empty() && reason != FinishReason::Cancelled {
             let _ = state.output.try_send(GenerationEvent::Delta {
@@ -626,6 +626,14 @@ impl<B: Backend> EngineWorker<B> {
             FinishReason::Error => self.metrics.request_failed(),
             FinishReason::Stop | FinishReason::Length => self.metrics.request_completed(),
         }
+        tracing::info!(
+            request_id = %id,
+            finish_reason = ?reason,
+            prompt_tokens = state.prompt_tokens,
+            generated_tokens = state.generated_tokens,
+            latency_ms = elapsed.as_secs_f64() * 1_000.0,
+            "request finished"
+        );
         self.update_gauges();
     }
 
@@ -639,6 +647,11 @@ impl<B: Backend> EngineWorker<B> {
         self.backend.remove_request(id);
         let _ = state.output.try_send(GenerationEvent::Failed { message });
         self.metrics.request_failed();
+        tracing::warn!(
+            request_id = %id,
+            latency_ms = state.started_at.elapsed().as_secs_f64() * 1_000.0,
+            "request failed"
+        );
         self.update_gauges();
     }
 

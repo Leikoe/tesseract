@@ -28,6 +28,7 @@ fi
 cd "${TESSERACT_REPO_PATH}"
 cargo +"${TESSERACT_RUST_TOOLCHAIN}" test --all-targets
 cargo +"${TESSERACT_RUST_TOOLCHAIN}" clippy --all-targets -- -D warnings
+cargo +"${TESSERACT_RUST_TOOLCHAIN}" clippy --features cuda --all-targets -- -D warnings
 cargo +"${TESSERACT_RUST_TOOLCHAIN}" run --release --bin model-check -- \
   --model-path "${TESSERACT_MODEL_PATH}"
 cargo +"${TESSERACT_RUST_TOOLCHAIN}" run --release --features cuda \

@@ -235,6 +235,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_empty_messages_with_typed_openai_error() {
+        let mut body = chat_body(false);
+        body["messages"] = json!([]);
+        let response = test_app()
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("messages must not be empty")
+        );
+    }
+
+    #[tokio::test]
     async fn health_and_metrics_are_exposed() {
         let app = test_app();
         let health = app
