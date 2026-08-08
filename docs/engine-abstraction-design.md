@@ -793,8 +793,11 @@ The refactor should remain runnable after every step:
    Llama computation is its statically composed initial `ModelProgram`.
    Workspaces, graph management, and execution-shape policy still need to move
    out of that program and into the generic executor.
-6. Extract a sealed `AttentionBackend` and grouped `StateSchema`, initially
-   implemented only by the current direct flat-KV path.
+6. **Partially implemented:** extract a crate-private `AttentionBackend` with
+   associated per-layer state and both eager and graph-recording contracts. The
+   current direct flat-KV path is its first static implementation and owns K/V
+   tensors plus RoPE tables. Moving that implementation out of the Llama module
+   and generalizing physical state into grouped `StateSchema` remain.
 7. Add the typed construction-time `KernelCatalog`; resolve the current kernels
    into one immutable default `KernelPlan` without changing their execution.
 8. Extract the common transformer computation into `DenseDecoder`; make the

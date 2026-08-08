@@ -48,15 +48,16 @@ important:
 | Engine/executor protocol | `ModelExecutor::{submit,poll}` with typed completion tickets and one in-flight synchronous CUDA submission | enable event-backed overlap, multiple tickets, and epoch-fenced reclamation without changing the boundary |
 | Executor request state | the engine owns prompt/generated/decoder/sampling state; the executor consumes batch-local materializations and owns physical KV | retain engine authority while allowing explicit versioned, non-authoritative device mirrors when they are performance-justified |
 | Physical state | one flat `KvSlot` domain | a schema of attention/recurrent/cache groups with typed arena identity |
-| Model program | a generic statically composed `CudaExecutor<P>` owns lowering, completion, output validation, and sampling; Llama is the initial whole-batch `ModelProgram`, with graph/workspace internals still in its 2,611-line file | small private architecture adapter constructing a shared decoder program |
-| Operation implementations | direct concrete kernels plus an explicit model-neutral `HostLogitsSampler` | stateful `AttentionBackend`, planned `MoeBackend`, and construction-time leaf-kernel plans |
+| Model program | a generic statically composed `CudaExecutor<P>` owns lowering, completion, output validation, and sampling; Llama is the initial whole-batch `ModelProgram`, with graph/workspace internals and the first attention implementation still in its 2,712-line file | small private architecture adapter constructing a shared decoder program |
+| Operation implementations | crate-private, statically composed `AttentionBackend` with typed layer state and eager/graph paths; explicit model-neutral `HostLogitsSampler` | retain this attention boundary, add `MoeBackend` with the first MoE, and resolve leaf kernels at construction time |
 
 The typed mixed batch, engine-owned request record, ticketed executor, and
 statically composed CUDA program are realized slices of the design. They remove
 semantic request authority and generic execution mechanics from Llama while
 making completion-gated reclamation explicit. Device execution is still
-synchronous and one-at-a-time, and graph/workspace ownership remains in the
-initial program, so overlap and full model isolation remain later steps.
+synchronous and one-at-a-time, and graph/workspace ownership plus the concrete
+flat-KV implementation remain in the initial program module, so overlap and
+full model isolation remain later steps.
 
 ## The three levels must remain distinct
 
