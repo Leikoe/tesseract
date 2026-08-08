@@ -161,7 +161,7 @@ pub fn validate_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaErr
 fn validate_transformer_primitives(
     stream: &std::sync::Arc<cuda_core::Stream>,
 ) -> Result<(), CudaError> {
-    use cutile::{tensor::IntoPartition, tile_kernel::TileKernel};
+    use cutile::tile_kernel::{PartitionOp, TileKernel};
 
     let token_ids = api::copy_host_vec_to_device(&std::sync::Arc::new(vec![0u32, 1u32]))
         .sync_on(stream)
