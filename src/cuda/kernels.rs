@@ -269,6 +269,26 @@ mod tile {
     }
 
     #[cutile::entry()]
+    fn gather_flat_kv_decode_batch_bf16<const D: i32, const KV_HEADS: i32>(
+        slots: &Tensor<u32, { [-1, -1] }>,
+        cache: &Tensor<bf16, { [-1, -1, D] }>,
+        out: &mut Tensor<bf16, { [1, 1, D] }>,
+    ) {
+        let pid = get_tile_block_id();
+        let row_head = pid.0;
+        let position = pid.1;
+        let row = row_head / KV_HEADS;
+        let head = row_head % KV_HEADS;
+        let slot: Tile<u32, { [1, 1] }> = slots.partition(const_shape![1, 1]).load([row, position]);
+        let slot: Tile<i32, { [1, 1] }> = bitcast(slot);
+        let slot: i32 = tile_to_scalar(slot.reshape(const_shape![]));
+        let value: Tile<bf16, { [1, 1, D] }> = cache
+            .partition(const_shape![1, 1, D])
+            .load([slot, head, 0i32]);
+        out.store(value);
+    }
+
+    #[cutile::entry()]
     fn gather_row_bf16<const BLOCK: i32>(
         input: &Tensor<bf16, { [-1, -1] }>,
         out: &mut Tensor<bf16, { [BLOCK] }>,
@@ -361,6 +381,152 @@ mod tile {
         out.store(output);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[cutile::entry()]
+    unsafe fn decode_attention_batch_bf16<const BN: i32, const D: i32, const KV_HEADS: i32>(
+        query: &Tensor<bf16, { [-1, -1, D] }>,
+        key: &Tensor<bf16, { [-1, -1, D] }>,
+        value: &Tensor<bf16, { [-1, -1, D] }>,
+        context_lengths: &Tensor<i32, { [-1] }>,
+        out: &mut Tensor<bf16, { [1, 1, D] }>,
+        scale: f32,
+        group_size: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let row = pid.0;
+        let query_head = pid.1;
+        let kv_head = query_head / group_size;
+        let context_len: i32 = tile_to_scalar(
+            context_lengths
+                .partition(const_shape![1])
+                .load([row])
+                .reshape(const_shape![]),
+        );
+        let query: Tile<f32, { [1, D] }> = convert_tile(
+            query
+                .partition(const_shape![1, 1, D])
+                .load([row, query_head, 0i32])
+                .reshape(const_shape![1, D]),
+        );
+        let key = key.partition(const_shape![1, BN, D]);
+        let value = value.partition(const_shape![1, BN, D]);
+        let row_head: i32 = row * KV_HEADS + kv_head;
+        let mut row_max: Tile<f32, { [1, 1] }> = constant(-1.0e30f32, const_shape![1, 1]);
+        let mut row_sum: Tile<f32, { [1, 1] }> = constant(0.0f32, const_shape![1, 1]);
+        let mut accumulator: Tile<f32, { [1, D] }> = constant(0.0f32, const_shape![1, D]);
+        let lane: Tile<i32, { [BN] }> = iota(const_shape![BN]);
+        let lane: Tile<i32, { [1, BN] }> = lane.reshape(const_shape![1, BN]);
+        for block in 0i32..((context_len + BN - 1i32) / BN) {
+            let key_tile: Tile<bf16, { [1, BN, D] }> = key.load([row_head, block, 0i32]);
+            let key_tile: Tile<f32, { [BN, D] }> =
+                convert_tile(key_tile.reshape(const_shape![BN, D]));
+            let key_tile: Tile<f32, { [D, BN] }> = key_tile.transpose();
+            let scores_zero: Tile<f32, { [1, BN] }> = constant(0.0f32, const_shape![1, BN]);
+            let scores: Tile<f32, { [1, BN] }> = mma(query, key_tile, scores_zero);
+            let positions: Tile<i32, { [1, BN] }> =
+                (block * BN).broadcast(const_shape![1, BN]) + lane;
+            let valid: Tile<bool, { [1, BN] }> =
+                lt_tile(positions, context_len.broadcast(const_shape![1, BN]));
+            let scale: Tile<f32, { [1, BN] }> = scale.broadcast(const_shape![1, BN]);
+            let negative_infinity: Tile<f32, { [1, BN] }> =
+                constant(-1.0e30f32, const_shape![1, BN]);
+            let scores: Tile<f32, { [1, BN] }> = select(valid, scores * scale, negative_infinity);
+            let block_max: Tile<f32, { [1] }> = reduce_max(scores, 1i32);
+            let block_max: Tile<f32, { [1, 1] }> = block_max.reshape(const_shape![1, 1]);
+            let next_max: Tile<f32, { [1, 1] }> = max_tile(row_max, block_max);
+            let probabilities: Tile<f32, { [1, BN] }> =
+                exp(scores - next_max.broadcast(const_shape![1, BN]));
+            let block_sum: Tile<f32, { [1] }> = reduce_sum(probabilities, 1i32);
+            let block_sum: Tile<f32, { [1, 1] }> = block_sum.reshape(const_shape![1, 1]);
+            let correction: Tile<f32, { [1, 1] }> = exp(row_max - next_max);
+            row_sum = row_sum * correction + block_sum;
+            accumulator = accumulator * correction.broadcast(const_shape![1, D]);
+            let value_tile: Tile<bf16, { [1, BN, D] }> = value.load([row_head, block, 0i32]);
+            let value_tile: Tile<bf16, { [BN, D] }> = value_tile.reshape(const_shape![BN, D]);
+            let probabilities: Tile<bf16, { [1, BN] }> = convert_tile(probabilities);
+            accumulator = mma(probabilities, value_tile, accumulator);
+            row_max = next_max;
+        }
+        let epsilon: Tile<f32, { [1, 1] }> = constant(1.0e-8f32, const_shape![1, 1]);
+        let denominator: Tile<f32, { [1, D] }> =
+            max_tile(row_sum, epsilon).broadcast(const_shape![1, D]);
+        let output: Tile<bf16, { [1, 1, D] }> =
+            convert_tile(true_div(accumulator, denominator).reshape(const_shape![1, 1, D]));
+        out.store(output);
+    }
+
+    #[cutile::entry()]
+    fn argmax_blocks_batch_bf16<const BLOCK: i32>(
+        logits: &Tensor<bf16, { [-1, -1] }>,
+        block_max: &mut Tensor<f32, { [1, 1] }>,
+        block_index: &mut Tensor<u32, { [1, 1] }>,
+        length: i32,
+    ) {
+        let pid = get_tile_block_id();
+        let row = pid.0;
+        let block = pid.1;
+        let logits = logits.partition(const_shape![1, BLOCK]);
+        let values_bf16: Tile<bf16, { [1, BLOCK] }> = logits.load([row, block]);
+        let values: Tile<f32, { [BLOCK] }> = convert_tile(values_bf16.reshape(const_shape![BLOCK]));
+        let base: i32 = block * BLOCK;
+        let base: Tile<i32, { [BLOCK] }> = base.broadcast(const_shape![BLOCK]);
+        let indices: Tile<i32, { [BLOCK] }> = base + iota(const_shape![BLOCK]);
+        let valid: Tile<bool, { [BLOCK] }> =
+            lt_tile(indices, length.broadcast(const_shape![BLOCK]));
+        let magnitude: Tile<f32, { [BLOCK] }> = constant(1.0e30f32, const_shape![BLOCK]);
+        let zero: Tile<f32, { [BLOCK] }> = constant(0.0f32, const_shape![BLOCK]);
+        let values: Tile<f32, { [BLOCK] }> = select(valid, values, zero - magnitude);
+        let maximum: Tile<f32, { [1] }> = reduce_max(values, 0i32);
+        let maximum_scalar: f32 = tile_to_scalar(maximum.reshape(const_shape![]));
+        let is_maximum: Tile<bool, { [BLOCK] }> =
+            eq_tile(values, maximum_scalar.broadcast(const_shape![BLOCK]));
+        let invalid_index: Tile<i32, { [BLOCK] }> = constant(2147483647i32, const_shape![BLOCK]);
+        let candidates: Tile<i32, { [BLOCK] }> = select(is_maximum, indices, invalid_index);
+        let winner: Tile<i32, { [1] }> = reduce_min(candidates, 0i32);
+        let winner: i32 = tile_to_scalar(winner.reshape(const_shape![]));
+        let maximum: Tile<f32, { [1, 1] }> =
+            scalar_to_tile(maximum_scalar).reshape(const_shape![1, 1]);
+        let winner: Tile<i32, { [1, 1] }> = scalar_to_tile(winner).reshape(const_shape![1, 1]);
+        let winner: Tile<u32, { [1, 1] }> = bitcast(winner);
+        block_max.store(maximum);
+        block_index.store(winner);
+    }
+
+    #[cutile::entry()]
+    fn argmax_reduce_batch_bf16<const BLOCK: i32>(
+        block_max: &Tensor<f32, { [-1, -1] }>,
+        block_index: &Tensor<u32, { [-1, -1] }>,
+        out: &mut Tensor<u32, { [1] }>,
+        num_blocks: i32,
+    ) {
+        let row = get_tile_block_id().0;
+        let maxima: Tile<f32, { [1, BLOCK] }> = block_max
+            .partition(const_shape![1, BLOCK])
+            .load([row, 0i32]);
+        let maxima: Tile<f32, { [BLOCK] }> = maxima.reshape(const_shape![BLOCK]);
+        let indices: Tile<u32, { [1, BLOCK] }> = block_index
+            .partition(const_shape![1, BLOCK])
+            .load([row, 0i32]);
+        let indices: Tile<i32, { [BLOCK] }> = bitcast(indices.reshape(const_shape![BLOCK]));
+        let offsets: Tile<i32, { [BLOCK] }> = iota(const_shape![BLOCK]);
+        let valid: Tile<bool, { [BLOCK] }> =
+            lt_tile(offsets, num_blocks.broadcast(const_shape![BLOCK]));
+        let magnitude: Tile<f32, { [BLOCK] }> = constant(1.0e30f32, const_shape![BLOCK]);
+        let zero: Tile<f32, { [BLOCK] }> = constant(0.0f32, const_shape![BLOCK]);
+        let masked: Tile<f32, { [BLOCK] }> = select(valid, maxima, zero - magnitude);
+        let maximum: Tile<f32, { [1] }> = reduce_max(masked, 0i32);
+        let maximum_scalar: f32 = tile_to_scalar(maximum.reshape(const_shape![]));
+        let is_maximum: Tile<bool, { [BLOCK] }> =
+            eq_tile(masked, maximum_scalar.broadcast(const_shape![BLOCK]));
+        let invalid_index: Tile<i32, { [BLOCK] }> = constant(2147483647i32, const_shape![BLOCK]);
+        let candidates: Tile<i32, { [BLOCK] }> = select(is_maximum, indices, invalid_index);
+        let winner: Tile<i32, { [1] }> = reduce_min(candidates, 0i32);
+        let winner: i32 = tile_to_scalar(winner.reshape(const_shape![]));
+        let winner: Tile<i32, { [1] }> = scalar_to_tile(winner).reshape(const_shape![1]);
+        let winner: Tile<u32, { [1] }> = bitcast(winner);
+        out.store(winner);
+    }
+
     #[cutile::entry()]
     fn argmax_blocks_bf16<const BLOCK: i32>(
         logits: &Tensor<bf16, { [-1] }>,
@@ -431,7 +597,8 @@ mod tile {
 
 #[allow(unused_imports)]
 pub(crate) use tile::{
-    add_rms_norm_bf16, argmax_blocks_bf16, argmax_reduce_bf16, causal_attention_bf16,
-    embedding_bf16, gather_flat_kv_bf16, gather_row_bf16, rms_norm_bf16, rope_kv_write_bf16,
-    rope_q_bf16, silu_mul_bf16,
+    add_rms_norm_bf16, argmax_blocks_batch_bf16, argmax_blocks_bf16, argmax_reduce_batch_bf16,
+    argmax_reduce_bf16, causal_attention_bf16, decode_attention_batch_bf16, embedding_bf16,
+    gather_flat_kv_bf16, gather_flat_kv_decode_batch_bf16, gather_row_bf16, rms_norm_bf16,
+    rope_kv_write_bf16, rope_q_bf16, silu_mul_bf16,
 };

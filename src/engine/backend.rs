@@ -43,6 +43,8 @@ pub struct BackendExecutionStats {
     pub eager_forwards: u64,
     pub graph_replays: u64,
     pub graph_captures: u64,
+    pub packed_decode_forwards: u64,
+    pub packed_decode_requests: u64,
 }
 
 /// Thread-confined model backend. Production backends are constructed and used

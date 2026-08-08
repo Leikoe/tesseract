@@ -115,6 +115,19 @@ greedy). Both produced exactly `Here is the count from one to three`. Metrics
 reported two eager prefills, 14 graph replays, and 16 generated tokens. Startup
 still warmed five graph buckets and reported ready only after capture.
 
+The backend was subsequently changed to execute aligned greedy decode requests
+as one packed GPU forward. It flattens each request's independent physical KV
+slot map into a ragged, padded batch; cuTile gathers K/V by row, attention reads
+a device context length per row, cuBLAS projects all rows together, and a
+batched cuTile argmax returns one token ID per request. Two simultaneous
+19-token prompts completed with eight tokens each as `The capital of France is
+Paris.` and `The capital of Germany is Berlin.`. Eight scheduler steps executed
+only nine eager forwards: two first-step prefills and seven two-row packed
+decode forwards. The same requests run separately through batch-1 CUDA graphs
+produced byte-identical text. The maximum scheduled batch was two, and KV usage
+and running requests returned to zero. Packed decode is eager in this revision;
+captured batch-shape graphs remain a performance follow-up.
+
 ## Independent BF16 logits reference
 
 The isolated reference environment used PyTorch 2.8.0, Transformers 4.55.0,

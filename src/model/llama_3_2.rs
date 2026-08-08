@@ -271,7 +271,12 @@ impl Model for Llama32 {
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
-    use std::{collections::HashMap, f32::consts::TAU, path::Path, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        f32::consts::TAU,
+        path::Path,
+        sync::Arc,
+    };
 
     use cuda_async::{
         cuda_graph::{CudaGraph, Scope},
@@ -407,6 +412,7 @@ mod cuda_impl {
         None,
         Logits(Vec<f32>),
         Token(u32),
+        Tokens(Vec<u32>),
     }
 
     impl CudaLlama {
@@ -503,17 +509,77 @@ mod cuda_impl {
             context_slots: &[u32],
             return_logits: bool,
         ) -> Result<ForwardOutput, ModelError> {
+            self.forward_eager_impl(
+                token_ids,
+                positions,
+                current_slots,
+                context_slots,
+                None,
+                return_logits,
+            )
+        }
+
+        fn forward_decode_batch(
+            &self,
+            token_ids: &[u32],
+            positions: &[u32],
+            current_slots: &[u32],
+            contexts: &[Vec<u32>],
+        ) -> Result<Vec<u32>, ModelError> {
+            match self.forward_eager_impl(
+                token_ids,
+                positions,
+                current_slots,
+                &[],
+                Some(contexts),
+                true,
+            )? {
+                ForwardOutput::Tokens(tokens) => Ok(tokens),
+                ForwardOutput::None | ForwardOutput::Logits(_) | ForwardOutput::Token(_) => Err(
+                    ModelError::Cuda("packed decode omitted sampled tokens".into()),
+                ),
+            }
+        }
+
+        fn forward_eager_impl(
+            &self,
+            token_ids: &[u32],
+            positions: &[u32],
+            current_slots: &[u32],
+            context_slots: &[u32],
+            decode_contexts: Option<&[Vec<u32>]>,
+            return_logits: bool,
+        ) -> Result<ForwardOutput, ModelError> {
             let rows = token_ids.len();
             if rows == 0
                 || positions.len() != rows
                 || current_slots.len() != rows
-                || context_slots.is_empty()
-                || context_slots
+                || current_slots
                     .iter()
-                    .chain(current_slots)
                     .any(|slot| *slot as usize >= self.capacity)
             {
                 return Err(ModelError::Cuda("invalid forward batch metadata".into()));
+            }
+            match decode_contexts {
+                Some(contexts)
+                    if contexts.len() == rows
+                        && contexts.iter().all(|context| {
+                            !context.is_empty()
+                                && context.iter().all(|slot| (*slot as usize) < self.capacity)
+                        }) => {}
+                Some(_) => {
+                    return Err(ModelError::Cuda(
+                        "invalid packed decode context metadata".into(),
+                    ));
+                }
+                None if context_slots.is_empty()
+                    || context_slots
+                        .iter()
+                        .any(|slot| *slot as usize >= self.capacity) =>
+                {
+                    return Err(ModelError::Cuda("invalid forward context metadata".into()));
+                }
+                None => {}
             }
             let cfg = &self.model.config;
             let stream = &self.stream;
@@ -521,16 +587,55 @@ mod cuda_impl {
             let token_ids = copy_u32(token_ids, stream, "token IDs")?;
             let positions = copy_u32(positions, stream, "positions")?;
             let current_slots = copy_u32(current_slots, stream, "current KV slots")?;
-            let context_len = context_slots.len();
-            let context_bucket = context_len.next_power_of_two().max(16);
-            let mut padded_context_slots = context_slots.to_vec();
-            padded_context_slots.resize(context_bucket, self.capacity as u32);
-            let context_slots = copy_u32(&padded_context_slots, stream, "padded context KV slots")?;
-            let attention_metadata = copy_i32(
-                &[context_len as i32, query_start],
-                stream,
-                "attention metadata",
-            )?;
+            let (context_bucket, context_slots, attention_metadata, decode_context_lengths) =
+                if let Some(contexts) = decode_contexts {
+                    let context_bucket = contexts
+                        .iter()
+                        .map(Vec::len)
+                        .max()
+                        .unwrap_or(1)
+                        .next_power_of_two()
+                        .max(16);
+                    let mut padded = Vec::with_capacity(rows * context_bucket);
+                    let mut lengths = Vec::with_capacity(rows);
+                    for context in contexts {
+                        lengths.push(i32::try_from(context.len()).map_err(|_| {
+                            ModelError::Cuda("packed decode context exceeds i32".into())
+                        })?);
+                        padded.extend_from_slice(context);
+                        padded.resize(
+                            padded.len() + context_bucket - context.len(),
+                            self.capacity as u32,
+                        );
+                    }
+                    (
+                        context_bucket,
+                        copy_u32(&padded, stream, "packed decode context KV slots")?,
+                        None,
+                        Some(copy_i32(&lengths, stream, "packed decode context lengths")?),
+                    )
+                } else {
+                    let context_len = context_slots.len();
+                    let context_bucket = context_len.next_power_of_two().max(16);
+                    let mut padded = context_slots.to_vec();
+                    padded.resize(context_bucket, self.capacity as u32);
+                    let metadata = copy_i32(
+                        &[
+                            i32::try_from(context_len).map_err(|_| {
+                                ModelError::Cuda("attention context exceeds i32".into())
+                            })?,
+                            query_start,
+                        ],
+                        stream,
+                        "attention metadata",
+                    )?;
+                    (
+                        context_bucket,
+                        copy_u32(&padded, stream, "padded context KV slots")?,
+                        Some(metadata),
+                        None,
+                    )
+                };
 
             let hidden = api::zeros::<bf16>(&[rows, cfg.hidden_size])
                 .partition([1, HIDDEN_BLOCK])
@@ -638,60 +743,135 @@ mod cuda_impl {
                 .map_err(|error| cuda_error("key RoPE and flat KV write", error))?;
                 drop(rotated_key);
 
-                let gathered_key =
-                    api::zeros::<bf16>(&[cfg.num_key_value_heads, context_bucket, cfg.head_dim])
+                let attention = if let Some(context_lengths) = &decode_context_lengths {
+                    let context_slots = context_slots
+                        .view(&[rows, context_bucket])
+                        .map_err(|error| cuda_error("view packed context slots", error))?;
+                    let gathered_shape =
+                        [rows * cfg.num_key_value_heads, context_bucket, cfg.head_dim];
+                    let gathered_key = api::zeros::<bf16>(&gathered_shape)
                         .partition([1, 1, cfg.head_dim])
                         .sync_on(stream)
-                        .map_err(|error| cuda_error("allocate gathered key", error))?;
-                let gathered_value =
-                    api::zeros::<bf16>(&[cfg.num_key_value_heads, context_bucket, cfg.head_dim])
+                        .map_err(|error| cuda_error("allocate packed gathered key", error))?;
+                    let gathered_value = api::zeros::<bf16>(&gathered_shape)
                         .partition([1, 1, cfg.head_dim])
                         .sync_on(stream)
-                        .map_err(|error| cuda_error("allocate gathered value", error))?;
-                let (_, _, gathered_key) = kernels::gather_flat_kv_bf16(
-                    &context_slots,
-                    &self.key_cache[layer_index],
-                    gathered_key,
-                )
-                .generics(vec![cfg.head_dim.to_string()])
-                .sync_on(stream)
-                .map_err(|error| cuda_error("gather key cache", error))?;
-                let (_, _, gathered_value) = kernels::gather_flat_kv_bf16(
-                    &context_slots,
-                    &self.value_cache[layer_index],
-                    gathered_value,
-                )
-                .generics(vec![cfg.head_dim.to_string()])
-                .sync_on(stream)
-                .map_err(|error| cuda_error("gather value cache", error))?;
-                let gathered_key = gathered_key.unpartition();
-                let gathered_value = gathered_value.unpartition();
-
-                let attention = api::zeros::<bf16>(&[rows, cfg.num_attention_heads, cfg.head_dim])
-                    .partition([ATTENTION_QUERY_BLOCK, 1, cfg.head_dim])
-                    .sync_on(stream)
-                    .map_err(|error| cuda_error("allocate attention output", error))?;
-                let (_, _, _, _, attention, _, _) = unsafe {
-                    kernels::causal_attention_bf16(
-                        &rotated_query,
-                        &gathered_key,
-                        &gathered_value,
-                        &attention_metadata,
-                        attention,
-                        1.0 / (cfg.head_dim as f32).sqrt(),
-                        (cfg.num_attention_heads / cfg.num_key_value_heads) as i32,
+                        .map_err(|error| cuda_error("allocate packed gathered value", error))?;
+                    let (_, _, gathered_key) = kernels::gather_flat_kv_decode_batch_bf16(
+                        &context_slots,
+                        &self.key_cache[layer_index],
+                        gathered_key,
                     )
-                }
-                .generics(vec![
-                    ATTENTION_QUERY_BLOCK.to_string(),
-                    ATTENTION_KEY_BLOCK.to_string(),
-                    cfg.head_dim.to_string(),
-                ])
-                .sync_on(stream)
-                .map_err(|error| cuda_error("causal attention", error))?;
+                    .generics(vec![
+                        cfg.head_dim.to_string(),
+                        cfg.num_key_value_heads.to_string(),
+                    ])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("gather packed key cache", error))?;
+                    let (_, _, gathered_value) = kernels::gather_flat_kv_decode_batch_bf16(
+                        &context_slots,
+                        &self.value_cache[layer_index],
+                        gathered_value,
+                    )
+                    .generics(vec![
+                        cfg.head_dim.to_string(),
+                        cfg.num_key_value_heads.to_string(),
+                    ])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("gather packed value cache", error))?;
+                    let gathered_key = gathered_key.unpartition();
+                    let gathered_value = gathered_value.unpartition();
+                    let attention =
+                        api::zeros::<bf16>(&[rows, cfg.num_attention_heads, cfg.head_dim])
+                            .partition([1, 1, cfg.head_dim])
+                            .sync_on(stream)
+                            .map_err(|error| {
+                                cuda_error("allocate packed attention output", error)
+                            })?;
+                    let (_, _, _, _, attention, _, _) = unsafe {
+                        kernels::decode_attention_batch_bf16(
+                            &rotated_query,
+                            &gathered_key,
+                            &gathered_value,
+                            context_lengths,
+                            attention,
+                            1.0 / (cfg.head_dim as f32).sqrt(),
+                            (cfg.num_attention_heads / cfg.num_key_value_heads) as i32,
+                        )
+                    }
+                    .generics(vec![
+                        ATTENTION_KEY_BLOCK.to_string(),
+                        cfg.head_dim.to_string(),
+                        cfg.num_key_value_heads.to_string(),
+                    ])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("packed decode attention", error))?;
+                    attention.unpartition()
+                } else {
+                    let gathered_key = api::zeros::<bf16>(&[
+                        cfg.num_key_value_heads,
+                        context_bucket,
+                        cfg.head_dim,
+                    ])
+                    .partition([1, 1, cfg.head_dim])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("allocate gathered key", error))?;
+                    let gathered_value = api::zeros::<bf16>(&[
+                        cfg.num_key_value_heads,
+                        context_bucket,
+                        cfg.head_dim,
+                    ])
+                    .partition([1, 1, cfg.head_dim])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("allocate gathered value", error))?;
+                    let (_, _, gathered_key) = kernels::gather_flat_kv_bf16(
+                        &context_slots,
+                        &self.key_cache[layer_index],
+                        gathered_key,
+                    )
+                    .generics(vec![cfg.head_dim.to_string()])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("gather key cache", error))?;
+                    let (_, _, gathered_value) = kernels::gather_flat_kv_bf16(
+                        &context_slots,
+                        &self.value_cache[layer_index],
+                        gathered_value,
+                    )
+                    .generics(vec![cfg.head_dim.to_string()])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("gather value cache", error))?;
+                    let gathered_key = gathered_key.unpartition();
+                    let gathered_value = gathered_value.unpartition();
+                    let attention =
+                        api::zeros::<bf16>(&[rows, cfg.num_attention_heads, cfg.head_dim])
+                            .partition([ATTENTION_QUERY_BLOCK, 1, cfg.head_dim])
+                            .sync_on(stream)
+                            .map_err(|error| cuda_error("allocate attention output", error))?;
+                    let metadata = attention_metadata.as_ref().ok_or_else(|| {
+                        ModelError::Cuda("causal attention metadata is missing".into())
+                    })?;
+                    let (_, _, _, _, attention, _, _) = unsafe {
+                        kernels::causal_attention_bf16(
+                            &rotated_query,
+                            &gathered_key,
+                            &gathered_value,
+                            metadata,
+                            attention,
+                            1.0 / (cfg.head_dim as f32).sqrt(),
+                            (cfg.num_attention_heads / cfg.num_key_value_heads) as i32,
+                        )
+                    }
+                    .generics(vec![
+                        ATTENTION_QUERY_BLOCK.to_string(),
+                        ATTENTION_KEY_BLOCK.to_string(),
+                        cfg.head_dim.to_string(),
+                    ])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("causal attention", error))?;
+                    attention.unpartition()
+                };
                 let attention = Arc::new(
                     attention
-                        .unpartition()
                         .reshape(&[rows, cfg.hidden_size])
                         .map_err(|error| cuda_error("reshape attention output", error))?,
                 );
@@ -749,6 +929,56 @@ mod cuda_impl {
                 .ok_or_else(|| ModelError::Cuda("model has no transformer layers".into()))?;
             let (final_hidden, _) =
                 self.add_rms_norm(residual, update, self.weights.final_norm.clone(), rows)?;
+            if decode_contexts.is_some() {
+                let logits = self.gemm(
+                    self.weights.lm_head.clone(),
+                    final_hidden,
+                    cfg.vocab_size,
+                    rows,
+                    cfg.hidden_size,
+                    "packed language-model head",
+                )?;
+                let argmax_blocks = cfg.vocab_size.div_ceil(ARGMAX_BLOCK);
+                let reduce_block = argmax_blocks.next_power_of_two();
+                let block_max = api::zeros::<f32>(&[rows, argmax_blocks])
+                    .partition([1, 1])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("allocate packed argmax maxima", error))?;
+                let block_index = api::zeros::<u32>(&[rows, argmax_blocks])
+                    .partition([1, 1])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("allocate packed argmax indices", error))?;
+                let (_, block_max, block_index, _) = kernels::argmax_blocks_batch_bf16(
+                    &logits,
+                    block_max,
+                    block_index,
+                    cfg.vocab_size as i32,
+                )
+                .generics(vec![ARGMAX_BLOCK.to_string()])
+                .sync_on(stream)
+                .map_err(|error| cuda_error("packed logits argmax blocks", error))?;
+                let block_max = block_max.unpartition();
+                let block_index = block_index.unpartition();
+                let sampled = api::zeros::<u32>(&[rows])
+                    .partition([1])
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("allocate packed sampled tokens", error))?;
+                let (_, _, sampled, _) = kernels::argmax_reduce_batch_bf16(
+                    &block_max,
+                    &block_index,
+                    sampled,
+                    argmax_blocks as i32,
+                )
+                .generics(vec![reduce_block.to_string()])
+                .sync_on(stream)
+                .map_err(|error| cuda_error("reduce packed logits argmax", error))?;
+                let sampled = sampled
+                    .unpartition()
+                    .to_host_vec()
+                    .sync_on(stream)
+                    .map_err(|error| cuda_error("copy packed sampled tokens to host", error))?;
+                return Ok(ForwardOutput::Tokens(sampled));
+            }
             let last = api::zeros::<bf16>(&[cfg.hidden_size])
                 .partition([HIDDEN_BLOCK])
                 .sync_on(stream)
@@ -1488,7 +1718,89 @@ mod cuda_impl {
 
         fn step(&mut self, batch: &[ScheduledWork]) -> Result<Vec<StepOutput>, BackendError> {
             let mut outputs = Vec::with_capacity(batch.len());
+            let packed_ids: HashSet<_> = batch
+                .iter()
+                .filter_map(|work| {
+                    let request = self.requests.get(&work.request_id)?;
+                    (work.sample
+                        && work.num_tokens == 1
+                        && work.position > 0
+                        && request.temperature == 0.0)
+                        .then_some(work.request_id)
+                })
+                .collect();
+            if packed_ids.len() >= 2 {
+                let mut request_ids = Vec::with_capacity(packed_ids.len());
+                let mut token_ids = Vec::with_capacity(packed_ids.len());
+                let mut positions = Vec::with_capacity(packed_ids.len());
+                let mut current_slots = Vec::with_capacity(packed_ids.len());
+                let mut contexts = Vec::with_capacity(packed_ids.len());
+                for work in batch
+                    .iter()
+                    .filter(|work| packed_ids.contains(&work.request_id))
+                {
+                    let request = self.requests.get_mut(&work.request_id).ok_or_else(|| {
+                        BackendError::Execution(format!("unknown request {}", work.request_id))
+                    })?;
+                    if work.kv_slots.len() != 1 || work.position != request.slots.len() {
+                        return Err(BackendError::Execution(format!(
+                            "invalid packed schedule metadata for request {}",
+                            work.request_id
+                        )));
+                    }
+                    let available = request.prompt.len() + request.generated.len();
+                    if work.position >= available {
+                        return Err(BackendError::Execution(format!(
+                            "packed token position {} exceeds request token state {available}",
+                            work.position
+                        )));
+                    }
+                    let token_id = if work.position < request.prompt.len() {
+                        request.prompt[work.position]
+                    } else {
+                        request.generated[work.position - request.prompt.len()]
+                    };
+                    request.slots.push(work.kv_slots[0]);
+                    request_ids.push(work.request_id);
+                    token_ids.push(token_id);
+                    positions.push(u32::try_from(work.position).map_err(|_| {
+                        BackendError::Execution("packed token position exceeds u32".into())
+                    })?);
+                    current_slots.push(work.kv_slots[0]);
+                    contexts.push(request.slots.clone());
+                }
+                let sampled = self
+                    .runtime
+                    .forward_decode_batch(&token_ids, &positions, &current_slots, &contexts)
+                    .map_err(execution)?;
+                self.runtime.execution_stats.eager_forwards += 1;
+                self.runtime.execution_stats.packed_decode_forwards += 1;
+                self.runtime.execution_stats.packed_decode_requests += request_ids.len() as u64;
+                if sampled.len() != request_ids.len() {
+                    return Err(BackendError::Execution(format!(
+                        "packed decode returned {} tokens for {} requests",
+                        sampled.len(),
+                        request_ids.len()
+                    )));
+                }
+                for (request_id, token_id) in request_ids.into_iter().zip(sampled) {
+                    let request = self.requests.get_mut(&request_id).ok_or_else(|| {
+                        BackendError::Execution(format!("unknown request {request_id}"))
+                    })?;
+                    request.generated.push(token_id);
+                    let text = request.decoder.push(token_id).map_err(execution)?;
+                    outputs.push(StepOutput {
+                        request_id,
+                        token_id: Some(token_id),
+                        text,
+                        is_eos: self.runtime.model.eos_token_ids().contains(&token_id),
+                    });
+                }
+            }
             for work in batch {
+                if packed_ids.len() >= 2 && packed_ids.contains(&work.request_id) {
+                    continue;
+                }
                 let request = self.requests.get_mut(&work.request_id).ok_or_else(|| {
                     BackendError::Execution(format!("unknown request {}", work.request_id))
                 })?;
@@ -1552,7 +1864,7 @@ mod cuda_impl {
                         request.top_p,
                         &mut request.rng,
                     )?,
-                    ForwardOutput::None => {
+                    ForwardOutput::None | ForwardOutput::Tokens(_) => {
                         return Err(BackendError::Execution(
                             "sampled forward omitted logits and token".into(),
                         ));
@@ -1754,7 +2066,7 @@ mod cuda_impl {
         let mut runtime = CudaLlama::load(Arc::new(model), device_id, capacity)?;
         let logits = match runtime.forward(&token_ids, &positions, &slots, &slots, true, false)? {
             ForwardOutput::Logits(logits) => logits,
-            ForwardOutput::None | ForwardOutput::Token(_) => {
+            ForwardOutput::None | ForwardOutput::Token(_) | ForwardOutput::Tokens(_) => {
                 return Err(ModelError::Cuda("forward omitted requested logits".into()));
             }
         };

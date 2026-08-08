@@ -28,6 +28,8 @@ pub struct Metrics {
     eager_forwards: AtomicU64,
     graph_replays: AtomicU64,
     graph_captures: AtomicU64,
+    packed_decode_forwards: AtomicU64,
+    packed_decode_requests: AtomicU64,
 }
 
 impl Metrics {
@@ -111,6 +113,10 @@ impl Metrics {
             .fetch_add(stats.graph_replays, Ordering::Relaxed);
         self.graph_captures
             .fetch_add(stats.graph_captures, Ordering::Relaxed);
+        self.packed_decode_forwards
+            .fetch_add(stats.packed_decode_forwards, Ordering::Relaxed);
+        self.packed_decode_requests
+            .fetch_add(stats.packed_decode_requests, Ordering::Relaxed);
     }
 
     pub fn prometheus(&self) -> String {
@@ -224,6 +230,18 @@ impl Metrics {
             "Full-model CUDA decode graphs captured",
             "counter",
             self.graph_captures.load(Ordering::Relaxed)
+        );
+        metric!(
+            "tesseract_packed_decode_forwards_total",
+            "Packed multi-request decode forwards executed",
+            "counter",
+            self.packed_decode_forwards.load(Ordering::Relaxed)
+        );
+        metric!(
+            "tesseract_packed_decode_requests_total",
+            "Request rows executed by packed multi-request decode",
+            "counter",
+            self.packed_decode_requests.load(Ordering::Relaxed)
         );
         timing_metrics(
             &mut out,
