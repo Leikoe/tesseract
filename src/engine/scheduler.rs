@@ -675,6 +675,7 @@ impl<B: Backend> EngineWorker<B> {
 mod tests {
     use super::*;
     use crate::engine::{GenerationParams, testing::DeterministicBackend};
+    use std::collections::HashSet;
 
     fn config() -> EngineConfig {
         EngineConfig {
@@ -830,5 +831,94 @@ mod tests {
             }
         }
         panic!("cancelled request closed without a terminal event");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_active_requests_and_clears_readiness() {
+        let metrics = Arc::new(Metrics::default());
+        let engine = EngineHandle::spawn(
+            DeterministicBackend::new("test-model").with_step_delay(Duration::from_millis(25)),
+            config(),
+            8,
+            Arc::clone(&metrics),
+        )
+        .unwrap();
+        let mut stream = engine.try_generate(request(20)).unwrap();
+        engine.shutdown(Duration::from_secs(1)).await.unwrap();
+        assert!(!metrics.is_ready());
+        while let Some(event) = stream.recv().await {
+            if let GenerationEvent::Finished { reason, .. } = event {
+                assert_eq!(reason, FinishReason::Cancelled);
+                return;
+            }
+        }
+        panic!("shutdown request closed without a terminal cancellation");
+    }
+
+    #[test]
+    fn batch_builder_preserves_budget_chunk_and_slot_invariants() {
+        for budget in 3..=9 {
+            for chunk in 1..=4 {
+                let mut test_config = config();
+                test_config.max_running = 3;
+                test_config.max_batch_tokens = budget;
+                test_config.prefill_chunk_tokens = chunk;
+                test_config.kv_capacity_tokens = 256;
+                let metrics = Arc::new(Metrics::default());
+                let backend = DeterministicBackend::new("test-model");
+                let mut worker = EngineWorker::new(backend, test_config, metrics);
+                let mut receivers = Vec::new();
+                for prompt_tokens in [2usize, 5, 11] {
+                    let (output, receiver) = mpsc::channel(8);
+                    receivers.push(receiver);
+                    let mut generated = request(3);
+                    generated.prompt = vec!["token"; prompt_tokens].join(" ");
+                    worker.add_request(generated, output);
+                }
+                worker.admit_waiting();
+                let batch = worker.build_batch();
+                assert!(batch.iter().map(|work| work.num_tokens).sum::<usize>() <= budget);
+                assert!(batch.iter().all(|work| work.num_tokens <= chunk));
+                let slots: Vec<_> = batch
+                    .iter()
+                    .flat_map(|work| work.kv_slots.iter().copied())
+                    .collect();
+                assert_eq!(
+                    slots.iter().copied().collect::<HashSet<_>>().len(),
+                    slots.len()
+                );
+                assert!(
+                    batch
+                        .iter()
+                        .all(|work| work.kv_slots.len() == work.num_tokens)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_work_has_priority_over_prefill_when_budget_is_tight() {
+        let mut test_config = config();
+        test_config.max_batch_tokens = 1;
+        let metrics = Arc::new(Metrics::default());
+        let backend = DeterministicBackend::new("test-model");
+        let mut worker = EngineWorker::new(backend, test_config, metrics);
+        let (decode_output, _decode_receiver) = mpsc::channel(8);
+        let decode = request(3);
+        let decode_id = decode.id;
+        worker.add_request(decode, decode_output);
+        let (prefill_output, _prefill_receiver) = mpsc::channel(8);
+        let prefill = request(3);
+        let prefill_id = prefill.id;
+        worker.add_request(prefill, prefill_output);
+        worker.admit_waiting();
+        let decode_state = worker.requests.get_mut(&decode_id).unwrap();
+        decode_state.computed_tokens = decode_state.prompt_tokens;
+        decode_state.generated_tokens = 1;
+
+        let batch = worker.build_batch();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].request_id, decode_id);
+        assert!(!batch.iter().any(|work| work.request_id == prefill_id));
     }
 }

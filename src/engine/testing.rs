@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::model::{ChatMessage, IncrementalDecoder, Model, ModelError, ModelSummary};
 
@@ -10,6 +10,7 @@ use super::{
 pub struct DeterministicBackend {
     model: Arc<TestModel>,
     requests: HashMap<RequestId, TestRequest>,
+    step_delay: Duration,
 }
 
 struct TestRequest {
@@ -23,7 +24,13 @@ impl DeterministicBackend {
                 id: model_id.into(),
             }),
             requests: HashMap::new(),
+            step_delay: Duration::ZERO,
         }
+    }
+
+    pub fn with_step_delay(mut self, step_delay: Duration) -> Self {
+        self.step_delay = step_delay;
+        self
     }
 }
 
@@ -40,6 +47,9 @@ impl Backend for DeterministicBackend {
     }
 
     fn step(&mut self, batch: &[ScheduledWork]) -> Result<Vec<StepOutput>, BackendError> {
+        if !self.step_delay.is_zero() {
+            std::thread::sleep(self.step_delay);
+        }
         let mut outputs = Vec::new();
         for work in batch {
             if !work.sample {

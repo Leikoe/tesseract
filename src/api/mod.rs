@@ -131,9 +131,23 @@ mod tests {
         engine::{EngineHandle, testing::DeterministicBackend},
     };
 
-    fn test_app() -> Router {
+    fn test_app_with(
+        backend: DeterministicBackend,
+        config: EngineConfig,
+    ) -> (Router, Arc<Metrics>) {
         let metrics = Arc::new(Metrics::default());
-        let engine = EngineHandle::spawn(
+        let engine = EngineHandle::spawn(backend, config, 8, Arc::clone(&metrics)).unwrap();
+        (
+            router(AppState {
+                engine,
+                metrics: Arc::clone(&metrics),
+            }),
+            metrics,
+        )
+    }
+
+    fn test_app() -> Router {
+        test_app_with(
             DeterministicBackend::new("test-model"),
             EngineConfig {
                 max_pending: 8,
@@ -144,11 +158,8 @@ mod tests {
                 kv_capacity_tokens: 128,
                 output_buffer: 8,
             },
-            8,
-            Arc::clone(&metrics),
         )
-        .unwrap();
-        router(AppState { engine, metrics })
+        .0
     }
 
     fn chat_body(stream: bool) -> Value {
@@ -242,5 +253,87 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("tesseract_running_requests"));
         assert!(body.contains("tesseract_kv_tokens_used"));
+    }
+
+    #[tokio::test]
+    async fn overload_returns_openai_rate_limit_error() {
+        let (app, metrics) = test_app_with(
+            DeterministicBackend::new("test-model")
+                .with_step_delay(std::time::Duration::from_millis(50)),
+            EngineConfig {
+                max_pending: 0,
+                max_running: 1,
+                max_batch_tokens: 4,
+                prefill_chunk_tokens: 1,
+                max_sequence_length: 128,
+                kv_capacity_tokens: 128,
+                output_buffer: 8,
+            },
+        );
+        let mut first_body = chat_body(false);
+        first_body["max_tokens"] = Value::from(4);
+        let first = tokio::spawn(
+            app.clone().oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(first_body.to_string()))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !metrics
+                .prometheus()
+                .contains("tesseract_running_requests 1")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(chat_body(false).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn explicit_cancel_route_is_typed_and_validated() {
+        let app = test_app();
+        let request_id = uuid::Uuid::now_v7();
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/v1/requests/chatcmpl-{}", request_id.simple()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(accepted.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["id"], request_id.to_string());
+        assert_eq!(body["cancelled"], true);
+
+        let invalid = app
+            .oneshot(
+                Request::delete("/v1/requests/not-a-uuid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     }
 }
