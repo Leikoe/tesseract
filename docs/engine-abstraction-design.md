@@ -803,11 +803,13 @@ The refactor should remain runnable after every step:
    validated compile-time geometry in one immutable `KernelPlan`. Prefill/mixed
    and decode attention are planned independently, runtime bucket dispatch uses
    the plan, and selection completes before allocation or graph capture.
-8. **Partially implemented:** the common transformer computation now consumes
+8. **Implemented:** the common transformer computation now consumes
    model-neutral `DenseDecoderConfig`, `DenseDecoderWeightNames`, and a validated
    `DenseDecoderArtifact`; the Llama module is 538 lines and owns validation,
-   presentation, tensor mapping, and construction. Split flat-KV attention and
-   graph/workspace policy out of the initial shared decoder module next.
+   presentation, tensor mapping, and construction. The first flat-KV
+   `AttentionBackend` and fixed-shape graph policy live in separate decoder
+   submodules rather than in either the architecture adapter or transformer
+   program.
 9. Add the architecture registry and independent `WeightSource`; remove
    model-name and checkpoint-format switches from serving code.
 10. Run property tests, strict Clippy, CUDA differential tests, Compute

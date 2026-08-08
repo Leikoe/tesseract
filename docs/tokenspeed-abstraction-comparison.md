@@ -48,7 +48,7 @@ important:
 | Engine/executor protocol | `ModelExecutor::{submit,poll}` with typed completion tickets and one in-flight synchronous CUDA submission | enable event-backed overlap, multiple tickets, and epoch-fenced reclamation without changing the boundary |
 | Executor request state | the engine owns prompt/generated/decoder/sampling state; the executor consumes batch-local materializations and owns physical KV | retain engine authority while allowing explicit versioned, non-authoritative device mirrors when they are performance-justified |
 | Physical state | one flat `KvSlot` domain | a schema of attention/recurrent/cache groups with typed arena identity |
-| Model program | `CudaExecutor<P>` owns lowering, completion, output validation, and sampling; the 538-line Llama adapter constructs a validated model-neutral dense-decoder artifact, while graph/workspace and flat-KV internals still share the initial decoder module | finish separating program, graph policy, and concrete attention implementation |
+| Model program | `CudaExecutor<P>` owns lowering, completion, output validation, and sampling; the 538-line Llama adapter constructs a validated model-neutral dense-decoder artifact; graph policy and the concrete flat-KV attention implementation are separate private modules | preserve this composition when adding the second dense architecture and attention backend |
 | Operation implementations | crate-private, statically composed `AttentionBackend`; explicit model-neutral `HostLogitsSampler`; construction-time typed `KernelCatalog` resolving stable per-operation descriptors and immutable geometry/mode plans | retain these boundaries and add `MoeBackend` with the first MoE |
 
 The typed mixed batch, engine-owned request record, ticketed executor,
