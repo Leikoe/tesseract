@@ -3,6 +3,7 @@ pub(crate) mod weights;
 
 use std::{io, path::Path, path::PathBuf, sync::Arc};
 
+use serde::Deserialize;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,11 +74,84 @@ pub trait Model: Send + Sync {
     fn summary(&self) -> ModelSummary;
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelManifest {
+    #[serde(default)]
+    architectures: Vec<String>,
+    #[serde(default)]
+    model_type: String,
+}
+
+trait ArchitectureFactory: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn probe(&self, manifest: &ModelManifest) -> bool;
+    fn load(&self, model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError>;
+
+    #[cfg(feature = "cuda")]
+    fn load_cuda_executor(
+        &self,
+        model_id: &str,
+        model_dir: &Path,
+        device_id: usize,
+        kv_capacity_tokens: usize,
+        max_batch_tokens: usize,
+        max_running: usize,
+    ) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError>;
+
+    #[cfg(feature = "cuda")]
+    fn validate_cuda_model(
+        &self,
+        model_id: &str,
+        model_dir: &Path,
+        device_id: usize,
+    ) -> Result<CudaModelReport, ModelError>;
+
+    #[cfg(feature = "cuda")]
+    fn validate_cuda_next_token(
+        &self,
+        model_id: &str,
+        model_dir: &Path,
+        device_id: usize,
+        prompt: &str,
+    ) -> Result<CudaForwardReport, ModelError>;
+}
+
+static ARCHITECTURES: [&dyn ArchitectureFactory; 1] = [&llama_3_2::FACTORY];
+
+fn architecture_factory(
+    model_id: &str,
+    model_dir: &Path,
+) -> Result<&'static dyn ArchitectureFactory, ModelError> {
+    let path = model_dir.join("config.json");
+    let text = read_file(&path)?;
+    let manifest: ModelManifest =
+        serde_json::from_str(&text).map_err(|source| ModelError::Json {
+            path: path.clone(),
+            source,
+        })?;
+    let factory =
+        resolve_architecture(&manifest).ok_or_else(|| ModelError::UnsupportedArchitecture {
+            model_id: model_id.into(),
+            architectures: manifest.architectures,
+            model_type: manifest.model_type,
+        })?;
+    tracing::debug!(
+        architecture = factory.name(),
+        model_id,
+        "resolved model architecture"
+    );
+    Ok(factory)
+}
+
+fn resolve_architecture(manifest: &ModelManifest) -> Option<&'static dyn ArchitectureFactory> {
+    ARCHITECTURES
+        .iter()
+        .copied()
+        .find(|factory| factory.probe(manifest))
+}
+
 pub fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
-    if llama_3_2::supports(model_id) {
-        return llama_3_2::load(model_id, model_dir).map(|model| Arc::new(model) as Arc<dyn Model>);
-    }
-    Err(ModelError::UnsupportedModel(model_id.into()))
+    architecture_factory(model_id, model_dir)?.load(model_id, model_dir)
 }
 
 #[cfg(feature = "cuda")]
@@ -90,17 +164,14 @@ pub fn load_cuda_executor(
     max_running: usize,
 ) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError> {
     crate::cuda::enable_persistent_cubin_cache()?;
-    if llama_3_2::supports(model_id) {
-        return llama_3_2::load_cuda_executor(
-            model_id,
-            model_dir,
-            device_id,
-            kv_capacity_tokens,
-            max_batch_tokens,
-            max_running,
-        );
-    }
-    Err(ModelError::UnsupportedModel(model_id.into()))
+    architecture_factory(model_id, model_dir)?.load_cuda_executor(
+        model_id,
+        model_dir,
+        device_id,
+        kv_capacity_tokens,
+        max_batch_tokens,
+        max_running,
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -110,10 +181,7 @@ pub fn validate_cuda_model(
     device_id: usize,
 ) -> Result<CudaModelReport, ModelError> {
     crate::cuda::enable_persistent_cubin_cache()?;
-    if llama_3_2::supports(model_id) {
-        return llama_3_2::validate_cuda(model_id, model_dir, device_id);
-    }
-    Err(ModelError::UnsupportedModel(model_id.into()))
+    architecture_factory(model_id, model_dir)?.validate_cuda_model(model_id, model_dir, device_id)
 }
 
 #[cfg(feature = "cuda")]
@@ -124,16 +192,22 @@ pub fn validate_cuda_next_token(
     prompt: &str,
 ) -> Result<CudaForwardReport, ModelError> {
     crate::cuda::enable_persistent_cubin_cache()?;
-    if llama_3_2::supports(model_id) {
-        return llama_3_2::validate_cuda_next_token(model_id, model_dir, device_id, prompt);
-    }
-    Err(ModelError::UnsupportedModel(model_id.into()))
+    architecture_factory(model_id, model_dir)?
+        .validate_cuda_next_token(model_id, model_dir, device_id, prompt)
 }
 
 #[derive(Debug, Error)]
 pub enum ModelError {
     #[error("unsupported model `{0}`")]
     UnsupportedModel(String),
+    #[error(
+        "model `{model_id}` declares unsupported architecture(s) {architectures:?} and model type `{model_type}`"
+    )]
+    UnsupportedArchitecture {
+        model_id: String,
+        architectures: Vec<String>,
+        model_type: String,
+    },
     #[error("failed to access `{path}`: {source}")]
     Io {
         path: PathBuf,
@@ -156,17 +230,16 @@ pub enum ModelError {
     SafeTensors { path: PathBuf, message: String },
     #[error("required tensor `{0}` is missing")]
     MissingTensor(String),
-    #[error("tensor `{name}` has dtype {actual:?}; expected BF16")]
-    WrongDtype {
-        name: String,
-        actual: safetensors::Dtype,
-    },
+    #[error("tensor `{name}` has dtype {actual}; expected BF16")]
+    WrongDtype { name: String, actual: String },
     #[error("tensor `{name}` has shape {actual:?}; expected {expected:?}")]
     WrongShape {
         name: String,
         expected: Vec<usize>,
         actual: Vec<usize>,
     },
+    #[error("tensor `{name}` is invalid: {message}")]
+    InvalidTensor { name: String, message: String },
     #[error("CUDA model operation failed: {0}")]
     Cuda(String),
     #[cfg(feature = "cuda")]
@@ -179,4 +252,27 @@ pub(crate) fn read_file(path: &Path) -> Result<String, ModelError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_resolves_architecture_without_model_id_checks() {
+        let manifest = ModelManifest {
+            architectures: vec!["LlamaForCausalLM".into()],
+            model_type: "llama".into(),
+        };
+        assert_eq!(resolve_architecture(&manifest).unwrap().name(), "llama");
+    }
+
+    #[test]
+    fn registry_rejects_unknown_architectures() {
+        let manifest = ModelManifest {
+            architectures: vec!["UnknownForCausalLM".into()],
+            model_type: "unknown".into(),
+        };
+        assert!(resolve_architecture(&manifest).is_none());
+    }
 }

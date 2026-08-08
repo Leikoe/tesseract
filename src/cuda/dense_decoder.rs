@@ -25,7 +25,8 @@ use crate::{
     },
     engine::{ExecutionError, ExecutionStats, ModelExecutor, TokenId},
     model::{
-        CudaForwardReport, CudaModelReport, CudaTokenLogit, Model, ModelError, weights::WeightStore,
+        CudaForwardReport, CudaModelReport, CudaTokenLogit, Model, ModelError,
+        weights::{WeightDtype, WeightSource},
     },
 };
 
@@ -93,7 +94,7 @@ pub(crate) struct DenseDecoderWeightNames {
 pub(crate) struct DenseDecoderArtifact {
     model: Arc<dyn Model>,
     config: DenseDecoderConfig,
-    weights: Arc<WeightStore>,
+    weights: Arc<dyn WeightSource>,
     weight_names: DenseDecoderWeightNames,
 }
 
@@ -101,7 +102,7 @@ impl DenseDecoderArtifact {
     pub fn try_new(
         model: Arc<dyn Model>,
         config: DenseDecoderConfig,
-        weights: Arc<WeightStore>,
+        weights: Arc<dyn WeightSource>,
         weight_names: DenseDecoderWeightNames,
     ) -> Result<Self, ModelError> {
         if !valid_dense_decoder_config(config) {
@@ -164,12 +165,30 @@ struct DeviceWeights {
 }
 
 impl DeviceWeights {
-    fn load(store: &WeightStore, stream: &Arc<Stream>) -> Result<Self, ModelError> {
-        let names = store.names();
+    fn load(source: &dyn WeightSource, stream: &Arc<Stream>) -> Result<Self, ModelError> {
+        let names = source.names();
         let mut tensors = HashMap::with_capacity(names.len());
         let mut bytes = 0usize;
         for name in names {
-            let tensor = store.load_device_bf16(&name, stream)?;
+            let view = source.tensor(&name)?;
+            if view.dtype() != &WeightDtype::Bf16 {
+                return Err(ModelError::WrongDtype {
+                    name,
+                    actual: view.dtype().to_string(),
+                });
+            }
+            let shape = view.shape().to_vec();
+            let host = Arc::new(
+                view.bytes()
+                    .chunks_exact(2)
+                    .map(|bytes| bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])))
+                    .collect::<Vec<_>>(),
+            );
+            let tensor = api::copy_host_vec_to_device(&host)
+                .sync_on(stream)
+                .map_err(|error| ModelError::Cuda(format!("upload `{name}`: {error:?}")))?
+                .reshape(&shape)
+                .map_err(|error| ModelError::Cuda(format!("reshape `{name}`: {error:?}")))?;
             bytes = bytes
                 .checked_add(tensor.num_bytes())
                 .ok_or_else(|| ModelError::Cuda("device weight byte count overflowed".into()))?;
@@ -1423,7 +1442,7 @@ pub(crate) fn load_executor(
 
 pub(crate) fn validate(
     model_id: &str,
-    weights: &WeightStore,
+    weights: &dyn WeightSource,
     probe_name: &str,
     device_id: usize,
 ) -> Result<CudaModelReport, ModelError> {
@@ -1442,9 +1461,9 @@ pub(crate) fn validate(
         .map_err(|error| ModelError::Cuda(format!("verify `{probe_name}`: {error:?}")))?;
     let matches = actual
         .iter()
-        .zip(expected.data().chunks_exact(2))
+        .zip(expected.bytes().chunks_exact(2))
         .all(|(actual, bytes)| actual.to_bits() == u16::from_le_bytes([bytes[0], bytes[1]]));
-    if !matches || actual.len() * 2 != expected.data().len() {
+    if !matches || actual.len() * 2 != expected.bytes().len() {
         return Err(ModelError::Cuda(format!(
             "BF16 round-trip mismatch for `{probe_name}`"
         )));
