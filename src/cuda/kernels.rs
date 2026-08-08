@@ -194,7 +194,6 @@ mod tile {
             key_out.store(key_lo.reshape(const_shape![1, 1, HALF]), [0i32, 0i32, 0i32]);
             key_out.store(key_hi.reshape(const_shape![1, 1, HALF]), [0i32, 0i32, 1i32]);
         }
-
         let base: i32 = (slot * KV_HEADS + head) * D;
         let half_offsets: Tile<i32, { [HALF] }> = iota(const_shape![HALF]);
         let half_offsets: Tile<i32, { [1, HALF] }> = half_offsets.reshape(const_shape![1, HALF]);
@@ -266,37 +265,6 @@ mod tile {
         let slot: i32 = tile_to_scalar(slot.reshape(const_shape![]));
         let cache = cache.partition(const_shape![1, 1, D]);
         out.store(cache.load([slot, head, 0i32]));
-    }
-
-    #[cutile::entry()]
-    fn gather_flat_kv_decode_batch_bf16<const D: i32, const KV_HEADS: i32>(
-        slots: &Tensor<u32, { [-1, -1] }>,
-        cache: &Tensor<bf16, { [-1, -1, D] }>,
-        out: &mut Tensor<bf16, { [1, 1, D] }>,
-    ) {
-        let pid = get_tile_block_id();
-        let row_head = pid.0;
-        let position = pid.1;
-        let row = row_head / KV_HEADS;
-        let head = row_head % KV_HEADS;
-        let slot: Tile<u32, { [1, 1] }> = slots.partition(const_shape![1, 1]).load([row, position]);
-        let slot: Tile<i32, { [1, 1] }> = bitcast(slot);
-        let slot: i32 = tile_to_scalar(slot.reshape(const_shape![]));
-        let value: Tile<bf16, { [1, 1, D] }> = cache
-            .partition(const_shape![1, 1, D])
-            .load([slot, head, 0i32]);
-        out.store(value);
-    }
-
-    #[cutile::entry()]
-    fn gather_row_bf16<const BLOCK: i32>(
-        input: &Tensor<bf16, { [-1, -1] }>,
-        out: &mut Tensor<bf16, { [BLOCK] }>,
-        row: i32,
-    ) {
-        let block = get_tile_block_id().0;
-        let input = input.partition(const_shape![1, BLOCK]);
-        out.store(input.load([row, block]).reshape(const_shape![BLOCK]));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -381,13 +349,22 @@ mod tile {
         out.store(output);
     }
 
+    /// Ragged attention over the flat physical KV cache.
+    ///
+    /// Query rows are flattened across requests. `request_indices[row]`
+    /// selects one row of the padded logical-to-physical slot table, while
+    /// `context_lengths[row]` applies the causal boundary for that individual
+    /// query token. K/V are loaded directly through the physical slot map; no
+    /// per-layer gathered cache is materialized.
     #[allow(clippy::too_many_arguments)]
     #[cutile::entry()]
-    unsafe fn decode_attention_batch_bf16<const BN: i32, const D: i32, const KV_HEADS: i32>(
+    unsafe fn ragged_attention_bf16<const BN: i32, const D: i32, const KV_HEADS: i32>(
         query: &Tensor<bf16, { [-1, -1, D] }>,
-        key: &Tensor<bf16, { [-1, -1, D] }>,
-        value: &Tensor<bf16, { [-1, -1, D] }>,
+        request_indices: &Tensor<u32, { [-1] }>,
+        context_slots: &Tensor<u32, { [-1, -1] }>,
         context_lengths: &Tensor<i32, { [-1] }>,
+        key_cache_ptr: *mut bf16,
+        value_cache_ptr: *mut bf16,
         out: &mut Tensor<bf16, { [1, 1, D] }>,
         scale: f32,
         group_size: i32,
@@ -396,6 +373,10 @@ mod tile {
         let row = pid.0;
         let query_head = pid.1;
         let kv_head = query_head / group_size;
+        let request_index: Tile<u32, { [1] }> =
+            request_indices.partition(const_shape![1]).load([row]);
+        let request_index: Tile<i32, { [1] }> = bitcast(request_index);
+        let request_index: i32 = tile_to_scalar(request_index.reshape(const_shape![]));
         let context_len: i32 = tile_to_scalar(
             context_lengths
                 .partition(const_shape![1])
@@ -408,16 +389,45 @@ mod tile {
                 .load([row, query_head, 0i32])
                 .reshape(const_shape![1, D]),
         );
-        let key = key.partition(const_shape![1, BN, D]);
-        let value = value.partition(const_shape![1, BN, D]);
-        let row_head: i32 = row * KV_HEADS + kv_head;
+        let context_slots = context_slots.partition(const_shape![1, BN]);
         let mut row_max: Tile<f32, { [1, 1] }> = constant(-1.0e30f32, const_shape![1, 1]);
         let mut row_sum: Tile<f32, { [1, 1] }> = constant(0.0f32, const_shape![1, 1]);
         let mut accumulator: Tile<f32, { [1, D] }> = constant(0.0f32, const_shape![1, D]);
         let lane: Tile<i32, { [BN] }> = iota(const_shape![BN]);
         let lane: Tile<i32, { [1, BN] }> = lane.reshape(const_shape![1, BN]);
+        let element: Tile<i32, { [D] }> = iota(const_shape![D]);
+        let element: Tile<i32, { [1, 1, D] }> = element.reshape(const_shape![1, 1, D]);
+        let key_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(key_cache_ptr);
+        let key_base: PointerTile<*mut bf16, { [1, 1, 1] }> =
+            key_base.reshape(const_shape![1, 1, 1]);
+        let key_base: PointerTile<*mut bf16, { [1, BN, D] }> =
+            key_base.broadcast(const_shape![1, BN, D]);
+        let value_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(value_cache_ptr);
+        let value_base: PointerTile<*mut bf16, { [1, 1, 1] }> =
+            value_base.reshape(const_shape![1, 1, 1]);
+        let value_base: PointerTile<*mut bf16, { [1, BN, D] }> =
+            value_base.broadcast(const_shape![1, BN, D]);
+
         for block in 0i32..((context_len + BN - 1i32) / BN) {
-            let key_tile: Tile<bf16, { [1, BN, D] }> = key.load([row_head, block, 0i32]);
+            let slots: Tile<u32, { [1, BN] }> = context_slots.load([request_index, block]);
+            let slots: Tile<i32, { [1, BN] }> = bitcast(slots);
+            let shape = const_shape![1, BN];
+            let cache_row: Tile<i32, { [1, BN] }> =
+                (slots * KV_HEADS.broadcast(shape) + kv_head.broadcast(shape)) * D.broadcast(shape);
+            let offsets: Tile<i32, { [1, BN, D] }> = cache_row
+                .reshape(const_shape![1, BN, 1])
+                .broadcast(const_shape![1, BN, D])
+                + element.broadcast(const_shape![1, BN, D]);
+            let key_ptrs: PointerTile<*mut bf16, { [1, BN, D] }> = key_base.offset_tile(offsets);
+            let (key_tile, _): (Tile<bf16, { [1, BN, D] }>, Token) = load_ptr_tko(
+                key_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                None,
+                Latency::<0>,
+            );
             let key_tile: Tile<f32, { [BN, D] }> =
                 convert_tile(key_tile.reshape(const_shape![BN, D]));
             let key_tile: Tile<f32, { [D, BN] }> = key_tile.transpose();
@@ -441,7 +451,17 @@ mod tile {
             let correction: Tile<f32, { [1, 1] }> = exp(row_max - next_max);
             row_sum = row_sum * correction + block_sum;
             accumulator = accumulator * correction.broadcast(const_shape![1, D]);
-            let value_tile: Tile<bf16, { [1, BN, D] }> = value.load([row_head, block, 0i32]);
+            let value_ptrs: PointerTile<*mut bf16, { [1, BN, D] }> =
+                value_base.offset_tile(offsets);
+            let (value_tile, _): (Tile<bf16, { [1, BN, D] }>, Token) = load_ptr_tko(
+                value_ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                None,
+                Latency::<0>,
+            );
             let value_tile: Tile<bf16, { [BN, D] }> = value_tile.reshape(const_shape![BN, D]);
             let probabilities: Tile<bf16, { [1, BN] }> = convert_tile(probabilities);
             accumulator = mma(probabilities, value_tile, accumulator);
@@ -453,6 +473,35 @@ mod tile {
         let output: Tile<bf16, { [1, 1, D] }> =
             convert_tile(true_div(accumulator, denominator).reshape(const_shape![1, 1, D]));
         out.store(output);
+    }
+
+    #[cutile::entry()]
+    unsafe fn gather_rows_bf16<const WIDTH: i32, const BLOCK: i32>(
+        input_ptr: *mut bf16,
+        rows: &Tensor<u32, { [-1] }>,
+        out: &mut Tensor<bf16, { [1, BLOCK] }>,
+    ) {
+        let pid = get_tile_block_id();
+        let row: Tile<u32, { [1] }> = rows.partition(const_shape![1]).load([pid.0]);
+        let row: Tile<i32, { [1] }> = bitcast(row);
+        let row: i32 = tile_to_scalar(row.reshape(const_shape![]));
+        let offsets: Tile<i32, { [BLOCK] }> = (row * WIDTH + pid.1 * BLOCK)
+            .broadcast(const_shape![BLOCK])
+            + iota(const_shape![BLOCK]);
+        let input: PointerTile<*mut bf16, { [] }> = pointer_to_tile(input_ptr);
+        let input: PointerTile<*mut bf16, { [1] }> = input.reshape(const_shape![1]);
+        let input: PointerTile<*mut bf16, { [BLOCK] }> = input.broadcast(const_shape![BLOCK]);
+        let input = input.offset_tile(offsets);
+        let (values, _): (Tile<bf16, { [BLOCK] }>, Token) = load_ptr_tko(
+            input,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<0>,
+        );
+        out.store(values.reshape(const_shape![1, BLOCK]));
     }
 
     #[cutile::entry()]
@@ -598,7 +647,7 @@ mod tile {
 #[allow(unused_imports)]
 pub(crate) use tile::{
     add_rms_norm_bf16, argmax_blocks_batch_bf16, argmax_blocks_bf16, argmax_reduce_batch_bf16,
-    argmax_reduce_bf16, causal_attention_bf16, decode_attention_batch_bf16, embedding_bf16,
-    gather_flat_kv_bf16, gather_flat_kv_decode_batch_bf16, gather_row_bf16, rms_norm_bf16,
-    rope_kv_write_bf16, rope_q_bf16, silu_mul_bf16,
+    argmax_reduce_bf16, causal_attention_bf16, embedding_bf16, gather_flat_kv_bf16,
+    gather_rows_bf16, ragged_attention_bf16, rms_norm_bf16, rope_kv_write_bf16, rope_q_bf16,
+    silu_mul_bf16,
 };

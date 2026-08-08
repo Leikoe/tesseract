@@ -37,8 +37,19 @@ async fn main() -> anyhow::Result<()> {
     let model_path = config.model_path.clone();
     let device = config.device;
     let kv_capacity_tokens = config.kv_capacity_tokens;
+    let max_batch_tokens = config.max_batch_tokens;
+    let max_running = config.max_running;
     let engine = EngineHandle::spawn_with_factory(
-        move || model::load_cuda_backend(&model_id, &model_path, device, kv_capacity_tokens),
+        move || {
+            model::load_cuda_backend(
+                &model_id,
+                &model_path,
+                device,
+                kv_capacity_tokens,
+                max_batch_tokens,
+                max_running,
+            )
+        },
         engine_config,
         config.max_queue,
         Arc::clone(&metrics),

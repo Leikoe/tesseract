@@ -2,6 +2,13 @@
 
 Validated 2026-08-08 UTC (2026-08-07 America/Los_Angeles).
 
+> Historical evidence: this report applies only to revision
+> `9404e47a6c4bdd0881727a81a68793a34f2dc831`. The unified ragged-batching and
+> direct flat-KV redesign described in `batching-architecture.md` changes the
+> CUDA execution path. Its separate A100 validation and retained cold/warm
+> benchmark are in
+> [`validation/2026-08-08-a100-batching-redesign.md`](validation/2026-08-08-a100-batching-redesign.md).
+
 This report audits every item in [`v1-acceptance.md`](v1-acceptance.md). It
 distinguishes retained measurements from design claims and identifies the exact
 revision used for the final clean-checkout gate.

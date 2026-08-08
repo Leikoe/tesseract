@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use crate::model::{ChatMessage, IncrementalDecoder, Model, ModelError, ModelSummary};
 
 use super::{
-    Backend, BackendError, GenerateRequest, PreparedRequest, RequestId, ScheduledWork, StepOutput,
+    Backend, BackendError, GenerateRequest, PreparedRequest, RequestId, ScheduledBatch, StepOutput,
 };
 
 /// Deterministic token backend used only by API and scheduler tests.
@@ -46,12 +46,12 @@ impl Backend for DeterministicBackend {
         Ok(PreparedRequest { prompt_tokens })
     }
 
-    fn step(&mut self, batch: &[ScheduledWork]) -> Result<Vec<StepOutput>, BackendError> {
+    fn step(&mut self, batch: &ScheduledBatch) -> Result<Vec<StepOutput>, BackendError> {
         if !self.step_delay.is_zero() {
             std::thread::sleep(self.step_delay);
         }
         let mut outputs = Vec::new();
-        for work in batch {
+        for work in batch.work() {
             if !work.sample {
                 continue;
             }

@@ -33,6 +33,7 @@ cudarc = { version = "=0.19.2", default-features = false, features = ["std", "cu
 
 [dev-dependencies]
 http-body-util = "0.1"
+proptest = "1.11"
 tempfile = "3"
 
 [features]

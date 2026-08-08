@@ -159,6 +159,10 @@ def main() -> None:
     parser.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct")
     parser.add_argument("--model-path", type=pathlib.Path, required=True)
     parser.add_argument("--model-revision", required=True)
+    parser.add_argument(
+        "--source-revision",
+        help="explicit source label for Git-less snapshots (defaults to git rev-parse HEAD)",
+    )
     parser.add_argument("--server-args", required=True)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--requests", type=int, default=8)
@@ -199,7 +203,7 @@ def main() -> None:
         ),
         "cuda": command("nvcc", "--version").splitlines()[-1],
         "rust": command("rustc", "--version"),
-        "git_revision": command("git", "rev-parse", "HEAD"),
+        "git_revision": args.source_revision or command("git", "rev-parse", "HEAD"),
         "model": args.model,
         "model_revision": args.model_revision,
         "model_config_sha256": sha256(config_path),

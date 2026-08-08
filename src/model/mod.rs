@@ -86,10 +86,19 @@ pub fn load_cuda_backend(
     model_dir: &Path,
     device_id: usize,
     kv_capacity_tokens: usize,
+    max_batch_tokens: usize,
+    max_running: usize,
 ) -> Result<Box<dyn crate::engine::Backend>, ModelError> {
     crate::cuda::enable_persistent_cubin_cache()?;
     if llama_3_2::supports(model_id) {
-        return llama_3_2::load_cuda_backend(model_id, model_dir, device_id, kv_capacity_tokens);
+        return llama_3_2::load_cuda_backend(
+            model_id,
+            model_dir,
+            device_id,
+            kv_capacity_tokens,
+            max_batch_tokens,
+            max_running,
+        );
     }
     Err(ModelError::UnsupportedModel(model_id.into()))
 }

@@ -14,10 +14,11 @@ continuous batching, decode priority, deterministic cancellation, and a flat
 preallocated BF16 KV cache with explicit logical-to-physical slot maps.
 
 Linear algebra uses cuBLAS. cuTile Rust kernels implement embedding,
-normalization, RoPE, flat-KV writes/gathers, attention, activation, residuals,
-and greedy argmax. Stable decode shapes use full-model CUDA graph replay with a
-correct eager fallback. Aligned greedy requests are packed into one batched GPU
-forward. cuTile's persistent CUBIN cache is enabled at startup.
+normalization, RoPE, direct flat-KV attention, activation, residuals, and greedy
+argmax. The backend flattens prompt chunks and decode rows into one ragged model
+batch. Pure greedy decode uses full-model CUDA graph replay; prefill, mixed, and
+stochastic batches share a batched eager path. cuTile's persistent CUBIN cache
+is enabled at startup.
 
 ## Run on the validated A100 stack
 
@@ -84,6 +85,7 @@ and invokes the same `tesseract bench` Clap subcommand.
 ## Research notes
 
 - [Inference engine architecture reference](docs/inference-engine-architecture-reference.md) — vLLM, SGLang, and SGLang's 2026 unified KV-memory work.
+- [Batching architecture](docs/batching-architecture.md) — Tesseract's scheduler/backend contract, ragged tensor layout, execution modes, and validation gates.
 - [v1 acceptance contract](docs/v1-acceptance.md) — required serving, engine, correctness, and performance gates.
 - [v1 validation report](docs/v1-validation-report.md) — requirement-by-requirement evidence and measured A100 results.
 - [A100 node setup](docs/a100-node-setup.md) — reproducible bootstrap and verification for the spot-worker base image.

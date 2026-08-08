@@ -17,8 +17,8 @@ use crate::model::Model;
 use crate::{config::EngineConfig, metrics::Metrics};
 
 use super::{
-    Backend, FinishReason, GenerateRequest, GenerationEvent, RequestId, ScheduledWork, StepOutput,
-    Usage, kv::KvSlots,
+    Backend, FinishReason, GenerateRequest, GenerationEvent, RequestId, ScheduledBatch,
+    ScheduledWork, StepOutput, Usage, WorkPhase, kv::KvSlots,
 };
 
 #[derive(Debug, Error)]
@@ -363,7 +363,7 @@ impl<B: Backend> EngineWorker<B> {
             match result {
                 Ok(outputs) => self.apply_step(&batch, outputs),
                 Err(error) => {
-                    for work in batch {
+                    for work in batch.work() {
                         self.fail_request(work.request_id, error.to_string());
                     }
                 }
@@ -489,7 +489,7 @@ impl<B: Backend> EngineWorker<B> {
         self.update_gauges();
     }
 
-    fn build_batch(&mut self) -> Vec<ScheduledWork> {
+    fn build_batch(&mut self) -> ScheduledBatch {
         let mut budget = self.config.max_batch_tokens;
         let ids: Vec<_> = self.running.iter().copied().collect();
         let mut batch = Vec::with_capacity(ids.len());
@@ -521,6 +521,11 @@ impl<B: Backend> EngineWorker<B> {
                 };
                 batch.push(ScheduledWork {
                     request_id: *id,
+                    phase: if is_decode {
+                        WorkPhase::Decode
+                    } else {
+                        WorkPhase::Prefill
+                    },
                     position: state.computed_tokens,
                     num_tokens,
                     kv_slots,
@@ -535,10 +540,11 @@ impl<B: Backend> EngineWorker<B> {
         if self.running.len() > 1 {
             self.running.rotate_left(1);
         }
-        batch
+        ScheduledBatch::try_from_work(batch)
+            .expect("scheduler must construct a valid non-aliasing batch")
     }
 
-    fn apply_step(&mut self, batch: &[ScheduledWork], outputs: Vec<StepOutput>) {
+    fn apply_step(&mut self, batch: &ScheduledBatch, outputs: Vec<StepOutput>) {
         let mut outputs: HashMap<_, _> = outputs
             .into_iter()
             .map(|output| (output.request_id, output))
@@ -546,7 +552,7 @@ impl<B: Backend> EngineWorker<B> {
         let mut finish = Vec::new();
         let mut failed = Vec::new();
 
-        for work in batch {
+        for work in batch.work() {
             let Some(state) = self.requests.get_mut(&work.request_id) else {
                 continue;
             };
@@ -694,6 +700,7 @@ impl<B: Backend> EngineWorker<B> {
 mod tests {
     use super::*;
     use crate::engine::{GenerationParams, testing::DeterministicBackend};
+    use proptest::prelude::*;
     use std::collections::HashSet;
 
     fn config() -> EngineConfig {
@@ -966,5 +973,88 @@ mod tests {
         assert_eq!(first_batch[0].request_id, first_id);
         assert_eq!(second_batch.len(), 1);
         assert_eq!(second_batch[0].request_id, second_id);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn arbitrary_scheduler_runs_preserve_batch_and_kv_invariants(
+            requests in prop::collection::vec((1usize..16, 1usize..8), 1..7),
+            token_budget in 1usize..33,
+            prefill_chunk in 1usize..17,
+        ) {
+            let max_running = requests.len();
+            let token_budget = token_budget.max(max_running);
+            let mut test_config = config();
+            test_config.max_running = max_running;
+            test_config.max_batch_tokens = token_budget;
+            test_config.prefill_chunk_tokens = prefill_chunk;
+            test_config.max_sequence_length = 64;
+            test_config.kv_capacity_tokens = 512;
+            test_config.output_buffer = 128;
+
+            let metrics = Arc::new(Metrics::default());
+            let backend = DeterministicBackend::new("test-model");
+            let mut worker = EngineWorker::new(backend, test_config, metrics);
+            let mut receivers = Vec::with_capacity(requests.len());
+            let mut maximum_steps = 0usize;
+            for (prompt_tokens, max_tokens) in requests {
+                maximum_steps += prompt_tokens + max_tokens;
+                let (output, receiver) = mpsc::channel(128);
+                receivers.push(receiver);
+                let mut generated = request(max_tokens);
+                generated.prompt = (0..prompt_tokens)
+                    .map(|index| format!("token{index}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                worker.add_request(generated, output);
+            }
+            worker.admit_waiting();
+
+            let mut steps = 0usize;
+            while !worker.requests.is_empty() {
+                steps += 1;
+                prop_assert!(steps <= maximum_steps, "scheduler stopped making progress");
+                let before: HashMap<_, _> = worker
+                    .requests
+                    .iter()
+                    .map(|(id, state)| (*id, state.computed_tokens))
+                    .collect();
+                let batch = worker.build_batch();
+                prop_assert!(!batch.is_empty());
+                prop_assert!(batch.num_tokens() <= token_budget);
+                prop_assert_eq!(
+                    batch.query_start_offsets().last().copied(),
+                    Some(batch.num_tokens())
+                );
+                let work_is_valid = batch.work().iter().all(|work| {
+                    work.kv_slots.len() == work.num_tokens
+                        && match work.phase {
+                            WorkPhase::Prefill => work.num_tokens <= prefill_chunk,
+                            WorkPhase::Decode => work.num_tokens == 1 && work.sample,
+                        }
+                });
+                prop_assert!(work_is_valid);
+                let slots: HashSet<_> = batch
+                    .work()
+                    .iter()
+                    .flat_map(|work| work.kv_slots.iter().copied())
+                    .collect();
+                prop_assert_eq!(slots.len(), batch.num_tokens());
+
+                let outputs = worker.backend.step(&batch).unwrap();
+                prop_assert_eq!(
+                    outputs.len(),
+                    batch.work().iter().filter(|work| work.sample).count()
+                );
+                worker.apply_step(&batch, outputs);
+                prop_assert!(worker.kv.used() <= 512);
+                for (id, state) in &worker.requests {
+                    prop_assert!(state.computed_tokens >= before[id]);
+                }
+            }
+            prop_assert_eq!(worker.kv.used(), 0);
+        }
     }
 }

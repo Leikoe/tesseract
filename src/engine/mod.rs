@@ -7,7 +7,8 @@ mod types;
 pub mod testing;
 
 pub use backend::{
-    Backend, BackendError, BackendExecutionStats, PreparedRequest, ScheduledWork, StepOutput,
+    Backend, BackendError, BackendExecutionStats, PreparedRequest, ScheduledBatch,
+    ScheduledBatchError, ScheduledWork, StepOutput, WorkPhase,
 };
 pub use scheduler::{EngineHandle, EngineSpawnError, RequestStream, SubmitError};
 pub use types::{
