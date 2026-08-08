@@ -17,8 +17,8 @@ use crate::model::Model;
 use crate::{config::EngineConfig, metrics::Metrics};
 
 use super::{
-    Backend, FinishReason, GenerateRequest, GenerationEvent, RequestId, ScheduledBatch,
-    ScheduledWork, StepOutput, Usage, WorkPhase, kv::KvSlots,
+    Backend, FinishReason, ForwardBatch, ForwardPhase, ForwardSequence, GenerateRequest,
+    GenerationEvent, Position, RequestId, StepOutput, Usage, kv::KvSlots,
 };
 
 #[derive(Debug, Error)]
@@ -363,8 +363,8 @@ impl<B: Backend> EngineWorker<B> {
             match result {
                 Ok(outputs) => self.apply_step(&batch, outputs),
                 Err(error) => {
-                    for work in batch.work() {
-                        self.fail_request(work.request_id, error.to_string());
+                    for sequence in batch.sequences() {
+                        self.fail_request(sequence.request_id(), error.to_string());
                     }
                 }
             }
@@ -489,7 +489,7 @@ impl<B: Backend> EngineWorker<B> {
         self.update_gauges();
     }
 
-    fn build_batch(&mut self) -> ScheduledBatch {
+    fn build_batch(&mut self) -> ForwardBatch {
         let mut budget = self.config.max_batch_tokens;
         let ids: Vec<_> = self.running.iter().copied().collect();
         let mut batch = Vec::with_capacity(ids.len());
@@ -519,18 +519,20 @@ impl<B: Backend> EngineWorker<B> {
                 let Some(kv_slots) = self.kv.allocate(*id, num_tokens) else {
                     continue;
                 };
-                batch.push(ScheduledWork {
-                    request_id: *id,
-                    phase: if is_decode {
-                        WorkPhase::Decode
-                    } else {
-                        WorkPhase::Prefill
-                    },
-                    position: state.computed_tokens,
-                    num_tokens,
-                    kv_slots,
-                    sample: state.computed_tokens + num_tokens == state.target_tokens(),
-                });
+                batch.push(
+                    ForwardSequence::try_new(
+                        *id,
+                        if is_decode {
+                            ForwardPhase::Decode
+                        } else {
+                            ForwardPhase::Prefill
+                        },
+                        Position::new(state.computed_tokens),
+                        kv_slots,
+                        state.computed_tokens + num_tokens == state.target_tokens(),
+                    )
+                    .expect("scheduler must construct a valid forward sequence"),
+                );
                 budget -= num_tokens;
             }
         }
@@ -540,11 +542,11 @@ impl<B: Backend> EngineWorker<B> {
         if self.running.len() > 1 {
             self.running.rotate_left(1);
         }
-        ScheduledBatch::try_from_work(batch)
+        ForwardBatch::try_from_sequences(batch)
             .expect("scheduler must construct a valid non-aliasing batch")
     }
 
-    fn apply_step(&mut self, batch: &ScheduledBatch, outputs: Vec<StepOutput>) {
+    fn apply_step(&mut self, batch: &ForwardBatch, outputs: Vec<StepOutput>) {
         let mut outputs: HashMap<_, _> = outputs
             .into_iter()
             .map(|output| (output.request_id, output))
@@ -552,17 +554,17 @@ impl<B: Backend> EngineWorker<B> {
         let mut finish = Vec::new();
         let mut failed = Vec::new();
 
-        for work in batch.work() {
-            let Some(state) = self.requests.get_mut(&work.request_id) else {
+        for sequence in batch.sequences() {
+            let Some(state) = self.requests.get_mut(&sequence.request_id()) else {
                 continue;
             };
-            state.computed_tokens += work.num_tokens;
-            if !work.sample {
+            state.computed_tokens += sequence.num_tokens();
+            if !sequence.should_sample() {
                 continue;
             }
-            let Some(output) = outputs.remove(&work.request_id) else {
+            let Some(output) = outputs.remove(&sequence.request_id()) else {
                 failed.push((
-                    work.request_id,
+                    sequence.request_id(),
                     "backend omitted output for a sampled request".to_string(),
                 ));
                 continue;
@@ -588,7 +590,7 @@ impl<B: Backend> EngineWorker<B> {
                     })
                     .is_err()
             {
-                finish.push((work.request_id, FinishReason::Cancelled));
+                finish.push((sequence.request_id(), FinishReason::Cancelled));
                 continue;
             }
 
@@ -600,7 +602,7 @@ impl<B: Backend> EngineWorker<B> {
                 None
             };
             if let Some(reason) = reason {
-                finish.push((work.request_id, reason));
+                finish.push((sequence.request_id(), reason));
             }
         }
 
@@ -699,7 +701,7 @@ impl<B: Backend> EngineWorker<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{GenerationParams, testing::DeterministicBackend};
+    use crate::engine::{GenerationParams, QueryRow, testing::DeterministicBackend};
     use proptest::prelude::*;
     use std::collections::HashSet;
 
@@ -881,6 +883,55 @@ mod tests {
         panic!("shutdown request closed without a terminal cancellation");
     }
 
+    #[tokio::test]
+    async fn backend_failure_releases_state_and_the_engine_keeps_serving() {
+        let metrics = Arc::new(Metrics::default());
+        let mut single = config();
+        single.max_running = 1;
+        let engine = EngineHandle::spawn(
+            DeterministicBackend::new("test-model").failing_next_step(),
+            single,
+            8,
+            Arc::clone(&metrics),
+        )
+        .unwrap();
+
+        let mut failed = engine.try_generate(request(1)).unwrap();
+        assert!(matches!(
+            failed.recv().await,
+            Some(GenerationEvent::Failed { message }) if message.contains("injected step failure")
+        ));
+
+        let mut recovered = engine.try_generate(request(1)).unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(event) = recovered.recv().await {
+                if matches!(event, GenerationEvent::Finished { .. }) {
+                    return event;
+                }
+            }
+            panic!("recovery request closed without a terminal event");
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            terminal,
+            GenerationEvent::Finished {
+                reason: FinishReason::Length,
+                ..
+            }
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if metrics.prometheus().contains("tesseract_kv_tokens_used 0") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn batch_builder_preserves_budget_chunk_and_slot_invariants() {
         for budget in 3..=9 {
@@ -903,11 +954,13 @@ mod tests {
                 }
                 worker.admit_waiting();
                 let batch = worker.build_batch();
-                assert!(batch.iter().map(|work| work.num_tokens).sum::<usize>() <= budget);
-                assert!(batch.iter().all(|work| work.num_tokens <= chunk));
+                assert!(batch.iter().map(ForwardSequence::num_tokens).sum::<usize>() <= budget);
+                assert!(batch.iter().all(|sequence| {
+                    sequence.phase() == ForwardPhase::Decode || sequence.num_tokens() <= chunk
+                }));
                 let slots: Vec<_> = batch
                     .iter()
-                    .flat_map(|work| work.kv_slots.iter().copied())
+                    .flat_map(|sequence| sequence.kv_slots().iter().copied())
                     .collect();
                 assert_eq!(
                     slots.iter().copied().collect::<HashSet<_>>().len(),
@@ -916,7 +969,7 @@ mod tests {
                 assert!(
                     batch
                         .iter()
-                        .all(|work| work.kv_slots.len() == work.num_tokens)
+                        .all(|sequence| sequence.kv_slots().len() == sequence.num_tokens())
                 );
             }
         }
@@ -944,8 +997,12 @@ mod tests {
 
         let batch = worker.build_batch();
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].request_id, decode_id);
-        assert!(!batch.iter().any(|work| work.request_id == prefill_id));
+        assert_eq!(batch[0].request_id(), decode_id);
+        assert!(
+            !batch
+                .iter()
+                .any(|sequence| sequence.request_id() == prefill_id)
+        );
     }
 
     #[test]
@@ -970,9 +1027,9 @@ mod tests {
         let second_batch = worker.build_batch();
 
         assert_eq!(first_batch.len(), 1);
-        assert_eq!(first_batch[0].request_id, first_id);
+        assert_eq!(first_batch[0].request_id(), first_id);
         assert_eq!(second_batch.len(), 1);
-        assert_eq!(second_batch[0].request_id, second_id);
+        assert_eq!(second_batch[0].request_id(), second_id);
     }
 
     proptest! {
@@ -1025,28 +1082,39 @@ mod tests {
                 prop_assert!(!batch.is_empty());
                 prop_assert!(batch.num_tokens() <= token_budget);
                 prop_assert_eq!(
-                    batch.query_start_offsets().last().copied(),
+                    batch.query_start_offsets().last().copied().map(QueryRow::get),
                     Some(batch.num_tokens())
                 );
-                let work_is_valid = batch.work().iter().all(|work| {
-                    work.kv_slots.len() == work.num_tokens
-                        && match work.phase {
-                            WorkPhase::Prefill => work.num_tokens <= prefill_chunk,
-                            WorkPhase::Decode => work.num_tokens == 1 && work.sample,
+                let phases_are_partitioned = batch.sequences().windows(2).all(|pair| {
+                    pair[0].phase() != ForwardPhase::Decode
+                        || pair[1].phase() == ForwardPhase::Decode
+                });
+                prop_assert!(phases_are_partitioned);
+                let work_is_valid = batch.sequences().iter().all(|sequence| {
+                    sequence.kv_slots().len() == sequence.num_tokens()
+                        && match sequence.phase() {
+                            ForwardPhase::Prefill => sequence.num_tokens() <= prefill_chunk,
+                            ForwardPhase::Decode => {
+                                sequence.num_tokens() == 1 && sequence.should_sample()
+                            }
                         }
                 });
                 prop_assert!(work_is_valid);
                 let slots: HashSet<_> = batch
-                    .work()
+                    .sequences()
                     .iter()
-                    .flat_map(|work| work.kv_slots.iter().copied())
+                    .flat_map(|sequence| sequence.kv_slots().iter().copied())
                     .collect();
                 prop_assert_eq!(slots.len(), batch.num_tokens());
 
                 let outputs = worker.backend.step(&batch).unwrap();
                 prop_assert_eq!(
                     outputs.len(),
-                    batch.work().iter().filter(|work| work.sample).count()
+                    batch
+                        .sequences()
+                        .iter()
+                        .filter(|sequence| sequence.should_sample())
+                        .count()
                 );
                 worker.apply_step(&batch, outputs);
                 prop_assert!(worker.kv.used() <= 512);

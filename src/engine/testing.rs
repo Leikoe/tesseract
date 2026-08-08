@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use crate::model::{ChatMessage, IncrementalDecoder, Model, ModelError, ModelSummary};
 
 use super::{
-    Backend, BackendError, GenerateRequest, PreparedRequest, RequestId, ScheduledBatch, StepOutput,
+    Backend, BackendError, ForwardBatch, GenerateRequest, PreparedRequest, RequestId, StepOutput,
 };
 
 /// Deterministic token backend used only by API and scheduler tests.
@@ -11,6 +11,7 @@ pub struct DeterministicBackend {
     model: Arc<TestModel>,
     requests: HashMap<RequestId, TestRequest>,
     step_delay: Duration,
+    fail_next_step: bool,
 }
 
 struct TestRequest {
@@ -25,11 +26,17 @@ impl DeterministicBackend {
             }),
             requests: HashMap::new(),
             step_delay: Duration::ZERO,
+            fail_next_step: false,
         }
     }
 
     pub fn with_step_delay(mut self, step_delay: Duration) -> Self {
         self.step_delay = step_delay;
+        self
+    }
+
+    pub fn failing_next_step(mut self) -> Self {
+        self.fail_next_step = true;
         self
     }
 }
@@ -46,22 +53,28 @@ impl Backend for DeterministicBackend {
         Ok(PreparedRequest { prompt_tokens })
     }
 
-    fn step(&mut self, batch: &ScheduledBatch) -> Result<Vec<StepOutput>, BackendError> {
+    fn step(&mut self, batch: &ForwardBatch) -> Result<Vec<StepOutput>, BackendError> {
+        if std::mem::take(&mut self.fail_next_step) {
+            return Err(BackendError::Execution("injected step failure".into()));
+        }
         if !self.step_delay.is_zero() {
             std::thread::sleep(self.step_delay);
         }
         let mut outputs = Vec::new();
-        for work in batch.work() {
-            if !work.sample {
+        for sequence in batch.sequences() {
+            if !sequence.should_sample() {
                 continue;
             }
-            let request = self.requests.get_mut(&work.request_id).ok_or_else(|| {
-                BackendError::Execution(format!("unknown request {}", work.request_id))
-            })?;
+            let request = self
+                .requests
+                .get_mut(&sequence.request_id())
+                .ok_or_else(|| {
+                    BackendError::Execution(format!("unknown request {}", sequence.request_id()))
+                })?;
             let index = request.generated;
             request.generated += 1;
             outputs.push(StepOutput {
-                request_id: work.request_id,
+                request_id: sequence.request_id(),
                 token_id: Some(1000 + index as u32),
                 text: format!(" token{index}"),
                 is_eos: false,

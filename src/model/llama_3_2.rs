@@ -327,8 +327,8 @@ mod cuda_impl {
     use crate::{
         cuda::{cublas, kernels},
         engine::{
-            Backend, BackendError, BackendExecutionStats, GenerateRequest, PreparedRequest,
-            RequestId, ScheduledBatch, StepOutput,
+            Backend, BackendError, BackendExecutionStats, ForwardBatch, GenerateRequest,
+            PreparedRequest, RequestId, SequenceIndex, StepOutput,
         },
         model::{IncrementalDecoder, Model},
     };
@@ -2151,7 +2151,7 @@ mod cuda_impl {
             Ok(PreparedRequest { prompt_tokens })
         }
 
-        fn step(&mut self, batch: &ScheduledBatch) -> Result<Vec<StepOutput>, BackendError> {
+        fn step(&mut self, batch: &ForwardBatch) -> Result<Vec<StepOutput>, BackendError> {
             let mut token_ids = Vec::with_capacity(batch.num_tokens());
             let mut positions = Vec::with_capacity(batch.num_tokens());
             let mut current_slots = Vec::with_capacity(batch.num_tokens());
@@ -2162,20 +2162,21 @@ mod cuda_impl {
             let mut sample_request_ids = Vec::new();
             let mut all_samples_greedy = true;
 
-            for (request_index, work) in batch.work().iter().enumerate() {
-                let request = self.requests.get(&work.request_id).ok_or_else(|| {
-                    BackendError::Execution(format!("unknown request {}", work.request_id))
+            for (request_index, sequence) in batch.sequences().iter().enumerate() {
+                let request = self.requests.get(&sequence.request_id()).ok_or_else(|| {
+                    BackendError::Execution(format!("unknown request {}", sequence.request_id()))
                 })?;
-                if work.position != request.slots.len() {
+                if sequence.position().get() != request.slots.len() {
                     return Err(BackendError::Execution(format!(
                         "invalid schedule metadata for request {}",
-                        work.request_id
+                        sequence.request_id()
                     )));
                 }
 
-                let end = work
-                    .position
-                    .checked_add(work.num_tokens)
+                let end = sequence
+                    .position()
+                    .get()
+                    .checked_add(sequence.num_tokens())
                     .ok_or_else(|| BackendError::Execution("token position overflowed".into()))?;
                 let available = request.prompt.len() + request.generated.len();
                 if end > available {
@@ -2183,11 +2184,11 @@ mod cuda_impl {
                         "scheduled tokens {end} exceed request token state {available}"
                     )));
                 }
-                let request_index = u32::try_from(request_index)
-                    .map_err(|_| BackendError::Execution("batch exceeds u32".into()))?;
-                let query_range = batch.query_range(request_index as usize);
-                request_indices.extend(std::iter::repeat_n(request_index, query_range.len()));
-                for position in work.position..end {
+                let request_index = SequenceIndex::try_from_usize(request_index)
+                    .map_err(|error| BackendError::Execution(error.to_string()))?;
+                let query_range = batch.query_range(request_index);
+                request_indices.extend(std::iter::repeat_n(request_index.get(), query_range.len()));
+                for position in sequence.position().get()..end {
                     token_ids.push(if position < request.prompt.len() {
                         request.prompt[position]
                     } else {
@@ -2203,17 +2204,17 @@ mod cuda_impl {
                         BackendError::Execution("token context length exceeds i32".into())
                     })?);
                 }
-                current_slots.extend_from_slice(&work.kv_slots);
+                current_slots.extend(sequence.kv_slots().iter().map(|slot| slot.get()));
                 let mut context = request.slots.clone();
-                context.extend_from_slice(&work.kv_slots);
+                context.extend(sequence.kv_slots().iter().map(|slot| slot.get()));
                 contexts.push(context);
-                if work.sample {
+                if sequence.should_sample() {
                     sample_rows.push(
                         u32::try_from(query_range.end - 1).map_err(|_| {
                             BackendError::Execution("sample row exceeds u32".into())
                         })?,
                     );
-                    sample_request_ids.push(work.request_id);
+                    sample_request_ids.push(sequence.request_id());
                     all_samples_greedy &= request.temperature == 0.0;
                 }
             }
@@ -2258,11 +2259,19 @@ mod cuda_impl {
             // Commit logical KV state only after the model forward succeeds. The
             // physical cache writes are disposable when execution fails because
             // the scheduler releases the affected requests' reservations.
-            for work in batch.work() {
-                let request = self.requests.get_mut(&work.request_id).ok_or_else(|| {
-                    BackendError::Execution(format!("unknown request {}", work.request_id))
-                })?;
-                request.slots.extend_from_slice(&work.kv_slots);
+            for sequence in batch.sequences() {
+                let request = self
+                    .requests
+                    .get_mut(&sequence.request_id())
+                    .ok_or_else(|| {
+                        BackendError::Execution(format!(
+                            "unknown request {}",
+                            sequence.request_id()
+                        ))
+                    })?;
+                request
+                    .slots
+                    .extend(sequence.kv_slots().iter().map(|slot| slot.get()));
             }
 
             let sampled_tokens = match forward {

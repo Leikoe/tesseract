@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use super::RequestId;
+use super::{KvSlot, RequestId};
 
 #[derive(Debug)]
 pub struct KvSlots {
-    free: Vec<u32>,
-    allocations: HashMap<RequestId, Vec<u32>>,
+    free: Vec<KvSlot>,
+    allocations: HashMap<RequestId, Vec<KvSlot>>,
     reserved_remaining: HashMap<RequestId, usize>,
 }
 
@@ -13,7 +13,7 @@ impl KvSlots {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity <= u32::MAX as usize);
         Self {
-            free: (0..capacity as u32).rev().collect(),
+            free: (0..capacity as u32).rev().map(KvSlot::new).collect(),
             allocations: HashMap::new(),
             reserved_remaining: HashMap::new(),
         }
@@ -44,7 +44,7 @@ impl KvSlots {
         true
     }
 
-    pub fn allocate(&mut self, request_id: RequestId, tokens: usize) -> Option<Vec<u32>> {
+    pub fn allocate(&mut self, request_id: RequestId, tokens: usize) -> Option<Vec<KvSlot>> {
         let remaining = self.reserved_remaining.get_mut(&request_id)?;
         if tokens > *remaining || tokens > self.free.len() {
             return None;
@@ -68,7 +68,7 @@ impl KvSlots {
     }
 
     #[cfg(test)]
-    fn request_slots(&self, request_id: RequestId) -> &[u32] {
+    fn request_slots(&self, request_id: RequestId) -> &[KvSlot] {
         self.allocations
             .get(&request_id)
             .map(Vec::as_slice)

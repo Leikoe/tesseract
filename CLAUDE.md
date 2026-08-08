@@ -467,3 +467,7 @@ I want you to clone tokenspeed in references/ too
 ```text
 I want you to explore tokenspeed vs our ideas so far
 ```
+
+```text
+make tesseract great with everything we learned
+```
