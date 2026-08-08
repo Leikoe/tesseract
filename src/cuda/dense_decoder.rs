@@ -24,10 +24,7 @@ use crate::{
         batch::CudaBatch,
         cublas,
         executor::{CudaExecutor, ModelProgram, ProgramOutput},
-        kernel_plan::{
-            AttentionKernelPlan, ComputeCapability, DecoderKernelRequirement, KernelCatalog,
-            KernelPlan,
-        },
+        kernel_plan::{ComputeCapability, DecoderKernelRequirement, KernelCatalog, KernelPlan},
         kernels,
     },
     engine::{ExecutionError, ExecutionStats, ModelExecutor, TokenId},
