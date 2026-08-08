@@ -6,6 +6,7 @@ TESSERACT_REPO_PATH="${TESSERACT_REPO_PATH:-$(cd -- "${TESSERACT_SCRIPT_DIR}/../
 TESSERACT_RUST_TOOLCHAIN="${TESSERACT_RUST_TOOLCHAIN:-1.89.0}"
 TESSERACT_CUDA_PATH="${TESSERACT_CUDA_PATH:-/usr/local/cuda-13.3}"
 TESSERACT_MODEL_ID="${TESSERACT_MODEL_ID:-meta-llama/Llama-3.2-1B-Instruct}"
+TESSERACT_MODEL_REVISION="${TESSERACT_MODEL_REVISION:-9213176726f574b556790deb65791e0c5aa438b6}"
 TESSERACT_MODEL_PATH="${TESSERACT_MODEL_PATH:-/home/ubuntu/models/Llama-3.2-1B-Instruct}"
 
 if [[ "$(. /etc/os-release && printf '%s' "${ID}:${VERSION_ID}")" != "ubuntu:22.04" ]]; then
@@ -77,6 +78,7 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
 fi
 mkdir -p "$(dirname -- "${TESSERACT_MODEL_PATH}")"
 "${HOME}/.venvs/hf/bin/hf" download "${TESSERACT_MODEL_ID}" \
+  --revision "${TESSERACT_MODEL_REVISION}" \
   --local-dir "${TESSERACT_MODEL_PATH}"
 
 "${TESSERACT_SCRIPT_DIR}/verify-a100.sh"

@@ -112,5 +112,6 @@ The scripts accept prefixed environment overrides:
 | `TESSERACT_RUST_TOOLCHAIN` | `1.89.0` |
 | `TESSERACT_CUDA_PATH` | `/usr/local/cuda-13.3` |
 | `TESSERACT_MODEL_ID` | `meta-llama/Llama-3.2-1B-Instruct` |
+| `TESSERACT_MODEL_REVISION` | `9213176726f574b556790deb65791e0c5aa438b6` |
 | `TESSERACT_MODEL_PATH` | `/home/ubuntu/models/Llama-3.2-1B-Instruct` |
 | `TESSERACT_CUTILE_COMMIT` | known-good commit recorded in the scripts |
