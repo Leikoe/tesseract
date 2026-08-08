@@ -5,6 +5,7 @@ use serde::Deserialize;
 use super::{
     ArchitectureFactory, ChatMessage, ChatRole, IncrementalDecoder, Model, ModelError,
     ModelManifest, ModelSummary, read_file,
+    tokenizer::Tokenizer,
     weights::{SafeTensorSource, WeightSource},
 };
 
@@ -208,58 +209,12 @@ impl Config {
     }
 }
 
-struct Tokenizer {
-    inner: Arc<tokenizers::Tokenizer>,
-}
-
 const TOKENIZER_WARMUP_TEXT: &str = concat!(
     "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
     "You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n",
     "Warm tokenizer paths: abc XYZ 0123456789, punctuation !?; café 東京 😀\n",
     "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
 );
-
-impl Tokenizer {
-    fn load(model_dir: &Path) -> Result<Self, ModelError> {
-        let path = model_dir.join("tokenizer.json");
-        let inner = tokenizers::Tokenizer::from_file(&path)
-            .map_err(|error| ModelError::Tokenizer(error.to_string()))?;
-        Ok(Self {
-            inner: Arc::new(inner),
-        })
-    }
-
-    fn encode(&self, text: &str) -> Result<Vec<u32>, ModelError> {
-        self.inner
-            .encode(text, true)
-            .map(|encoding| encoding.get_ids().to_vec())
-            .map_err(|error| ModelError::Tokenizer(error.to_string()))
-    }
-
-    fn warm(&self) -> Result<(), ModelError> {
-        let token_ids = self.encode(TOKENIZER_WARMUP_TEXT)?;
-        if token_ids.is_empty() {
-            return Err(ModelError::Tokenizer(
-                "tokenizer warmup produced no tokens".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn decode(&self, ids: &[u32]) -> Result<String, ModelError> {
-        self.inner
-            .decode(ids, true)
-            .map_err(|error| ModelError::Tokenizer(error.to_string()))
-    }
-}
-
-impl Clone for Tokenizer {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
 
 pub(super) struct Llama32 {
     id: String,
@@ -279,7 +234,7 @@ impl Llama32 {
         // the first admitted request leaves the A100 idle for hundreds of
         // milliseconds. Readiness includes representative tokenizer paths so
         // the first user request sees steady-state preprocessing latency.
-        tokenizer.warm()?;
+        tokenizer.warm(TOKENIZER_WARMUP_TEXT)?;
         Ok(Self {
             id: model_id.into(),
             config,
@@ -355,11 +310,7 @@ impl Model for Llama32 {
     }
 
     fn decoder(&self) -> Box<dyn IncrementalDecoder> {
-        Box::new(Decoder {
-            tokenizer: self.tokenizer.clone(),
-            token_ids: Vec::new(),
-            decoded: String::new(),
-        })
+        self.tokenizer.incremental_decoder()
     }
 
     fn eos_token_ids(&self) -> &[u32] {
@@ -408,25 +359,6 @@ fn render_chat(messages: &[ChatMessage<'_>]) -> Result<String, ModelError> {
     }
     prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
     Ok(prompt)
-}
-
-struct Decoder {
-    tokenizer: Tokenizer,
-    token_ids: Vec<u32>,
-    decoded: String,
-}
-
-impl IncrementalDecoder for Decoder {
-    fn push(&mut self, token_id: u32) -> Result<String, ModelError> {
-        self.token_ids.push(token_id);
-        let decoded = self.tokenizer.decode(&self.token_ids)?;
-        let delta = decoded
-            .strip_prefix(&self.decoded)
-            .unwrap_or(&decoded)
-            .to_owned();
-        self.decoded = decoded;
-        Ok(delta)
-    }
 }
 
 fn validate_weights(weights: &dyn WeightSource, config: &Config) -> Result<(), ModelError> {
