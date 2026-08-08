@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
+
+use crate::model::{ChatMessage, IncrementalDecoder, Model, ModelError, ModelSummary};
 
 use super::{
     Backend, BackendError, GenerateRequest, PreparedRequest, RequestId, ScheduledWork, StepOutput,
@@ -6,7 +8,7 @@ use super::{
 
 /// Deterministic token backend used only by API and scheduler tests.
 pub struct DeterministicBackend {
-    model_id: String,
+    model: Arc<TestModel>,
     requests: HashMap<RequestId, TestRequest>,
 }
 
@@ -17,15 +19,17 @@ struct TestRequest {
 impl DeterministicBackend {
     pub fn new(model_id: impl Into<String>) -> Self {
         Self {
-            model_id: model_id.into(),
+            model: Arc::new(TestModel {
+                id: model_id.into(),
+            }),
             requests: HashMap::new(),
         }
     }
 }
 
 impl Backend for DeterministicBackend {
-    fn model_id(&self) -> &str {
-        &self.model_id
+    fn model(&self) -> Arc<dyn Model> {
+        self.model.clone()
     }
 
     fn add_request(&mut self, request: &GenerateRequest) -> Result<PreparedRequest, BackendError> {
@@ -58,5 +62,62 @@ impl Backend for DeterministicBackend {
 
     fn remove_request(&mut self, request_id: RequestId) {
         self.requests.remove(&request_id);
+    }
+}
+
+struct TestModel {
+    id: String,
+}
+
+impl Model for TestModel {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn render_chat(&self, messages: &[ChatMessage<'_>]) -> Result<String, ModelError> {
+        if messages.is_empty() {
+            return Err(ModelError::InvalidInput(
+                "messages must not be empty".into(),
+            ));
+        }
+        Ok(messages
+            .iter()
+            .map(|message| message.content)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<u32>, ModelError> {
+        Ok((0..text.split_whitespace().count().max(1) as u32).collect())
+    }
+
+    fn decoder(&self) -> Box<dyn IncrementalDecoder> {
+        Box::new(TestDecoder)
+    }
+
+    fn eos_token_ids(&self) -> &[u32] {
+        &[]
+    }
+
+    fn summary(&self) -> ModelSummary {
+        ModelSummary {
+            id: self.id.clone(),
+            architecture: "deterministic-test-model".into(),
+            dtype: "none".into(),
+            layers: 0,
+            hidden_size: 0,
+            attention_heads: 0,
+            kv_heads: 0,
+            vocab_size: 0,
+            tensors: 0,
+        }
+    }
+}
+
+struct TestDecoder;
+
+impl IncrementalDecoder for TestDecoder {
+    fn push(&mut self, token_id: u32) -> Result<String, ModelError> {
+        Ok(format!(" token{token_id}"))
     }
 }

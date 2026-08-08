@@ -8,6 +8,7 @@ use std::{
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::model::Model;
 use crate::{config::EngineConfig, metrics::Metrics};
 
 use super::{
@@ -42,6 +43,7 @@ enum Command {
 pub struct EngineHandle {
     commands: mpsc::Sender<Command>,
     metrics: Arc<Metrics>,
+    model: Arc<dyn Model>,
     model_id: Arc<str>,
     output_buffer: usize,
 }
@@ -53,7 +55,8 @@ impl EngineHandle {
         command_capacity: usize,
         metrics: Arc<Metrics>,
     ) -> Result<Self, EngineSpawnError> {
-        let model_id: Arc<str> = Arc::from(backend.model_id());
+        let model = backend.model();
+        let model_id: Arc<str> = Arc::from(model.id());
         let output_buffer = config.output_buffer;
         let (commands_tx, commands_rx) = mpsc::channel(command_capacity);
         let worker_metrics = Arc::clone(&metrics);
@@ -64,6 +67,7 @@ impl EngineHandle {
         Ok(Self {
             commands: commands_tx,
             metrics,
+            model,
             model_id,
             output_buffer,
         })
@@ -71,6 +75,10 @@ impl EngineHandle {
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    pub fn model(&self) -> &Arc<dyn Model> {
+        &self.model
     }
 
     pub fn metrics(&self) -> &Arc<Metrics> {

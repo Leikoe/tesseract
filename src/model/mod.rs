@@ -1,17 +1,63 @@
-mod config;
-mod tokenizer;
+mod llama_3_2;
 mod weights;
 
-use std::{io, path::PathBuf};
+use std::{io, path::Path, path::PathBuf, sync::Arc};
 
 use thiserror::Error;
 
-pub use config::{LlamaConfig, RopeScaling};
-pub use tokenizer::{IncrementalDecoder, LlamaTokenizer};
-pub use weights::WeightStore;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    System,
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ChatMessage<'a> {
+    pub role: ChatRole,
+    pub content: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSummary {
+    pub id: String,
+    pub architecture: String,
+    pub dtype: String,
+    pub layers: usize,
+    pub hidden_size: usize,
+    pub attention_heads: usize,
+    pub kv_heads: usize,
+    pub vocab_size: usize,
+    pub tensors: usize,
+}
+
+pub trait IncrementalDecoder: Send {
+    fn push(&mut self, token_id: u32) -> Result<String, ModelError>;
+}
+
+/// Model-neutral contract used by serving and scheduling code. Architecture
+/// details, prompt syntax, tensor names, and model-specific validation stay in
+/// the implementing model's source file.
+pub trait Model: Send + Sync {
+    fn id(&self) -> &str;
+    fn render_chat(&self, messages: &[ChatMessage<'_>]) -> Result<String, ModelError>;
+    fn encode(&self, text: &str) -> Result<Vec<u32>, ModelError>;
+    fn decoder(&self) -> Box<dyn IncrementalDecoder>;
+    fn eos_token_ids(&self) -> &[u32];
+    fn summary(&self) -> ModelSummary;
+}
+
+pub fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
+    if llama_3_2::supports(model_id) {
+        return llama_3_2::load(model_id, model_dir).map(|model| Arc::new(model) as Arc<dyn Model>);
+    }
+    Err(ModelError::UnsupportedModel(model_id.into()))
+}
 
 #[derive(Debug, Error)]
 pub enum ModelError {
+    #[error("unsupported model `{0}`")]
+    UnsupportedModel(String),
     #[error("failed to access `{path}`: {source}")]
     Io {
         path: PathBuf,
@@ -26,6 +72,8 @@ pub enum ModelError {
     },
     #[error("invalid model configuration: {0}")]
     InvalidConfig(String),
+    #[error("invalid model input: {0}")]
+    InvalidInput(String),
     #[error("failed to load tokenizer: {0}")]
     Tokenizer(String),
     #[error("invalid SafeTensors file `{path}`: {message}")]
@@ -45,7 +93,7 @@ pub enum ModelError {
     },
 }
 
-pub(crate) fn read_file(path: &std::path::Path) -> Result<String, ModelError> {
+pub(crate) fn read_file(path: &Path) -> Result<String, ModelError> {
     std::fs::read_to_string(path).map_err(|source| ModelError::Io {
         path: path.to_path_buf(),
         source,

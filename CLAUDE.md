@@ -100,3 +100,7 @@ error types should probably be using thiserror.
 ```text
 you can use the safetensors library if you want OR build your own safetensors support if you can justify it.
 ```
+
+```text
+we will support different models. a model shouldn't leak outside it's own file.
+```

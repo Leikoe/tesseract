@@ -16,6 +16,7 @@ use crate::{
     engine::{
         FinishReason, GenerateRequest, GenerationEvent, GenerationParams, SubmitError, Usage,
     },
+    model::{ChatMessage, ChatRole},
 };
 
 const DEFAULT_MAX_TOKENS: usize = 128;
@@ -26,16 +27,6 @@ pub enum Role {
     System,
     User,
     Assistant,
-}
-
-impl Role {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::User => "user",
-            Self::Assistant => "assistant",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -138,7 +129,23 @@ pub async fn chat_completions(
             request.model
         )));
     }
-    let prompt = render_llama3_chat(&request.messages)?;
+    let model_messages: Vec<_> = request
+        .messages
+        .iter()
+        .map(|message| ChatMessage {
+            role: match message.role {
+                Role::System => ChatRole::System,
+                Role::User => ChatRole::User,
+                Role::Assistant => ChatRole::Assistant,
+            },
+            content: &message.content,
+        })
+        .collect();
+    let prompt = state
+        .engine
+        .model()
+        .render_chat(&model_messages)
+        .map_err(|error| ApiError::InvalidRequest(error.to_string()))?;
     let id = Uuid::now_v7();
     let max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
     let params = GenerationParams {
@@ -275,62 +282,9 @@ async fn streaming_response(
     Sse::new(events).into_response()
 }
 
-fn render_llama3_chat(messages: &[Message]) -> Result<String, ApiError> {
-    if messages.is_empty() {
-        return Err(ApiError::InvalidRequest(
-            "messages must contain at least one item".into(),
-        ));
-    }
-    if messages.iter().any(|message| message.content.is_empty()) {
-        return Err(ApiError::InvalidRequest(
-            "message content must not be empty".into(),
-        ));
-    }
-
-    let mut prompt = String::from("<|begin_of_text|>");
-    for message in messages {
-        prompt.push_str("<|start_header_id|>");
-        prompt.push_str(message.role.as_str());
-        prompt.push_str("<|end_header_id|>\n\n");
-        prompt.push_str(&message.content);
-        prompt.push_str("<|eot_id|>");
-    }
-    prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
-    Ok(prompt)
-}
-
 fn unix_timestamp() -> u64 {
     SystemTime::UNIX_EPOCH
         .elapsed()
         .unwrap_or_default()
         .as_secs()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn renders_llama3_chat_template() {
-        let prompt = render_llama3_chat(&[
-            Message {
-                role: Role::System,
-                content: "Be terse.".into(),
-            },
-            Message {
-                role: Role::User,
-                content: "Hello".into(),
-            },
-        ])
-        .unwrap();
-        assert_eq!(
-            prompt,
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nBe terse.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        );
-    }
-
-    #[test]
-    fn rejects_empty_messages() {
-        assert!(render_llama3_chat(&[]).is_err());
-    }
 }

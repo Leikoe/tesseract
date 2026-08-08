@@ -1,4 +1,8 @@
+use std::sync::Arc;
+
 use thiserror::Error;
+
+use crate::model::Model;
 
 use super::{GenerateRequest, RequestId};
 
@@ -35,7 +39,7 @@ pub struct StepOutput {
 }
 
 pub trait Backend: Send + 'static {
-    fn model_id(&self) -> &str;
+    fn model(&self) -> Arc<dyn Model>;
 
     fn add_request(&mut self, request: &GenerateRequest) -> Result<PreparedRequest, BackendError>;
 
