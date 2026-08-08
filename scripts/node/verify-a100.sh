@@ -31,6 +31,8 @@ cargo +"${TESSERACT_RUST_TOOLCHAIN}" run --release --bin model-check -- \
   --model-path "${TESSERACT_MODEL_PATH}"
 cargo +"${TESSERACT_RUST_TOOLCHAIN}" run --release --features cuda \
   --bin cuda-check
+cargo +"${TESSERACT_RUST_TOOLCHAIN}" run --release --features cuda \
+  --bin model-cuda-check -- --model-path "${TESSERACT_MODEL_PATH}"
 
 mkdir -p "$(dirname -- "${TESSERACT_CUTILE_PATH}")"
 if [[ ! -d "${TESSERACT_CUTILE_PATH}/.git" ]]; then

@@ -81,6 +81,46 @@ impl WeightStore {
         self.weight_map.len()
     }
 
+    #[cfg(feature = "cuda")]
+    pub(super) fn names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.weight_map.keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn load_device_bf16(
+        &self,
+        name: &str,
+        stream: &std::sync::Arc<cuda_core::Stream>,
+    ) -> Result<cutile::tensor::Tensor<cutile::core::bf16>, ModelError> {
+        use cuda_async::device_operation::DeviceOp;
+        use cutile::tensor::Reshape;
+
+        let view = self.tensor(name)?;
+        if view.dtype() != Dtype::BF16 {
+            return Err(ModelError::WrongDtype {
+                name: name.into(),
+                actual: view.dtype(),
+            });
+        }
+        let shape = view.shape().to_vec();
+        let host = std::sync::Arc::new(
+            view.data()
+                .chunks_exact(2)
+                .map(|bytes| {
+                    cutile::core::bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]]))
+                })
+                .collect::<Vec<_>>(),
+        );
+        let tensor = cutile::api::copy_host_vec_to_device(&host)
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("upload `{name}`: {error:?}")))?;
+        tensor
+            .reshape(&shape)
+            .map_err(|error| ModelError::Cuda(format!("reshape `{name}`: {error:?}")))
+    }
+
     pub(super) fn validate_bf16(&self, name: &str, expected: &[usize]) -> Result<(), ModelError> {
         let tensor = self.tensor(name)?;
         if tensor.dtype() != Dtype::BF16 {

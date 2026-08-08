@@ -7,6 +7,9 @@ use super::{
     weights::WeightStore,
 };
 
+#[cfg(feature = "cuda")]
+use super::CudaModelReport;
+
 const MODEL_ID: &str = "meta-llama/Llama-3.2-1B-Instruct";
 
 pub(super) fn supports(model_id: &str) -> bool {
@@ -15,6 +18,62 @@ pub(super) fn supports(model_id: &str) -> bool {
 
 pub(super) fn load(model_id: &str, model_dir: &Path) -> Result<Llama32, ModelError> {
     Llama32::load(model_id, model_dir)
+}
+
+#[cfg(feature = "cuda")]
+pub(super) fn validate_cuda(
+    model_id: &str,
+    model_dir: &Path,
+    device_id: usize,
+) -> Result<CudaModelReport, ModelError> {
+    use cuda_core::Device;
+    use cutile::tensor::ToHostVec;
+
+    let model = Llama32::load(model_id, model_dir)?;
+    let device = Device::new(device_id)
+        .map_err(|error| ModelError::Cuda(format!("initialize device {device_id}: {error:?}")))?;
+    let stream = device
+        .new_stream()
+        .map_err(|error| ModelError::Cuda(format!("create stream: {error:?}")))?;
+
+    let names = model.weights.names();
+    let mut device_weights = std::collections::HashMap::with_capacity(names.len());
+    let mut bytes = 0usize;
+    for name in names {
+        let tensor = model.weights.load_device_bf16(&name, &stream)?;
+        bytes = bytes
+            .checked_add(tensor.num_bytes())
+            .ok_or_else(|| ModelError::Cuda("device weight byte count overflowed".into()))?;
+        device_weights.insert(name, tensor);
+    }
+
+    // Verify one architecture-owned tensor bit-for-bit after its H2D/D2H
+    // round trip. The remaining tensors went through the same typed path and
+    // remain resident until this function returns.
+    let name = "model.norm.weight";
+    let expected = model.weights.tensor(name)?;
+    let actual: Vec<cutile::core::bf16> = device_weights
+        .get(name)
+        .ok_or_else(|| ModelError::MissingTensor(name.into()))?
+        .to_host_vec()
+        .sync_on(&stream)
+        .map_err(|error| ModelError::Cuda(format!("verify `{name}`: {error:?}")))?;
+    let matches = actual
+        .iter()
+        .zip(expected.data().chunks_exact(2))
+        .all(|(actual, bytes)| actual.to_bits() == u16::from_le_bytes([bytes[0], bytes[1]]));
+    if !matches || actual.len() * 2 != expected.data().len() {
+        return Err(ModelError::Cuda(format!(
+            "BF16 round-trip mismatch for `{name}`"
+        )));
+    }
+
+    Ok(CudaModelReport {
+        model_id: model.id,
+        device_id,
+        tensors: device_weights.len(),
+        bytes,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -54,3 +54,8 @@ path = "src/bin/model-check.rs"
 name = "cuda-check"
 path = "src/bin/cuda-check.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "model-cuda-check"
+path = "src/bin/model-cuda-check.rs"
+required-features = ["cuda"]

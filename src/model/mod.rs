@@ -31,6 +31,15 @@ pub struct ModelSummary {
     pub tensors: usize,
 }
 
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaModelReport {
+    pub model_id: String,
+    pub device_id: usize,
+    pub tensors: usize,
+    pub bytes: usize,
+}
+
 pub trait IncrementalDecoder: Send {
     fn push(&mut self, token_id: u32) -> Result<String, ModelError>;
 }
@@ -50,6 +59,18 @@ pub trait Model: Send + Sync {
 pub fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
     if llama_3_2::supports(model_id) {
         return llama_3_2::load(model_id, model_dir).map(|model| Arc::new(model) as Arc<dyn Model>);
+    }
+    Err(ModelError::UnsupportedModel(model_id.into()))
+}
+
+#[cfg(feature = "cuda")]
+pub fn validate_cuda_model(
+    model_id: &str,
+    model_dir: &Path,
+    device_id: usize,
+) -> Result<CudaModelReport, ModelError> {
+    if llama_3_2::supports(model_id) {
+        return llama_3_2::validate_cuda(model_id, model_dir, device_id);
     }
     Err(ModelError::UnsupportedModel(model_id.into()))
 }
@@ -91,6 +112,8 @@ pub enum ModelError {
         expected: Vec<usize>,
         actual: Vec<usize>,
     },
+    #[error("CUDA model operation failed: {0}")]
+    Cuda(String),
 }
 
 pub(crate) fn read_file(path: &Path) -> Result<String, ModelError> {
