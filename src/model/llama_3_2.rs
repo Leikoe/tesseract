@@ -26,6 +26,7 @@ pub(super) fn validate_cuda(
     model_dir: &Path,
     device_id: usize,
 ) -> Result<CudaModelReport, ModelError> {
+    use cuda_async::device_operation::DeviceOp;
     use cuda_core::Device;
     use cutile::tensor::ToHostVec;
 
