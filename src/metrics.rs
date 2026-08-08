@@ -16,6 +16,15 @@ pub struct Metrics {
     prompt_tokens: AtomicU64,
     generated_tokens: AtomicU64,
     engine_steps: AtomicU64,
+    engine_batches: AtomicU64,
+    batch_items: AtomicU64,
+    max_batch_size: AtomicUsize,
+    ttft_microseconds: AtomicU64,
+    ttft_count: AtomicU64,
+    inter_token_microseconds: AtomicU64,
+    inter_token_count: AtomicU64,
+    request_microseconds: AtomicU64,
+    request_duration_count: AtomicU64,
 }
 
 impl Metrics {
@@ -66,6 +75,30 @@ impl Metrics {
 
     pub(crate) fn engine_step(&self) {
         self.engine_steps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_batch(&self, size: usize) {
+        self.engine_batches.fetch_add(1, Ordering::Relaxed);
+        self.batch_items.fetch_add(size as u64, Ordering::Relaxed);
+        self.max_batch_size.fetch_max(size, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_ttft(&self, duration: std::time::Duration) {
+        self.ttft_microseconds
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+        self.ttft_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_inter_token(&self, duration: std::time::Duration) {
+        self.inter_token_microseconds
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+        self.inter_token_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_request_duration(&self, duration: std::time::Duration) {
+        self.request_microseconds
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+        self.request_duration_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn prometheus(&self) -> String {
@@ -144,6 +177,63 @@ impl Metrics {
             "counter",
             self.engine_steps.load(Ordering::Relaxed)
         );
+        metric!(
+            "tesseract_engine_batches_total",
+            "Backend execution batches",
+            "counter",
+            self.engine_batches.load(Ordering::Relaxed)
+        );
+        metric!(
+            "tesseract_batch_items_total",
+            "Scheduled request items across backend batches",
+            "counter",
+            self.batch_items.load(Ordering::Relaxed)
+        );
+        metric!(
+            "tesseract_max_batch_size",
+            "Largest scheduled backend batch",
+            "gauge",
+            self.max_batch_size.load(Ordering::Relaxed)
+        );
+        timing_metrics(
+            &mut out,
+            "tesseract_time_to_first_token_seconds",
+            "Time from admission to first generated token",
+            &self.ttft_microseconds,
+            &self.ttft_count,
+        );
+        timing_metrics(
+            &mut out,
+            "tesseract_inter_token_seconds",
+            "Time between generated tokens",
+            &self.inter_token_microseconds,
+            &self.inter_token_count,
+        );
+        timing_metrics(
+            &mut out,
+            "tesseract_request_duration_seconds",
+            "End-to-end request lifetime",
+            &self.request_microseconds,
+            &self.request_duration_count,
+        );
         out
     }
+}
+
+fn timing_metrics(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    microseconds: &AtomicU64,
+    count: &AtomicU64,
+) {
+    writeln!(out, "# HELP {name} {help}").unwrap();
+    writeln!(out, "# TYPE {name} summary").unwrap();
+    writeln!(
+        out,
+        "{name}_sum {}",
+        microseconds.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    )
+    .unwrap();
+    writeln!(out, "{name}_count {}", count.load(Ordering::Relaxed)).unwrap();
 }

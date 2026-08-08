@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde_json::json;
 use thiserror::Error;
@@ -29,7 +29,28 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics))
         .route("/v1/models", get(openai::models))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/requests/{request_id}", delete(cancel_request))
         .with_state(state)
+}
+
+async fn cancel_request(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let request_id = request_id.strip_prefix("chatcmpl-").unwrap_or(&request_id);
+    let request_id = uuid::Uuid::parse_str(request_id)
+        .map_err(|_| ApiError::InvalidRequest("request_id is not a valid UUID".into()))?;
+    state
+        .engine
+        .try_cancel(request_id)
+        .map_err(|error| match error {
+            crate::engine::SubmitError::Overloaded => ApiError::Overloaded,
+            crate::engine::SubmitError::Unavailable => ApiError::Unavailable,
+        })?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"id": request_id, "cancelled": true})),
+    ))
 }
 
 async fn live() -> impl IntoResponse {

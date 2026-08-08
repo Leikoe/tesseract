@@ -2,9 +2,12 @@ use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
     fmt::Display,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use thiserror::Error;
@@ -52,6 +55,27 @@ pub struct EngineHandle {
     model: Arc<dyn Model>,
     model_id: Arc<str>,
     output_buffer: usize,
+    admission: Arc<Admission>,
+}
+
+struct Admission {
+    active: AtomicUsize,
+    limit: usize,
+}
+
+impl Admission {
+    fn try_acquire(&self) -> bool {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.limit).then_some(active + 1)
+            })
+            .is_ok()
+    }
+
+    fn release(&self) {
+        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "admission permit released more than once");
+    }
 }
 
 impl EngineHandle {
@@ -83,6 +107,7 @@ impl EngineHandle {
         E: Display,
     {
         let output_buffer = config.output_buffer;
+        let admission_limit = config.max_pending + config.max_running;
         let (commands_tx, commands_rx) = mpsc::channel(command_capacity);
         let worker_metrics = Arc::clone(&metrics);
         let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
@@ -111,6 +136,10 @@ impl EngineHandle {
             model,
             model_id,
             output_buffer,
+            admission: Arc::new(Admission {
+                active: AtomicUsize::new(0),
+                limit: admission_limit,
+            }),
         })
     }
 
@@ -127,24 +156,39 @@ impl EngineHandle {
     }
 
     pub fn try_generate(&self, request: GenerateRequest) -> Result<RequestStream, SubmitError> {
+        if !self.admission.try_acquire() {
+            return Err(SubmitError::Overloaded);
+        }
         let request_id = request.id;
         let (output_tx, output_rx) = mpsc::channel(self.output_buffer);
-        self.commands
-            .try_send(Command::Start {
-                request,
-                output: output_tx,
-            })
-            .map_err(|error| match error {
+        if let Err(error) = self.commands.try_send(Command::Start {
+            request,
+            output: output_tx,
+        }) {
+            self.admission.release();
+            return Err(match error {
                 mpsc::error::TrySendError::Full(_) => SubmitError::Overloaded,
                 mpsc::error::TrySendError::Closed(_) => SubmitError::Unavailable,
-            })?;
+            });
+        }
 
         Ok(RequestStream {
             request_id,
             output: output_rx,
             commands: self.commands.clone(),
             terminal: false,
+            admission: Arc::clone(&self.admission),
+            permit_released: false,
         })
+    }
+
+    pub fn try_cancel(&self, request_id: RequestId) -> Result<(), SubmitError> {
+        self.commands
+            .try_send(Command::Cancel(request_id))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => SubmitError::Overloaded,
+                mpsc::error::TrySendError::Closed(_) => SubmitError::Unavailable,
+            })
     }
 
     pub async fn shutdown(&self, grace: Duration) -> Result<(), SubmitError> {
@@ -165,6 +209,8 @@ pub struct RequestStream {
     output: mpsc::Receiver<GenerationEvent>,
     commands: mpsc::Sender<Command>,
     terminal: bool,
+    admission: Arc<Admission>,
+    permit_released: bool,
 }
 
 impl RequestStream {
@@ -179,8 +225,16 @@ impl RequestStream {
             Some(GenerationEvent::Finished { .. } | GenerationEvent::Failed { .. }) | None
         ) {
             self.terminal = true;
+            self.release_permit();
         }
         event
+    }
+
+    fn release_permit(&mut self) {
+        if !self.permit_released {
+            self.admission.release();
+            self.permit_released = true;
+        }
     }
 }
 
@@ -189,6 +243,7 @@ impl Drop for RequestStream {
         if !self.terminal {
             let _ = self.commands.try_send(Command::Cancel(self.request_id));
         }
+        self.release_permit();
     }
 }
 
@@ -199,6 +254,8 @@ struct RequestState {
     computed_tokens: usize,
     generated_tokens: usize,
     pending_text: String,
+    started_at: Instant,
+    last_token_at: Option<Instant>,
 }
 
 impl RequestState {
@@ -297,6 +354,7 @@ impl<B: Backend> EngineWorker<B> {
             }
 
             self.metrics.engine_step();
+            self.metrics.observe_batch(batch.len());
             match self.backend.step(&batch) {
                 Ok(outputs) => self.apply_step(&batch, outputs),
                 Err(error) => {
@@ -397,6 +455,8 @@ impl<B: Backend> EngineWorker<B> {
                 computed_tokens: 0,
                 generated_tokens: 0,
                 pending_text: String::new(),
+                started_at: Instant::now(),
+                last_token_at: None,
             },
         );
         self.waiting.push_back(id);
@@ -493,6 +553,14 @@ impl<B: Backend> EngineWorker<B> {
 
             state.generated_tokens += 1;
             self.metrics.token_generated();
+            let now = Instant::now();
+            match state.last_token_at {
+                Some(previous) => self.metrics.observe_inter_token(now - previous),
+                None => {
+                    self.metrics.observe_ttft(now - state.started_at);
+                }
+            }
+            state.last_token_at = Some(now);
             let (text, hit_stop) = state.consume_text(&output.text);
             if !text.is_empty()
                 && state
@@ -535,6 +603,8 @@ impl<B: Backend> EngineWorker<B> {
         self.running.retain(|candidate| *candidate != id);
         self.kv.release(id);
         self.backend.remove_request(id);
+        self.metrics
+            .observe_request_duration(state.started_at.elapsed());
 
         if !state.pending_text.is_empty() && reason != FinishReason::Cancelled {
             let _ = state.output.try_send(GenerationEvent::Delta {
@@ -716,5 +786,44 @@ mod tests {
         }
         assert_eq!(text, " token0");
         assert_eq!(reason, Some(FinishReason::Stop));
+    }
+
+    #[tokio::test]
+    async fn frontend_admission_is_strictly_bounded() {
+        let metrics = Arc::new(Metrics::default());
+        let mut bounded = config();
+        bounded.max_pending = 0;
+        bounded.max_running = 1;
+        let engine =
+            EngineHandle::spawn(DeterministicBackend::new("test-model"), bounded, 8, metrics)
+                .unwrap();
+        let first = engine.try_generate(request(20)).unwrap();
+        assert!(matches!(
+            engine.try_generate(request(1)),
+            Err(SubmitError::Overloaded)
+        ));
+        drop(first);
+        assert!(engine.try_generate(request(1)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn explicit_cancellation_finishes_the_request() {
+        let metrics = Arc::new(Metrics::default());
+        let engine = EngineHandle::spawn(
+            DeterministicBackend::new("test-model"),
+            config(),
+            8,
+            metrics,
+        )
+        .unwrap();
+        let mut stream = engine.try_generate(request(20)).unwrap();
+        engine.try_cancel(stream.request_id()).unwrap();
+        while let Some(event) = stream.recv().await {
+            if let GenerationEvent::Finished { reason, .. } = event {
+                assert_eq!(reason, FinishReason::Cancelled);
+                return;
+            }
+        }
+        panic!("cancelled request closed without a terminal event");
     }
 }
