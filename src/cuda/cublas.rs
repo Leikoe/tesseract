@@ -1,6 +1,11 @@
 use std::{cell::RefCell, ffi::c_void, sync::Arc};
 
-use cuda_async::device_operation::{DeviceOp, value, with_context};
+use cuda_async::{
+    device_context::with_default_device_policy,
+    device_future::DeviceFuture,
+    device_operation::{DeviceOp, ExecutionContext, GraphNode, value, with_context},
+    error::DeviceError,
+};
 use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 use cutile::{core::bf16, tensor::Tensor};
 use thiserror::Error;
@@ -127,4 +132,82 @@ pub fn gemm_bf16(
         })();
         value(result)
     }))
+}
+
+/// Allocation-free BF16 GEMM operation suitable for CUDA graph capture.
+pub struct GemmBf16 {
+    matrix: Arc<Tensor<bf16>>,
+    rhs: Arc<Tensor<bf16>>,
+    out: Arc<Tensor<bf16>>,
+    m: i32,
+    n: i32,
+    k: i32,
+}
+
+pub fn gemm_bf16_into(
+    matrix: Arc<Tensor<bf16>>,
+    rhs: Arc<Tensor<bf16>>,
+    out: Arc<Tensor<bf16>>,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<GemmBf16, CublasError> {
+    if m == 0
+        || n == 0
+        || k == 0
+        || m > i32::MAX as usize
+        || n > i32::MAX as usize
+        || k > i32::MAX as usize
+    {
+        return Err(CublasError::InvalidDimensions { m, n, k });
+    }
+    Ok(GemmBf16 {
+        matrix,
+        rhs,
+        out,
+        m: m as i32,
+        n: n as i32,
+        k: k as i32,
+    })
+}
+
+impl DeviceOp for GemmBf16 {
+    type Output = Result<(), CublasError>;
+
+    unsafe fn execute(
+        self,
+        context: &ExecutionContext,
+    ) -> Result<<Self as DeviceOp>::Output, DeviceError> {
+        context.device().bind_to_thread()?;
+        let stream = context.get_cuda_stream().cu_stream() as cublas_sys::cudaStream_t;
+        Ok(unsafe {
+            launch(
+                context.get_device_id(),
+                stream,
+                &self.matrix,
+                &self.rhs,
+                &self.out,
+                self.m,
+                self.n,
+                self.k,
+            )
+        })
+    }
+}
+
+impl GraphNode for GemmBf16 {}
+
+impl IntoFuture for GemmBf16 {
+    type Output = Result<Result<(), CublasError>, DeviceError>;
+    type IntoFuture = DeviceFuture<Result<(), CublasError>, Self>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        match with_default_device_policy(|policy| {
+            let stream = policy.next_stream()?;
+            Ok(DeviceFuture::scheduled(self, ExecutionContext::new(stream)))
+        }) {
+            Ok(Ok(future)) => future,
+            Ok(Err(error)) | Err(error) => DeviceFuture::failed(error),
+        }
+    }
 }

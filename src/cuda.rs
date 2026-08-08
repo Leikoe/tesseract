@@ -4,6 +4,7 @@
 //! forward-pass composition belong to the corresponding model module.
 
 use cuda_async::device_operation::DeviceOp;
+use cuda_async::{cuda_graph::CudaGraph, error::DeviceError};
 use cuda_core::Device;
 use cutile::{
     api,
@@ -138,16 +139,11 @@ pub fn validate_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaErr
     let gemm_out = api::zeros::<bf16>(&[1, 2])
         .sync_on(&stream)
         .map_err(|error| kernel_error("allocate GEMM output", error))?;
-    let gemm_out = cublas::gemm_bf16(
-        std::sync::Arc::new(matrix),
-        std::sync::Arc::new(rhs),
-        gemm_out,
-        2,
-        1,
-        3,
-    )?
-    .sync_on(&stream)
-    .map_err(|error| kernel_error("execute BF16 cuBLAS GEMM", error))??;
+    let matrix = std::sync::Arc::new(matrix);
+    let rhs = std::sync::Arc::new(rhs);
+    let gemm_out = cublas::gemm_bf16(matrix.clone(), rhs.clone(), gemm_out, 2, 1, 3)?
+        .sync_on(&stream)
+        .map_err(|error| kernel_error("execute BF16 cuBLAS GEMM", error))??;
     let gemm_host: Vec<bf16> = gemm_out
         .to_host_vec()
         .sync_on(&stream)
@@ -161,6 +157,38 @@ pub fn validate_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaErr
                 actual,
             });
         }
+    }
+
+    let graph_out = std::sync::Arc::new(
+        api::zeros::<bf16>(&[1, 2])
+            .sync_on(&stream)
+            .map_err(|error| kernel_error("allocate graph GEMM output", error))?,
+    );
+    let graph = CudaGraph::scope(&stream, |scope| {
+        let result = scope.record(
+            cublas::gemm_bf16_into(matrix, rhs, graph_out.clone(), 2, 1, 3)
+                .map_err(|error| DeviceError::Internal(error.to_string()))?,
+        )?;
+        result.map_err(|error| DeviceError::Internal(error.to_string()))
+    })
+    .map_err(|error| kernel_error("capture BF16 cuBLAS graph", error))?;
+    graph
+        .launch()
+        .sync_on(&stream)
+        .map_err(|error| kernel_error("replay BF16 cuBLAS graph", error))?;
+    let graph_host: Vec<bf16> = graph_out
+        .to_host_vec()
+        .sync_on(&stream)
+        .map_err(|error| kernel_error("copy graph GEMM result", error))?;
+    if graph_host
+        .into_iter()
+        .zip(expected)
+        .any(|(actual, expected)| (actual.to_f32() - expected).abs() > 0.01)
+    {
+        return Err(CudaError::Bf16Kernel {
+            operation: "validate cuBLAS graph replay",
+            message: "captured GEMM result differs from eager GEMM".into(),
+        });
     }
 
     validate_transformer_primitives(&stream)?;

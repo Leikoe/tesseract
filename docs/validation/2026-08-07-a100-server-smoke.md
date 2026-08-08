@@ -77,6 +77,18 @@ current backend also executes scheduled requests serially inside a scheduler
 step rather than packing them into one GPU batch. These are explicit remaining
 acceptance gaps, not hidden by this smoke result.
 
+Follow-up revision `5b924e9` moved the changing context length and query start
+into device metadata and padded gathered KV to power-of-two context buckets. A
+19-token prefill followed by ten decode tokens then compiled only one attention
+specialization for that bucket, rather than one per context length, and still
+generated `One, Two, Three, Four, Five.`. The three-prompt logits gate continued
+to pass. Full model graph replay remains pending.
+
+A subsequent CUDA smoke gate captured an allocation-free BF16 cuBLAS GEMM in a
+CUDA graph, replayed it, and compared the replay output to the eager result.
+This proves the selected cuBLAS/CUDA/cuTile stack supports graph capture; it is
+not evidence that the complete Llama decode path is captured yet.
+
 ## Independent BF16 logits reference
 
 The isolated reference environment used PyTorch 2.8.0, Transformers 4.55.0,
