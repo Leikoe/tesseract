@@ -94,6 +94,10 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 ```
 
 ```text
+you can also scp/rsync src/ if you find it easier for faster iteration
+```
+
+```text
 error types should probably be using thiserror.
 ```
 

@@ -264,17 +264,18 @@ mod tile {
         );
         let key = key.partition(const_shape![1, BN, D]);
         let value = value.partition(const_shape![1, BN, D]);
-        let mut row_max = constant(-1.0e30f32, const_shape![BM, 1]);
-        let mut row_sum = constant(0.0f32, const_shape![BM, 1]);
-        let mut accumulator = constant(0.0f32, const_shape![BM, D]);
+        let mut row_max: Tile<f32, { [BM, 1] }> = constant(-1.0e30f32, const_shape![BM, 1]);
+        let mut row_sum: Tile<f32, { [BM, 1] }> = constant(0.0f32, const_shape![BM, 1]);
+        let mut accumulator: Tile<f32, { [BM, D] }> = constant(0.0f32, const_shape![BM, D]);
         let lane: Tile<i32, { [BN] }> = iota(const_shape![BN]);
-        let lane = lane
+        let lane: Tile<i32, { [BM, BN] }> = lane
             .reshape(const_shape![1, BN])
             .broadcast(const_shape![BM, BN]);
         let query_lane: Tile<i32, { [BM] }> = iota(const_shape![BM]);
-        let query_position = query_start + query_block * BM;
-        let query_position = query_position.broadcast(const_shape![BM]) + query_lane;
-        let query_position = query_position
+        let query_position: i32 = query_start + query_block * BM;
+        let query_position: Tile<i32, { [BM] }> =
+            query_position.broadcast(const_shape![BM]) + query_lane;
+        let query_position: Tile<i32, { [BM, BN] }> = query_position
             .reshape(const_shape![BM, 1])
             .broadcast(const_shape![BM, BN]);
         for block in 0i32..((context_len + BN - 1i32) / BN) {
@@ -282,24 +283,26 @@ mod tile {
                 .load([kv_head, block, 0i32])
                 .reshape(const_shape![BN, D]);
             let key_tile: Tile<f32, { [BN, D] }> = convert_tile(key_tile);
-            let key_tile = key_tile.transpose();
-            let scores = mma(query, key_tile, constant(0.0f32, const_shape![BM, BN]));
-            let key_position = (block * BN).broadcast(const_shape![BM, BN]) + lane;
-            let valid = lt_tile(key_position, context_len.broadcast(const_shape![BM, BN]))
-                & ge_tile(query_position, key_position);
+            let key_tile: Tile<f32, { [D, BN] }> = key_tile.transpose();
+            let scores_zero: Tile<f32, { [BM, BN] }> = constant(0.0f32, const_shape![BM, BN]);
+            let scores: Tile<f32, { [BM, BN] }> = mma(query, key_tile, scores_zero);
+            let key_position: Tile<i32, { [BM, BN] }> =
+                (block * BN).broadcast(const_shape![BM, BN]) + lane;
+            let valid: Tile<bool, { [BM, BN] }> =
+                lt_tile(key_position, context_len.broadcast(const_shape![BM, BN]))
+                    & ge_tile(query_position, key_position);
             let scale: Tile<f32, { [BM, BN] }> = scale.broadcast(const_shape![BM, BN]);
-            let scores = select(
-                valid,
-                scores * scale,
-                constant(-1.0e30f32, const_shape![BM, BN]),
-            );
+            let negative_infinity: Tile<f32, { [BM, BN] }> =
+                constant(-1.0e30f32, const_shape![BM, BN]);
+            let scores: Tile<f32, { [BM, BN] }> = select(valid, scores * scale, negative_infinity);
             let block_max: Tile<f32, { [BM] }> = reduce_max(scores, 1i32);
             let block_max: Tile<f32, { [BM, 1] }> = block_max.reshape(const_shape![BM, 1]);
-            let next_max = max_tile(row_max, block_max);
-            let probabilities = exp(scores - next_max.broadcast(const_shape![BM, BN]));
+            let next_max: Tile<f32, { [BM, 1] }> = max_tile(row_max, block_max);
+            let probabilities: Tile<f32, { [BM, BN] }> =
+                exp(scores - next_max.broadcast(const_shape![BM, BN]));
             let block_sum: Tile<f32, { [BM] }> = reduce_sum(probabilities, 1i32);
             let block_sum: Tile<f32, { [BM, 1] }> = block_sum.reshape(const_shape![BM, 1]);
-            let correction = exp(row_max - next_max);
+            let correction: Tile<f32, { [BM, 1] }> = exp(row_max - next_max);
             row_sum = row_sum * correction + block_sum;
             accumulator = accumulator * correction.broadcast(const_shape![BM, D]);
             let value_tile = value
@@ -309,8 +312,9 @@ mod tile {
             accumulator = mma(probabilities, value_tile, accumulator);
             row_max = next_max;
         }
-        let epsilon = constant(1.0e-8f32, const_shape![BM, 1]);
-        let denominator = max_tile(row_sum, epsilon).broadcast(const_shape![BM, D]);
+        let epsilon: Tile<f32, { [BM, 1] }> = constant(1.0e-8f32, const_shape![BM, 1]);
+        let denominator: Tile<f32, { [BM, D] }> =
+            max_tile(row_sum, epsilon).broadcast(const_shape![BM, D]);
         let output: Tile<bf16, { [BM, 1, D] }> =
             convert_tile(true_div(accumulator, denominator).reshape(const_shape![BM, 1, D]));
         out.store(output);
