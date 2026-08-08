@@ -7,8 +7,26 @@ use crate::model::Model;
 use super::{ForwardBatch, RequestId, TokenId};
 
 #[derive(Debug, Error)]
+pub enum BatchLoweringError {
+    #[error("batch contains too many sequences for device metadata")]
+    TooManySequences,
+    #[error("token position overflowed for request {0}")]
+    PositionOverflow(RequestId),
+    #[error("token position does not fit device metadata for request {0}")]
+    PositionOutOfRange(RequestId),
+    #[error("context length does not fit device metadata for request {0}")]
+    ContextLengthOutOfRange(RequestId),
+    #[error("sample row does not fit device metadata for request {0}")]
+    SampleRowOutOfRange(RequestId),
+}
+
+#[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ExecutionError {
+    #[error(transparent)]
+    BatchLowering(#[from] BatchLoweringError),
+    #[error(transparent)]
+    Sampling(#[from] super::SamplingError),
     #[error("model execution failed: {0}")]
     Execution(String),
     #[error("executor is unavailable: {0}")]

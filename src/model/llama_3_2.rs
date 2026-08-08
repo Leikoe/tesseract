@@ -325,10 +325,10 @@ mod cuda_impl {
     };
 
     use crate::{
-        cuda::{cublas, kernels},
+        cuda::{batch::CudaBatch, cublas, kernels},
         engine::{
             BatchTicket, CompletionId, ExecutionError, ExecutionOutput, ExecutionStats,
-            ForwardBatch, GeneratedToken, ImmediateCompletion, ModelExecutor, SequenceIndex,
+            ForwardBatch, GeneratedToken, HostLogitsSampler, ImmediateCompletion, ModelExecutor,
             TokenId,
         },
         model::Model,
@@ -2101,81 +2101,35 @@ mod cuda_impl {
 
         fn submit(&mut self, batch: &ForwardBatch) -> Result<BatchTicket, ExecutionError> {
             self.completions.ensure_available()?;
-            let mut token_ids = Vec::with_capacity(batch.num_tokens());
-            let mut positions = Vec::with_capacity(batch.num_tokens());
-            let mut current_slots = Vec::with_capacity(batch.num_tokens());
-            let mut request_indices = Vec::with_capacity(batch.num_tokens());
-            let mut context_lengths = Vec::with_capacity(batch.num_tokens());
-            let mut contexts = Vec::with_capacity(batch.len());
-            let mut sample_rows = Vec::new();
-            let mut samples = Vec::new();
-            let mut all_samples_greedy = true;
-
-            for (request_index, sequence) in batch.sequences().iter().enumerate() {
-                let end = sequence
-                    .position()
-                    .get()
-                    .checked_add(sequence.num_tokens())
-                    .ok_or_else(|| ExecutionError::Execution("token position overflowed".into()))?;
-                let request_index = SequenceIndex::try_from_usize(request_index)
-                    .map_err(|error| ExecutionError::Execution(error.to_string()))?;
-                let query_range = batch.query_range(request_index);
-                request_indices.extend(std::iter::repeat_n(request_index.get(), query_range.len()));
-                token_ids.extend(sequence.token_ids().iter().map(|token| token.get()));
-                for position in sequence.position().get()..end {
-                    positions.push(u32::try_from(position).map_err(|_| {
-                        ExecutionError::Execution("token position exceeds u32".into())
-                    })?);
-                    let context_length = position.checked_add(1).ok_or_else(|| {
-                        ExecutionError::Execution("token context length overflowed".into())
-                    })?;
-                    context_lengths.push(i32::try_from(context_length).map_err(|_| {
-                        ExecutionError::Execution("token context length exceeds i32".into())
-                    })?);
-                }
-                current_slots.extend(sequence.kv_slots().iter().map(|slot| slot.get()));
-                contexts.push(
-                    sequence
-                        .context_slots()
-                        .iter()
-                        .map(|slot| slot.get())
-                        .collect(),
-                );
-                if let Some(sampling) = sequence.sampling() {
-                    sample_rows.push(
-                        u32::try_from(query_range.end - 1).map_err(|_| {
-                            ExecutionError::Execution("sample row exceeds u32".into())
-                        })?,
-                    );
-                    samples.push((sequence.request_id(), sampling));
-                    all_samples_greedy &= sampling.is_greedy();
-                }
-            }
+            let lowered = CudaBatch::lower(batch)?;
 
             let started = Instant::now();
-            let forward = if batch.num_prefill_tokens() == 0
-                && all_samples_greedy
-                && samples.len() == batch.len()
-            {
+            let forward = if lowered.is_packed_greedy_decode() {
                 let output = self
                     .runtime
-                    .forward_decode_batch(&token_ids, &positions, &current_slots, &contexts)
+                    .forward_decode_batch(
+                        &lowered.token_ids,
+                        &lowered.positions,
+                        &lowered.current_slots,
+                        &lowered.contexts,
+                    )
                     .map_err(execution)?;
                 self.runtime.execution_stats.packed_decode_forwards += 1;
-                self.runtime.execution_stats.packed_decode_requests += batch.len() as u64;
+                self.runtime.execution_stats.packed_decode_requests +=
+                    lowered.request_count() as u64;
                 ForwardOutput::Tokens(output)
             } else {
                 let output = self
                     .runtime
                     .forward_eager_impl(EagerBatch {
-                        token_ids: &token_ids,
-                        positions: &positions,
-                        current_slots: &current_slots,
-                        contexts: &contexts,
-                        request_indices: &request_indices,
-                        context_lengths: &context_lengths,
-                        sample_rows: &sample_rows,
-                        greedy: all_samples_greedy,
+                        token_ids: &lowered.token_ids,
+                        positions: &lowered.positions,
+                        current_slots: &lowered.current_slots,
+                        contexts: &lowered.contexts,
+                        request_indices: &lowered.request_indices,
+                        context_lengths: &lowered.context_lengths,
+                        sample_rows: &lowered.sample_rows,
+                        greedy: lowered.all_samples_greedy,
                     })
                     .map_err(execution)?;
                 self.runtime.execution_stats.eager_forwards += 1;
@@ -2190,26 +2144,26 @@ mod cuda_impl {
             );
 
             let sampled_tokens = match forward {
-                ForwardOutput::None if samples.is_empty() => Vec::new(),
-                ForwardOutput::Token(token) if samples.len() == 1 => vec![token],
-                ForwardOutput::Tokens(tokens) if tokens.len() == samples.len() => tokens,
-                ForwardOutput::Logits(logits) if samples.len() == 1 => {
-                    let sampling = samples[0].1;
-                    vec![sample_token(&logits, sampling)?]
+                ForwardOutput::None if lowered.samples.is_empty() => Vec::new(),
+                ForwardOutput::Token(token) if lowered.samples.len() == 1 => vec![token],
+                ForwardOutput::Tokens(tokens) if tokens.len() == lowered.samples.len() => tokens,
+                ForwardOutput::Logits(logits) if lowered.samples.len() == 1 => {
+                    let sampling = lowered.samples[0].sampling;
+                    vec![HostLogitsSampler.sample(&logits, sampling)?.get()]
                 }
                 ForwardOutput::BatchLogits(logits) => {
                     let vocab_size = self.runtime.model.config.vocab_size;
-                    if logits.len() != samples.len() * vocab_size {
+                    if logits.len() != lowered.samples.len() * vocab_size {
                         return Err(ExecutionError::Execution(format!(
                             "ragged logits returned {} values for {} samples and vocab {vocab_size}",
                             logits.len(),
-                            samples.len()
+                            lowered.samples.len()
                         )));
                     }
-                    let mut tokens = Vec::with_capacity(samples.len());
-                    for ((_, sampling), row) in samples.iter().zip(logits.chunks_exact(vocab_size))
+                    let mut tokens = Vec::with_capacity(lowered.samples.len());
+                    for (sample, row) in lowered.samples.iter().zip(logits.chunks_exact(vocab_size))
                     {
-                        tokens.push(sample_token(row, *sampling)?);
+                        tokens.push(HostLogitsSampler.sample(row, sample.sampling)?.get());
                     }
                     tokens
                 }
@@ -2221,9 +2175,9 @@ mod cuda_impl {
             };
 
             let mut outputs = Vec::with_capacity(sampled_tokens.len());
-            for ((request_id, _), token_id) in samples.into_iter().zip(sampled_tokens) {
+            for (sample, token_id) in lowered.samples.into_iter().zip(sampled_tokens) {
                 outputs.push(GeneratedToken {
-                    request_id,
+                    request_id: sample.request_id,
                     token_id: TokenId::new(token_id),
                 });
             }
@@ -2241,72 +2195,6 @@ mod cuda_impl {
         fn take_execution_stats(&mut self) -> ExecutionStats {
             std::mem::take(&mut self.runtime.execution_stats)
         }
-    }
-
-    fn sample_token(
-        logits: &[f32],
-        sampling: crate::engine::SamplingInput,
-    ) -> Result<u32, ExecutionError> {
-        if logits.is_empty() || logits.iter().any(|logit| !logit.is_finite()) {
-            return Err(ExecutionError::Execution(
-                "sampler received empty or non-finite logits".into(),
-            ));
-        }
-        if sampling.is_greedy() {
-            return logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| left.total_cmp(right))
-                .map(|(token, _)| token as u32)
-                .ok_or_else(|| ExecutionError::Execution("sampler received no logits".into()));
-        }
-
-        let inverse_temperature = 1.0 / sampling.temperature();
-        let max = logits
-            .iter()
-            .copied()
-            .map(|logit| logit * inverse_temperature)
-            .max_by(f32::total_cmp)
-            .ok_or_else(|| ExecutionError::Execution("sampler received no logits".into()))?;
-        let mut candidates: Vec<(u32, f64)> = logits
-            .iter()
-            .enumerate()
-            .map(|(token, logit)| {
-                (
-                    token as u32,
-                    ((*logit * inverse_temperature - max) as f64).exp(),
-                )
-            })
-            .collect();
-        candidates.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
-        let total: f64 = candidates.iter().map(|(_, weight)| weight).sum();
-        if !total.is_finite() || total <= 0.0 {
-            return Err(ExecutionError::Execution(
-                "sampler probability mass is invalid".into(),
-            ));
-        }
-
-        let cutoff = total * sampling.top_p() as f64;
-        let mut retained_mass = 0.0;
-        let mut retained = 0usize;
-        for (_, weight) in &candidates {
-            retained_mass += weight;
-            retained += 1;
-            if retained_mass >= cutoff {
-                break;
-            }
-        }
-        let draw = sampling.random_sample() * retained_mass;
-        let mut cumulative = 0.0;
-        for (token, weight) in candidates.into_iter().take(retained) {
-            cumulative += weight;
-            if draw < cumulative {
-                return Ok(token);
-            }
-        }
-        Err(ExecutionError::Execution(
-            "sampler failed to select a token".into(),
-        ))
     }
 
     fn execution(error: ModelError) -> ExecutionError {

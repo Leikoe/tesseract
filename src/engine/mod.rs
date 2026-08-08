@@ -1,6 +1,7 @@
 mod batch;
 mod executor;
 mod kv;
+mod sampling;
 mod scheduler;
 mod types;
 
@@ -14,9 +15,10 @@ pub use batch::{
 #[cfg(any(test, feature = "cuda", feature = "test-backend"))]
 pub(crate) use executor::ImmediateCompletion;
 pub use executor::{
-    BatchTicket, CompletionId, ExecutionError, ExecutionOutput, ExecutionStats, GeneratedToken,
-    ModelExecutor,
+    BatchLoweringError, BatchTicket, CompletionId, ExecutionError, ExecutionOutput, ExecutionStats,
+    GeneratedToken, ModelExecutor,
 };
+pub use sampling::{HostLogitsSampler, SamplingError};
 pub use scheduler::{EngineHandle, EngineSpawnError, RequestStream, SubmitError};
 pub use types::{
     FinishReason, GenerateRequest, GenerationEvent, GenerationParams, RequestId, Usage,

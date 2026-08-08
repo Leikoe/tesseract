@@ -15,6 +15,7 @@ use cutile::{
 };
 use thiserror::Error;
 
+pub(crate) mod batch;
 pub(crate) mod cublas;
 pub(crate) mod kernels;
 
