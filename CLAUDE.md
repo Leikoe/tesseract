@@ -183,6 +183,10 @@ I meant a `tesseract bench` clap command. for doing the serving benchmarks
 ```
 
 ```text
+is everything that should be pushed pushed ?
+```
+
+```text
 <codex_internal_context source="goal">
 Continue working toward the active thread goal.
 
