@@ -89,9 +89,12 @@ mod tile {
             let combined = residual + update;
             let scale: Tile<f32, { [1, BLOCK] }> =
                 convert_tile(weight.load([block]).reshape(shape));
+            let combined_bf16: Tile<bf16, { [1, BLOCK] }> = convert_tile(combined);
+            let normalized_bf16: Tile<bf16, { [1, BLOCK] }> =
+                convert_tile(combined * inverse * scale);
             unsafe {
-                combined_out.store(convert_tile(combined), [0i32, block]);
-                normalized.store(convert_tile(combined * inverse * scale), [0i32, block]);
+                combined_out.store(combined_bf16, [0i32, block]);
+                normalized.store(normalized_bf16, [0i32, block]);
             }
         }
     }
@@ -107,10 +110,12 @@ mod tile {
             convert_tile(gate.partition(const_shape![1, BLOCK]).load([pid.0, pid.1]));
         let up: Tile<f32, { [1, BLOCK] }> =
             convert_tile(up.partition(const_shape![1, BLOCK]).load([pid.0, pid.1]));
-        let one = constant(1.0f32, const_shape![1, BLOCK]);
-        let zero = constant(0.0f32, const_shape![1, BLOCK]);
-        let activated = gate * true_div(one, one + exp(zero - gate)) * up;
-        out.store(convert_tile(activated));
+        let one: Tile<f32, { [1, BLOCK] }> = constant(1.0f32, const_shape![1, BLOCK]);
+        let zero: Tile<f32, { [1, BLOCK] }> = constant(0.0f32, const_shape![1, BLOCK]);
+        let activated: Tile<f32, { [1, BLOCK] }> =
+            gate * true_div(one, one + exp(zero - gate)) * up;
+        let activated: Tile<bf16, { [1, BLOCK] }> = convert_tile(activated);
+        out.store(activated);
     }
 
     #[cutile::entry()]
@@ -137,15 +142,13 @@ mod tile {
         let sin: Tile<f32, { [1, HALF] }> =
             sin.partition(const_shape![1, HALF]).load([position, 0i32]);
         let mut out = unsafe { out.partition_mut(const_shape![1, 1, HALF]) };
+        let rotated_lo: Tile<bf16, { [1, 1, HALF] }> =
+            convert_tile((lo * cos - hi * sin).reshape(const_shape![1, 1, HALF]));
+        let rotated_hi: Tile<bf16, { [1, 1, HALF] }> =
+            convert_tile((hi * cos + lo * sin).reshape(const_shape![1, 1, HALF]));
         unsafe {
-            out.store(
-                convert_tile((lo * cos - hi * sin).reshape(const_shape![1, 1, HALF])),
-                [0i32, 0i32, 0i32],
-            );
-            out.store(
-                convert_tile((hi * cos + lo * sin).reshape(const_shape![1, 1, HALF])),
-                [0i32, 0i32, 1i32],
-            );
+            out.store(rotated_lo, [0i32, 0i32, 0i32]);
+            out.store(rotated_hi, [0i32, 0i32, 1i32]);
         }
     }
 
@@ -278,7 +281,8 @@ mod tile {
             let key_tile = key
                 .load([kv_head, block, 0i32])
                 .reshape(const_shape![BN, D]);
-            let key_tile = convert_tile(key_tile).transpose();
+            let key_tile: Tile<f32, { [BN, D] }> = convert_tile(key_tile);
+            let key_tile = key_tile.transpose();
             let scores = mma(query, key_tile, constant(0.0f32, const_shape![BM, BN]));
             let key_position = (block * BN).broadcast(const_shape![BM, BN]) + lane;
             let valid = lt_tile(key_position, context_len.broadcast(const_shape![BM, BN]))
@@ -301,14 +305,15 @@ mod tile {
             let value_tile = value
                 .load([kv_head, block, 0i32])
                 .reshape(const_shape![BN, D]);
-            accumulator = mma(convert_tile(probabilities), value_tile, accumulator);
+            let probabilities: Tile<bf16, { [BM, BN] }> = convert_tile(probabilities);
+            accumulator = mma(probabilities, value_tile, accumulator);
             row_max = next_max;
         }
         let epsilon = constant(1.0e-8f32, const_shape![BM, 1]);
         let denominator = max_tile(row_sum, epsilon).broadcast(const_shape![BM, D]);
-        out.store(convert_tile(
-            true_div(accumulator, denominator).reshape(const_shape![BM, 1, D]),
-        ));
+        let output: Tile<bf16, { [BM, 1, D] }> =
+            convert_tile(true_div(accumulator, denominator).reshape(const_shape![BM, 1, D]));
+        out.store(output);
     }
 }
 
