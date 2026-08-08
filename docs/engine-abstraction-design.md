@@ -611,10 +611,13 @@ fallback because it cannot safely wait for CUDA or report synchronization
 failure. If completion cannot be established, the executor is poisoned and the
 affected state is quarantined rather than recycled.
 
-This removes the authoritative `slots`, `prompt`, and `generated` collections
-now hidden in the Llama backend while permitting compact versioned mirrors in
-the executor. It prevents partial scheduler commits without serializing all GPU
-work behind synchronous execute-then-commit.
+The current synchronous implementation has already removed authoritative
+`slots`, `prompt`, `generated`, decoder, and sampling state from the Llama
+backend. `ForwardBatch` now carries the batch-local materialization of the
+engine-owned state. The ticket protocol preserves that ownership boundary while
+permitting compact versioned mirrors in a future asynchronous executor. It also
+prevents partial scheduler commits without serializing all GPU work behind
+synchronous execute-then-commit.
 
 ## Generic CUDA executor
 
@@ -771,14 +774,15 @@ src/
 
 The refactor should remain runnable after every step:
 
-1. Add characterization tests for current Llama eager, graph, mixed-batch, and
-   failure behavior.
-2. Introduce semantic newtypes and validated `ForwardBatch` without changing
-   execution.
-3. Move authoritative prompt/generated tokens, decoder, sampling state, and
-   logical slot history from `LlamaCudaBackend` into engine request state;
-   retain only explicit versioned executor mirrors.
-4. Replace `Backend::{add_request,remove_request,step}` with mode-aware
+1. **Implemented:** add characterization tests for current Llama eager, graph,
+   mixed-batch, and failure behavior.
+2. **Implemented:** introduce semantic newtypes and validated `ForwardBatch`
+   without changing execution.
+3. **Implemented:** move authoritative prompt/generated tokens, decoder,
+   sampling state, and logical slot history from `LlamaCudaBackend` into engine
+   request state. The current executor needs no persistent per-request mirror;
+   add one later only as an explicit, versioned optimization.
+4. Replace synchronous `Backend::step` with mode-aware
    `ModelExecutor::{submit,poll}` and execution tickets. Start with one in-flight
    ticket while proving the API, then enable overlap without redesign.
 5. Extract sampling, device batching, workspaces, and graph management into
