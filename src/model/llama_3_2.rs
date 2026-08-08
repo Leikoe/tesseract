@@ -45,7 +45,7 @@ pub(super) fn validate_cuda(
         bytes = bytes
             .checked_add(tensor.num_bytes())
             .ok_or_else(|| ModelError::Cuda("device weight byte count overflowed".into()))?;
-        device_weights.insert(name, tensor);
+        device_weights.insert(name, std::sync::Arc::new(tensor));
     }
 
     // Verify one architecture-owned tensor bit-for-bit after its H2D/D2H
@@ -56,6 +56,7 @@ pub(super) fn validate_cuda(
     let actual: Vec<cutile::core::bf16> = device_weights
         .get(name)
         .ok_or_else(|| ModelError::MissingTensor(name.into()))?
+        .clone()
         .to_host_vec()
         .sync_on(&stream)
         .map_err(|error| ModelError::Cuda(format!("verify `{name}`: {error:?}")))?;
