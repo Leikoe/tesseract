@@ -29,6 +29,7 @@ cuda-async = { git = "https://github.com/NVlabs/cutile-rs.git", rev = "9fe5756f8
 cuda-core = { git = "https://github.com/NVlabs/cutile-rs.git", rev = "9fe5756f861bc40f098e6981ac2dff6cf5d3d0e4", optional = true }
 cutile = { git = "https://github.com/NVlabs/cutile-rs.git", rev = "9fe5756f861bc40f098e6981ac2dff6cf5d3d0e4", optional = true }
 cutile-compiler = { git = "https://github.com/NVlabs/cutile-rs.git", rev = "9fe5756f861bc40f098e6981ac2dff6cf5d3d0e4", optional = true }
+cudarc = { version = "=0.19.2", default-features = false, features = ["std", "cublas", "dynamic-loading", "cuda-13010"], optional = true }
 
 [dev-dependencies]
 http-body-util = "0.1"
@@ -41,6 +42,7 @@ cuda = [
     "dep:cuda-core",
     "dep:cutile",
     "dep:cutile-compiler",
+    "dep:cudarc",
 ]
 test-backend = []
 

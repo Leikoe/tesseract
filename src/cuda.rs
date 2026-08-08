@@ -5,8 +5,15 @@
 
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
-use cutile::{api, core::bf16, tensor::PartitionMut, tile_kernel::ToHostVecOp};
+use cutile::{
+    api,
+    core::bf16,
+    tensor::{PartitionMut, Reshape},
+    tile_kernel::ToHostVecOp,
+};
 use thiserror::Error;
+
+mod cublas;
 
 #[cutile::module]
 mod kernels {
@@ -34,6 +41,7 @@ const SMOKE_BLOCK: usize = 128;
 pub struct Bf16SmokeReport {
     pub device_id: usize,
     pub elements: usize,
+    pub gemm_rows: usize,
 }
 
 #[derive(Debug, Error)]
@@ -47,6 +55,8 @@ pub enum CudaError {
     },
     #[error("BF16 cuTile validation produced {actual} at element {index}; expected 2")]
     WrongValue { index: usize, actual: f32 },
+    #[error(transparent)]
+    Cublas(#[from] cublas::CublasError),
 }
 
 /// Compile and execute a Tesseract-owned BF16 cuTile kernel on the requested
@@ -89,9 +99,59 @@ pub fn validate_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaErr
         }
     }
 
+    let matrix = api::copy_host_vec_to_device(&std::sync::Arc::new(vec![
+        bf16::from_f32(1.0),
+        bf16::from_f32(2.0),
+        bf16::from_f32(3.0),
+        bf16::from_f32(4.0),
+        bf16::from_f32(5.0),
+        bf16::from_f32(6.0),
+    ]))
+    .sync_on(&stream)
+    .map_err(|error| kernel_error("copy GEMM matrix", error))?
+    .reshape(&[2, 3])
+    .map_err(|error| kernel_error("reshape GEMM matrix", error))?;
+    let rhs = api::copy_host_vec_to_device(&std::sync::Arc::new(vec![
+        bf16::from_f32(1.0),
+        bf16::from_f32(0.0),
+        bf16::from_f32(-1.0),
+    ]))
+    .sync_on(&stream)
+    .map_err(|error| kernel_error("copy GEMM rhs", error))?
+    .reshape(&[1, 3])
+    .map_err(|error| kernel_error("reshape GEMM rhs", error))?;
+    let gemm_out = api::zeros::<bf16>(&[1, 2])
+        .sync_on(&stream)
+        .map_err(|error| kernel_error("allocate GEMM output", error))?;
+    let gemm_out = cublas::gemm_bf16(
+        std::sync::Arc::new(matrix),
+        std::sync::Arc::new(rhs),
+        gemm_out,
+        2,
+        1,
+        3,
+    )?
+    .sync_on(&stream)
+    .map_err(|error| kernel_error("execute BF16 cuBLAS GEMM", error))??;
+    let gemm_host: Vec<bf16> = gemm_out
+        .to_host_vec()
+        .sync_on(&stream)
+        .map_err(|error| kernel_error("copy GEMM result to host", error))?;
+    let expected = [-2.0f32, -2.0f32];
+    for (index, (actual, expected)) in gemm_host.into_iter().zip(expected).enumerate() {
+        let actual = actual.to_f32();
+        if (actual - expected).abs() > 0.01 {
+            return Err(CudaError::WrongValue {
+                index: SMOKE_ELEMENTS + index,
+                actual,
+            });
+        }
+    }
+
     Ok(Bf16SmokeReport {
         device_id,
         elements: SMOKE_ELEMENTS,
+        gemm_rows: 2,
     })
 }
 

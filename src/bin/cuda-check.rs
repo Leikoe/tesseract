@@ -13,6 +13,7 @@ fn main() -> anyhow::Result<()> {
     println!("device_id={}", report.device_id);
     println!("dtype=bfloat16");
     println!("elements={}", report.elements);
+    println!("gemm_rows={}", report.gemm_rows);
     println!("cutile_validation=ok");
     Ok(())
 }
