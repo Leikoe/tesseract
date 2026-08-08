@@ -27,3 +27,7 @@ we can start by supporting bf16 only. what stack should we base it on ? i'd say 
 ```text
 I will give you an A100 box. you can ssh to it and test your code there when needed. HOWEVER, it is a spot instance and might die at any point, so always use the git repo to save your work, and pull on the box (scp anything important back to local). Also, each message I send you needs to be saved verbatim inside CLAUDE.md (and this instruction too!).
 ```
+
+```text
+I say you use llama 3.2 1B Instruct for now. you have a .env with the hf token to hf download it. you can copy that .env to the A100 machine it's ok. "ssh ubuntu@216.81.245.246"
+```
