@@ -22,7 +22,7 @@ use crate::{
 };
 
 use super::{
-    Bf16Tensor, DenseDecoder, DenseDecoderConfig, copy_i32, copy_u32, cuda_error, device_error,
+    DenseDecoder, DenseDecoderConfig, ForwardOutput, copy_i32, copy_u32, cuda_error, device_error,
     output_bf16, output_buffer,
 };
 

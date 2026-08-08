@@ -10,7 +10,7 @@ use cuda_core::{Device, Stream};
 use cutile::{
     api,
     core::bf16,
-    tensor::{IntoPartition, PartitionMut, Reshape, Tensor, ToHostVec},
+    tensor::{IntoPartition, Reshape, Tensor, ToHostVec},
     tile_kernel::TileKernel,
 };
 
@@ -253,7 +253,7 @@ struct DenseDecoder<A> {
     execution_stats: ExecutionStats,
 }
 
-enum ForwardOutput {
+pub(super) enum ForwardOutput {
     None,
     Logits(Vec<f32>),
     BatchLogits(Vec<f32>),
