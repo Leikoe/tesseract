@@ -13,7 +13,8 @@ use cutile::{
 };
 use thiserror::Error;
 
-mod cublas;
+pub(crate) mod cublas;
+pub(crate) mod kernels;
 
 #[cutile::module]
 mod kernels {
