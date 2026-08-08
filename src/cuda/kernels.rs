@@ -267,11 +267,11 @@ mod tile {
         let mut row_max = constant(-1.0e30f32, const_shape![BM, 1]);
         let mut row_sum = constant(0.0f32, const_shape![BM, 1]);
         let mut accumulator = constant(0.0f32, const_shape![BM, D]);
-        let lane = iota(const_shape![BN]);
+        let lane: Tile<i32, { [BN] }> = iota(const_shape![BN]);
         let lane = lane
             .reshape(const_shape![1, BN])
             .broadcast(const_shape![BM, BN]);
-        let query_lane = iota(const_shape![BM]);
+        let query_lane: Tile<i32, { [BM] }> = iota(const_shape![BM]);
         let query_position = query_start + query_block * BM;
         let query_position = query_position.broadcast(const_shape![BM]) + query_lane;
         let query_position = query_position
