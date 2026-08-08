@@ -182,7 +182,9 @@ mod tile {
         }
 
         let cache_shape = Shape::<{ [-1, KV_HEADS, D] }> { dims: &[capacity] };
-        let cache_strides = Array::<{ [KV_HEADS * D, D, 1] }> { dims: &[] };
+        let cache_strides = Array::<{ [-1, D, 1] }> {
+            dims: &[KV_HEADS * D],
+        };
         let token = new_token_unordered();
         let mut key_cache = unsafe {
             make_tensor_view(

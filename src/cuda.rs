@@ -17,7 +17,7 @@ pub(crate) mod cublas;
 pub(crate) mod kernels;
 
 #[cutile::module]
-mod kernels {
+mod smoke_kernels {
     use cutile::core::*;
 
     #[cutile::entry()]
@@ -33,7 +33,7 @@ mod kernels {
     }
 }
 
-use kernels::add_bf16;
+use smoke_kernels::add_bf16;
 
 const SMOKE_ELEMENTS: usize = 4096;
 const SMOKE_BLOCK: usize = 128;
