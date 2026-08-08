@@ -64,4 +64,5 @@ evidence lives under `docs/validation/` and `docs/benchmarks/`.
 
 - [Inference engine architecture reference](docs/inference-engine-architecture-reference.md) — vLLM, SGLang, and SGLang's 2026 unified KV-memory work.
 - [v1 acceptance contract](docs/v1-acceptance.md) — required serving, engine, correctness, and performance gates.
+- [v1 validation report](docs/v1-validation-report.md) — requirement-by-requirement evidence and measured A100 results.
 - [A100 node setup](docs/a100-node-setup.md) — reproducible bootstrap and verification for the spot-worker base image.

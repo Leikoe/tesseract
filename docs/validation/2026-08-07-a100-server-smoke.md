@@ -67,15 +67,16 @@ all zero. Four prior requests were recorded as started and completed, with 19
 generated tokens over 14 engine steps. Sending SIGINT terminated the process;
 no `tesseract` process remained.
 
-## Finding requiring follow-up
+## Historical finding (closed by the subsequent results below)
 
-The runtime is correct enough to serve real requests, but it is not yet a v1
-performance result. cuTile compiled new attention specializations as context
+At this point in the validation sequence, the runtime was correct enough to
+serve real requests, but it was not yet a v1 performance result. cuTile compiled
+new attention specializations as context
 length changed. Stable decode buckets and CUDA graph capture/replay are still
 required to remove shape-specific JIT work from steady-state decoding. The
-current backend also executes scheduled requests serially inside a scheduler
-step rather than packing them into one GPU batch. These are explicit remaining
-acceptance gaps, not hidden by this smoke result.
+backend at this revision also executed scheduled requests serially inside a
+scheduler step rather than packing them into one GPU batch. These were explicit
+acceptance gaps, subsequently closed and measured later in this document.
 
 Follow-up revision `5b924e9` moved the changing context length and query start
 into device metadata and padded gathered KV to power-of-two context buckets. A
@@ -96,9 +97,9 @@ six-token completion, metrics directly reported one eager prefill, one graph
 capture, and five graph replays; output remained `One\nTwo\nThree` and stopped
 on EOS. That run measured 1.557 s TTFT and 1.285 s total inter-token time across
 five intervals (about 257 ms/interval). These are unoptimized measurements, not
-targets: request metadata still uses allocating host-to-device updates,
-stochastic sampling still copies logits to the host, and scheduled requests are
-executed serially.
+targets: request metadata still used allocating host-to-device updates,
+stochastic sampling copied logits to the host, and scheduled requests at this
+revision were executed serially.
 
 Startup warmup was subsequently enabled for every power-of-two context bucket.
 With a 256-token test capacity, the backend logged five warmed graph buckets
