@@ -529,6 +529,12 @@ impl<B: Backend> EngineWorker<B> {
                 budget -= num_tokens;
             }
         }
+        // Preserve decode-before-prefill priority while rotating peers of the
+        // same phase so a request at the front cannot monopolize a tight
+        // token budget across engine iterations.
+        if self.running.len() > 1 {
+            self.running.rotate_left(1);
+        }
         batch
     }
 
@@ -933,5 +939,32 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].request_id, decode_id);
         assert!(!batch.iter().any(|work| work.request_id == prefill_id));
+    }
+
+    #[test]
+    fn equal_phase_requests_rotate_under_a_tight_budget() {
+        let mut test_config = config();
+        test_config.max_batch_tokens = 1;
+        test_config.prefill_chunk_tokens = 1;
+        let metrics = Arc::new(Metrics::default());
+        let backend = DeterministicBackend::new("test-model");
+        let mut worker = EngineWorker::new(backend, test_config, metrics);
+        let (first_output, _first_receiver) = mpsc::channel(8);
+        let first = request(3);
+        let first_id = first.id;
+        worker.add_request(first, first_output);
+        let (second_output, _second_receiver) = mpsc::channel(8);
+        let second = request(3);
+        let second_id = second.id;
+        worker.add_request(second, second_output);
+        worker.admit_waiting();
+
+        let first_batch = worker.build_batch();
+        let second_batch = worker.build_batch();
+
+        assert_eq!(first_batch.len(), 1);
+        assert_eq!(first_batch[0].request_id, first_id);
+        assert_eq!(second_batch.len(), 1);
+        assert_eq!(second_batch[0].request_id, second_id);
     }
 }
