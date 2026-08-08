@@ -1,0 +1,11 @@
+{
+  "hardware": "NVIDIA A100-SXM4-80GB, 8.0, 580.126.09, 81920 MiB",
+  "cuda": "Build cuda_13.3.r13.3/compiler.38244171_0",
+  "git_revision": "9f3f2917704a0ba68c829fd5fd6dfd2565ebd8ce",
+  "model": "meta-llama/Llama-3.2-1B-Instruct",
+  "requests": 16,
+  "completion_tokens": 212,
+  "wall_seconds": 0.13333111900101358,
+  "completion_tokens_per_second": 1590.0264063514564,
+  "mean_ttft_seconds": 0.012918422749862657
+}

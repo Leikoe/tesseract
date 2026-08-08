@@ -48,7 +48,7 @@ important:
 | Engine/executor protocol | `ModelExecutor::{submit,poll}` with typed completion tickets and one in-flight synchronous CUDA submission | enable event-backed overlap, multiple tickets, and epoch-fenced reclamation without changing the boundary |
 | Executor request state | the engine owns prompt/generated/decoder/sampling state; the executor consumes batch-local materializations and owns physical KV | retain engine authority while allowing explicit versioned, non-authoritative device mirrors when they are performance-justified |
 | Physical state | one flat `KvSlot` domain | a schema of attention/recurrent/cache groups with typed arena identity |
-| Model program | a generic statically composed `CudaExecutor<P>` owns lowering, completion, output validation, and sampling; Llama is the initial whole-batch `ModelProgram`, with graph/workspace internals and the first attention implementation still in its 2,712-line file | small private architecture adapter constructing a shared decoder program |
+| Model program | `CudaExecutor<P>` owns lowering, completion, output validation, and sampling; the 538-line Llama adapter constructs a validated model-neutral dense-decoder artifact, while graph/workspace and flat-KV internals still share the initial decoder module | finish separating program, graph policy, and concrete attention implementation |
 | Operation implementations | crate-private, statically composed `AttentionBackend`; explicit model-neutral `HostLogitsSampler`; construction-time typed `KernelCatalog` resolving stable per-operation descriptors and immutable geometry/mode plans | retain these boundaries and add `MoeBackend` with the first MoE |
 
 The typed mixed batch, engine-owned request record, ticketed executor,
@@ -134,8 +134,8 @@ changing the hot-path ownership model.
 
 ## Models and layer composition
 
-TokenSpeed's dense Llama implementation is 395 lines, versus the current
-2,712-line `src/model/llama_3_2.rs`, because generic execution, cache, graph,
+TokenSpeed's dense Llama implementation is 395 lines, versus Tesseract's current
+538-line `src/model/llama_3_2.rs`, because generic execution, cache, graph,
 sampling, and common transformer mechanics live elsewhere. Llama defines its
 MLP, projections/RoPE/attention computation, layer resolvers, and weight mapping
 (`python/tokenspeed/runtime/models/llama.py:63`, `:115`, and `:290`). Shared
