@@ -73,7 +73,8 @@ cargo bench-a100
 Results default to a timestamped directory under `target/benchmarks/`. The
 command refuses tracked worktree changes so every result names a reproducible
 Git revision. Use `cargo bench-a100 --help` for workload, output, model, and
-server configuration overrides.
+server configuration overrides. An exact end-to-end command run is retained in
+[`docs/benchmarks/2026-08-08-bench-command/`](docs/benchmarks/2026-08-08-bench-command/README.md).
 
 
 ## Research notes
