@@ -43,12 +43,15 @@ mod kernels {
         let k_tiles = Dim::new(K_TILES);
         let low_mask: Tile<i32, { [16, 8] }> = constant(0x0fi32, const_shape![16, 8]);
         let nibble_shift: Tile<i32, { [16, 8] }> = constant(4i32, const_shape![16, 8]);
+        let zero_i32: Tile<i32, { [16, 8] }> = constant(0i32, const_shape![16, 8]);
+        let byte_modulus: Tile<i32, { [16, 8] }> = constant(256i32, const_shape![16, 8]);
         let mut accumulator = constant(0.0f32, const_shape![16, 16]);
 
         for k_tile in k_tiles {
             let activation = input.load_tile(const_shape![16, 16], [pid.0, k_tile]);
             let packed: Tile<i32, { [16, 8] }> =
                 exti(packed_weight.load_tile(const_shape![16, 8], [pid.1, k_tile]));
+            let packed = select(lt_tile(packed, zero_i32), packed + byte_modulus, packed);
             let low = andi(packed, low_mask).reshape(const_shape![16, 8, 1]);
             let high = shri(packed, nibble_shift).reshape(const_shape![16, 8, 1]);
             let nibbles: Tile<i32, { [16, 8, 2] }> = cat(low, high, 2);
@@ -82,6 +85,8 @@ mod kernels {
     ) {
         let low_mask: Tile<i32, { [1, 16, 8] }> = constant(0x0fi32, const_shape![1, 16, 8]);
         let nibble_shift: Tile<i32, { [1, 16, 8] }> = constant(4i32, const_shape![1, 16, 8]);
+        let zero_i32: Tile<i32, { [1, 16, 8] }> = constant(0i32, const_shape![1, 16, 8]);
+        let byte_modulus: Tile<i32, { [1, 16, 8] }> = constant(256i32, const_shape![1, 16, 8]);
         let k_tiles = Dim::new(K_TILES);
 
         // `iter_indices` maps the full logical output grid onto a physical
@@ -102,6 +107,7 @@ mod kernels {
                 let packed: Tile<i32, { [1, 16, 8] }> = exti(
                     packed_weight.load_tile(const_shape![1, 16, 8], [expert, column_tile, k_tile]),
                 );
+                let packed = select(lt_tile(packed, zero_i32), packed + byte_modulus, packed);
                 let low = andi(packed, low_mask).reshape(const_shape![16, 8, 1]);
                 let high = shri(packed, nibble_shift).reshape(const_shape![16, 8, 1]);
                 let nibbles: Tile<i32, { [16, 8, 2] }> = cat(low, high, 2);
