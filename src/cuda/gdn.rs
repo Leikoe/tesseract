@@ -110,8 +110,8 @@ mod kernels {
             state_0 * weight_0 + state_1 * weight_1 + state_2 * weight_2 + input_f32 * weight_3;
         const ONE: f32 = 1.0;
         const ZERO: f32 = 0.0;
-        let one: Tile<f32, { [1, 256] }> = constant(ONE, const_shape![1, 256]);
-        let zero: Tile<f32, { [1, 256] }> = constant(ZERO, const_shape![1, 256]);
+        let one: Tile<f32, { [1, 256] }> = broadcast_scalar(ONE, const_shape![1, 256]);
+        let zero: Tile<f32, { [1, 256] }> = broadcast_scalar(ZERO, const_shape![1, 256]);
         let activated: Tile<bf16, { [1, 256] }> = ftof(
             convolved * true_div(one, one + exp(zero - convolved)),
             rounding::NearestEven,
