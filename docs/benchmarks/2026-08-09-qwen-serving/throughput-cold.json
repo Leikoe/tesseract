@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "timestamp_unix_seconds": 1786267527,
+  "base_url": "http://127.0.0.1:18100",
+  "api": "chat-completions",
+  "endpoint": "http://127.0.0.1:18100/v1/chat/completions",
+  "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+  "dataset": "random",
+  "input_len": 128,
+  "length_variation": 0.0,
+  "shared_prefix_len": 0,
+  "num_prompts": 32,
+  "max_concurrency": 8,
+  "request_rate": null,
+  "output_len": 32,
+  "warmup_requests": 8,
+  "seed": 42,
+  "metadata": {
+    "phase": "cold",
+    "scenario": "throughput-128-32-c8"
+  },
+  "summary": {
+    "successful_requests": 32,
+    "failed_requests": 0,
+    "prompt_tokens": 4423,
+    "completion_tokens": 1024,
+    "wall_seconds": 27.827585299,
+    "request_throughput": 1.149938079648971,
+    "prompt_tokens_per_second": 158.94300394648124,
+    "completion_tokens_per_second": 36.798018548767075,
+    "total_tokens_per_second": 195.7410224952483,
+    "peak_concurrency": 8,
+    "request_latency_seconds": {
+      "mean": 6.956538921531249,
+      "p50": 5.843428748999999,
+      "p90": 10.3218647116,
+      "p99": 10.322112595490001
+    },
+    "ttft_seconds": {
+      "mean": 3.2084860551249994,
+      "p50": 2.0942489374999997,
+      "p90": 6.5753970625000004,
+      "p99": 6.575508837659999
+    },
+    "time_per_output_token_seconds": {
+      "mean": 0.12090248215927418,
+      "p50": 0.12086391803225806,
+      "p90": 0.12107826373548386,
+      "p99": 0.12108084514419357
+    },
+    "inter_token_seconds": {
+      "mean": 0.12090248215927414,
+      "p50": 0.12083841799999995,
+      "p90": 0.12169062000000004,
+      "p99": 0.1224238670900001
+    }
+  },
+  "results": null
+}
