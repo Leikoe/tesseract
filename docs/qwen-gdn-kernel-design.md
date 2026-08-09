@@ -42,28 +42,30 @@ contains scheduler-owned recurrent slot indices.
 ## Prefill
 
 Prefill uses chunks, not a token-serial recurrent kernel. For a chunk of length
-`C`, define the cumulative decay `gamma` and the strict-lower triangular
-matrix
+`C`, let `ell = cumsum(log(alpha))`. The numerically stable system is
 
 ```text
-M = I + tril(B K K^T, -1).
+N = I + tril(B (exp(ell_i - ell_j) .* K K^T), -1).
 ```
 
-The second system needed by the gated update is diagonally similar:
+For causal entries `i > j`, `ell_i - ell_j <= 0`, so the exponential cannot
+grow. The kernel never materializes `gamma = exp(ell)` or `gamma^-1`. A single
+FP32 forward-substitution factorization of `N` is reused for
 
 ```text
-G = diag(gamma)
-N = G M G^-1
-N^-1 = G M^-1 G^-1.
+U = N^-1 (B V)
+W = N^-1 (B exp(ell) K).
 ```
 
-Therefore the FP32 forward-substitution factorization of `M` is computed once
-per chunk/head and reused for both `W` and the gate-rescaled `U`. The remaining
-state transition and causal chunk output are tensor-core GEMMs. This is the
-single-inversion formulation described in [Simple math to speed up GDN
-prefill](https://veitner.bearblog.dev/simple-math-to-speed-up-gdn-prefill/)
-and is consistent with the single-inverse observation in
-[Comba](https://arxiv.org/abs/2506.02475).
+This is algebraically identical to factoring the ungated
+`M = I + tril(B K K^T, -1)`, because with `G = diag(exp(ell))`,
+`N = G M G^-1` and `N^-1 = G M^-1 G^-1`. Factoring `N` is preferable on the
+GPU because it expresses every decay as a bounded log-space difference. The
+remaining state transition and causal chunk output are tensor-core GEMMs. This
+is the single-inversion identity described in [Simple math to speed up GDN
+prefill](https://veitner.bearblog.dev/simple-math-to-speed-up-gdn-prefill/),
+the orientation used by SGLang's fused KKT solve, and is consistent with the
+single-inverse observation in [Comba](https://arxiv.org/abs/2506.02475).
 
 Chunk boundaries are internal kernel choices. Request boundaries, initial
 state selection, and final-state commit come from `query_start_offsets` and

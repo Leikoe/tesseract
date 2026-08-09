@@ -152,6 +152,172 @@ mod kernels {
         );
     }
 
+    /// Runs the width-four causal convolution for every packed request while
+    /// keeping the three-token tail resident in registers. Requests are
+    /// independent tile blocks; channels are parallel within each request.
+    #[cutile::entry()]
+    unsafe fn qwen_gdn_conv_prefill(
+        input: &Tensor<bf16, { [-1, 8192] }>,
+        weight: &Tensor<bf16, { [8192, 4] }>,
+        query_start_offsets: &Tensor<i32, { [-1] }>,
+        state_slots: &Tensor<i32, { [-1] }>,
+        state_ptr: *mut bf16,
+        output_ptr: *mut bf16,
+        completion: &mut Tensor<i32, { [1, 1] }>,
+    ) {
+        const ONE: f32 = 1.0;
+        const ZERO: f32 = 0.0;
+        const ZERO_I32: i32 = 0;
+
+        let pid = get_tile_block_id();
+        let request = pid.0;
+        let feature_block = pid.1;
+        let offsets = query_start_offsets.partition(const_shape![1]);
+        let start: i32 = tile_to_scalar(offsets.load([request]).reshape(const_shape![]));
+        let end: i32 = tile_to_scalar(offsets.load([request + 1i32]).reshape(const_shape![]));
+        let slot = state_slots.partition(const_shape![1]).load([request]);
+        let slot: i32 = tile_to_scalar(slot.reshape(const_shape![]));
+
+        let lane: Tile<i32, { [256] }> = iota(const_shape![256]);
+        let feature_offset = feature_block * 256i32;
+        let feature_offset: Tile<i32, { [256] }> = feature_offset.broadcast(const_shape![256]);
+        let feature = lane + feature_offset;
+        let state_offset = (slot * 8192i32 * 3i32).broadcast(const_shape![256])
+            + feature * 3i32.broadcast(const_shape![256]);
+
+        let state_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(state_ptr);
+        let state_base: PointerTile<*mut bf16, { [1] }> = state_base.reshape(const_shape![1]);
+        let state_base: PointerTile<*mut bf16, { [256] }> = state_base.broadcast(const_shape![256]);
+        let state_0_pointer = state_base.offset_tile(state_offset);
+        let state_1_pointer =
+            state_base.offset_tile(state_offset + 1i32.broadcast(const_shape![256]));
+        let state_2_pointer =
+            state_base.offset_tile(state_offset + 2i32.broadcast(const_shape![256]));
+        let (state_0, state_0_token): (Tile<bf16, { [256] }>, Token) = load_ptr_tko(
+            state_0_pointer,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<0>,
+        );
+        let (state_1, state_1_token): (Tile<bf16, { [256] }>, Token) = load_ptr_tko(
+            state_1_pointer,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<0>,
+        );
+        let (state_2, state_2_token): (Tile<bf16, { [256] }>, Token) = load_ptr_tko(
+            state_2_pointer,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<0>,
+        );
+        let mut state_0: Tile<f32, { [1, 256] }> =
+            convert_tile(state_0.reshape(const_shape![1, 256]));
+        let mut state_1: Tile<f32, { [1, 256] }> =
+            convert_tile(state_1.reshape(const_shape![1, 256]));
+        let mut state_2: Tile<f32, { [1, 256] }> =
+            convert_tile(state_2.reshape(const_shape![1, 256]));
+
+        let weight = weight.partition(const_shape![256, 1]);
+        let weight_0: Tile<f32, { [1, 256] }> = convert_tile(
+            weight
+                .load([feature_block, 0i32])
+                .reshape(const_shape![1, 256]),
+        );
+        let weight_1: Tile<f32, { [1, 256] }> = convert_tile(
+            weight
+                .load([feature_block, 1i32])
+                .reshape(const_shape![1, 256]),
+        );
+        let weight_2: Tile<f32, { [1, 256] }> = convert_tile(
+            weight
+                .load([feature_block, 2i32])
+                .reshape(const_shape![1, 256]),
+        );
+        let weight_3: Tile<f32, { [1, 256] }> = convert_tile(
+            weight
+                .load([feature_block, 3i32])
+                .reshape(const_shape![1, 256]),
+        );
+        let one: Tile<f32, { [1, 256] }> = broadcast_scalar(ONE, const_shape![1, 256]);
+        let zero: Tile<f32, { [1, 256] }> = broadcast_scalar(ZERO, const_shape![1, 256]);
+        let input = input.partition(const_shape![1, 256]);
+        let output_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(output_ptr);
+        let output_base: PointerTile<*mut bf16, { [1] }> = output_base.reshape(const_shape![1]);
+        let output_base: PointerTile<*mut bf16, { [256] }> =
+            output_base.broadcast(const_shape![256]);
+
+        for row in start..end {
+            let value: Tile<bf16, { [1, 256] }> = input.load([row, feature_block]);
+            let value_f32: Tile<f32, { [1, 256] }> = convert_tile(value);
+            let convolved =
+                state_0 * weight_0 + state_1 * weight_1 + state_2 * weight_2 + value_f32 * weight_3;
+            let activated: Tile<bf16, { [256] }> = ftof(
+                (convolved * true_div(one, one + exp(zero - convolved))).reshape(const_shape![256]),
+                rounding::NearestEven,
+            );
+            let output_offset =
+                (row * 8192i32 + feature_block * 256i32).broadcast(const_shape![256]) + lane;
+            let output_pointer = output_base.offset_tile(output_offset);
+            let _output_token = store_ptr_tko(
+                output_pointer,
+                activated,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                Latency::<0>,
+            );
+            state_0 = state_1;
+            state_1 = state_2;
+            state_2 = value_f32;
+        }
+
+        let next_state_0: Tile<bf16, { [256] }> =
+            ftof(state_0.reshape(const_shape![256]), rounding::NearestEven);
+        let next_state_1: Tile<bf16, { [256] }> =
+            ftof(state_1.reshape(const_shape![256]), rounding::NearestEven);
+        let next_state_2: Tile<bf16, { [256] }> =
+            ftof(state_2.reshape(const_shape![256]), rounding::NearestEven);
+        let _state_0_store = store_ptr_tko(
+            state_0_pointer,
+            next_state_0,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            Some(state_0_token),
+            Latency::<0>,
+        );
+        let _state_1_store = store_ptr_tko(
+            state_1_pointer,
+            next_state_1,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            Some(state_1_token),
+            Latency::<0>,
+        );
+        let _state_2_store = store_ptr_tko(
+            state_2_pointer,
+            next_state_2,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            Some(state_2_token),
+            Latency::<0>,
+        );
+        completion.store(broadcast_scalar(ZERO_I32, const_shape![1, 1]));
+    }
+
     #[cutile::entry()]
     unsafe fn qwen_gdn_decode(
         mixed_qkv: &Tensor<bf16, { [-1, 8192] }>,
@@ -348,7 +514,7 @@ mod kernels {
     }
 }
 
-use kernels::{qwen_gdn_conv_decode, qwen_gdn_decode, qwen_gdn_output_gate};
+use kernels::{qwen_gdn_conv_decode, qwen_gdn_conv_prefill, qwen_gdn_decode, qwen_gdn_output_gate};
 
 pub(crate) fn output_gate(
     input: Arc<Tensor<bf16>>,
@@ -437,6 +603,59 @@ impl GdnState {
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("execute GDN convolution decode: {error:?}")))?;
         drop(output_partition);
+        Ok(output)
+    }
+
+    pub(crate) fn prefill_conv(
+        &mut self,
+        input: Arc<Tensor<bf16>>,
+        weight: Arc<Tensor<bf16>>,
+        query_start_offsets: Arc<Tensor<i32>>,
+        state_slots: Arc<Tensor<i32>>,
+        rows: usize,
+        requests: usize,
+        stream: &Arc<Stream>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        if self.slots == 0
+            || requests == 0
+            || input.shape() != [rows as i32, CONV_FEATURES as i32]
+            || weight.shape() != [CONV_FEATURES as i32, CONV_WIDTH as i32]
+            || query_start_offsets.shape() != [(requests + 1) as i32]
+            || state_slots.shape() != [requests as i32]
+        {
+            return Err(ModelError::Cuda(
+                "invalid GDN convolution prefill geometry".into(),
+            ));
+        }
+        let mut output = api::zeros::<bf16>(&[rows, CONV_FEATURES])
+            .sync_on(stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!(
+                    "allocate GDN convolution prefill output: {error:?}"
+                ))
+            })?;
+        // cuTile derives the launch grid from tensor partitions. This tiny
+        // completion matrix provides exactly one block per request/channel tile
+        // while the packed-token output is written through its device pointer.
+        let mut completion = api::zeros::<i32>(&[requests, CONV_FEATURES / CONV_BLOCK])
+            .sync_on(stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!("allocate GDN convolution launch grid: {error:?}"))
+            })?;
+        let (_, _, _, _, _, _, completion_partition) = unsafe {
+            qwen_gdn_conv_prefill(
+                input,
+                weight,
+                query_start_offsets,
+                state_slots,
+                self.conv.device_pointer(),
+                output.device_pointer(),
+                (&mut completion).partition([1, 1]),
+            )
+        }
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("execute GDN convolution prefill: {error:?}")))?;
+        drop(completion_partition);
         Ok(output)
     }
 
@@ -603,6 +822,7 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
 }
 
 fn probe_conv(stream: &Arc<Stream>) -> Result<f32, ModelError> {
+    let prefill_max_abs_error = probe_conv_prefill(stream)?;
     let rows = 2usize;
     let first_host = host_bf16(rows * CONV_FEATURES, 23, 17.0);
     let second_host = host_bf16(rows * CONV_FEATURES, 29, 19.0);
@@ -644,6 +864,89 @@ fn probe_conv(stream: &Arc<Stream>) -> Result<f32, ModelError> {
                 "GDN convolution differential mismatch at {index}: {} != {expected}",
                 actual[index].to_f32()
             )));
+        }
+    }
+    Ok(max_abs_error.max(prefill_max_abs_error))
+}
+
+fn probe_conv_prefill(stream: &Arc<Stream>) -> Result<f32, ModelError> {
+    let requests = 2usize;
+    let offsets = [0i32, 3, 8];
+    let rows = 8usize;
+    let input_host = host_bf16(rows * CONV_FEATURES, 31, 29.0);
+    let continuation_host = host_bf16(requests * CONV_FEATURES, 37, 31.0);
+    let weight_host = host_bf16(CONV_FEATURES * CONV_WIDTH, 17, 27.0);
+    let slots = [1i32, 0i32];
+    let mut state = GdnState::zeros(requests, stream)?;
+    let weight = upload_bf16(&weight_host, &[CONV_FEATURES, CONV_WIDTH], stream)?;
+    let state_slots = upload_i32(&slots, stream)?;
+    let output = state.prefill_conv(
+        upload_bf16(&input_host, &[rows, CONV_FEATURES], stream)?,
+        weight.clone(),
+        upload_i32(&offsets, stream)?,
+        state_slots.clone(),
+        rows,
+        requests,
+        stream,
+    )?;
+    let actual: Vec<bf16> = output.to_host_vec().sync_on(stream).map_err(|error| {
+        ModelError::Cuda(format!("download GDN convolution prefill probe: {error:?}"))
+    })?;
+    let continuation = state.decode_conv(
+        upload_bf16(&continuation_host, &[requests, CONV_FEATURES], stream)?,
+        weight,
+        state_slots,
+        requests,
+        stream,
+    )?;
+    let continuation_actual: Vec<bf16> =
+        continuation
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!(
+                    "download GDN convolution continuation probe: {error:?}"
+                ))
+            })?;
+
+    let mut max_abs_error = 0.0f32;
+    for request in 0..requests {
+        for feature in 0..CONV_FEATURES {
+            let mut tail = [0.0f32; CONV_STATE_WIDTH];
+            for row in offsets[request] as usize..offsets[request + 1] as usize {
+                let input = input_host[row * CONV_FEATURES + feature].to_f32();
+                let convolved = tail[0] * weight_host[feature * CONV_WIDTH].to_f32()
+                    + tail[1] * weight_host[feature * CONV_WIDTH + 1].to_f32()
+                    + tail[2] * weight_host[feature * CONV_WIDTH + 2].to_f32()
+                    + input * weight_host[feature * CONV_WIDTH + 3].to_f32();
+                let expected = bf16::from_f32(convolved / (1.0 + (-convolved).exp())).to_f32();
+                let index = row * CONV_FEATURES + feature;
+                let error = (actual[index].to_f32() - expected).abs();
+                max_abs_error = max_abs_error.max(error);
+                if error > 0.01 || !actual[index].to_f32().is_finite() {
+                    return Err(ModelError::Cuda(format!(
+                        "GDN convolution prefill mismatch at {index}: {} != {expected}",
+                        actual[index].to_f32()
+                    )));
+                }
+                tail = [tail[1], tail[2], input];
+            }
+
+            let input = continuation_host[request * CONV_FEATURES + feature].to_f32();
+            let convolved = tail[0] * weight_host[feature * CONV_WIDTH].to_f32()
+                + tail[1] * weight_host[feature * CONV_WIDTH + 1].to_f32()
+                + tail[2] * weight_host[feature * CONV_WIDTH + 2].to_f32()
+                + input * weight_host[feature * CONV_WIDTH + 3].to_f32();
+            let expected = bf16::from_f32(convolved / (1.0 + (-convolved).exp())).to_f32();
+            let index = request * CONV_FEATURES + feature;
+            let error = (continuation_actual[index].to_f32() - expected).abs();
+            max_abs_error = max_abs_error.max(error);
+            if error > 0.01 || !continuation_actual[index].to_f32().is_finite() {
+                return Err(ModelError::Cuda(format!(
+                    "GDN convolution continuation mismatch at {index}: {} != {expected}",
+                    continuation_actual[index].to_f32()
+                )));
+            }
         }
     }
     Ok(max_abs_error)
