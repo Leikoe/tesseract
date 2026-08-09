@@ -165,8 +165,8 @@ mod nvfp4_probe_kernels {
         let mantissa = bytes % eight;
         let zero_u8: Tile<u8, { [16, 8] }> = constant(0u8, const_shape![16, 8]);
         let one_u8: Tile<u8, { [16, 8] }> = constant(1u8, const_shape![16, 8]);
-        let exponent_f: Tile<f32, { [16, 8] }> = itof(exponent, rounding::NearestEven);
-        let mantissa_f: Tile<f32, { [16, 8] }> = itof(mantissa, rounding::NearestEven);
+        let exponent_f: Tile<f32, { [16, 8] }> = convert_tile(exponent);
+        let mantissa_f: Tile<f32, { [16, 8] }> = convert_tile(mantissa);
         let zero_f: Tile<f32, { [16, 8] }> = constant(0.0f32, const_shape![16, 8]);
         let one_f: Tile<f32, { [16, 8] }> = constant(1.0f32, const_shape![16, 8]);
         let two_f: Tile<f32, { [16, 8] }> = constant(2.0f32, const_shape![16, 8]);
