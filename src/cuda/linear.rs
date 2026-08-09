@@ -47,9 +47,8 @@ mod kernels {
 
         for k_tile in k_tiles {
             let activation = input.load_tile(const_shape![16, 16], [pid.0, k_tile]);
-            let packed: Tile<f32, { [16, 8] }> =
-                convert_tile(packed_weight.load_tile(const_shape![16, 8], [pid.1, k_tile]));
-            let packed: Tile<i32, { [16, 8] }> = ftoi(packed, rounding::Zero);
+            let packed: Tile<i32, { [16, 8] }> =
+                exti(packed_weight.load_tile(const_shape![16, 8], [pid.1, k_tile]));
             let low = andi(packed, low_mask).reshape(const_shape![16, 8, 1]);
             let high = shri(packed, nibble_shift).reshape(const_shape![16, 8, 1]);
             let nibbles: Tile<i32, { [16, 8, 2] }> = cat(low, high, 2);
@@ -100,10 +99,9 @@ mod kernels {
 
             for k_tile in k_tiles {
                 let activation = dispatched.load_tile(const_shape![16, 16], [row_tile, k_tile]);
-                let packed: Tile<f32, { [1, 16, 8] }> = convert_tile(
+                let packed: Tile<i32, { [1, 16, 8] }> = exti(
                     packed_weight.load_tile(const_shape![1, 16, 8], [expert, column_tile, k_tile]),
                 );
-                let packed: Tile<i32, { [1, 16, 8] }> = ftoi(packed, rounding::Zero);
                 let low = andi(packed, low_mask).reshape(const_shape![16, 8, 1]);
                 let high = shri(packed, nibble_shift).reshape(const_shape![16, 8, 1]);
                 let nibbles: Tile<i32, { [16, 8, 2] }> = cat(low, high, 2);
