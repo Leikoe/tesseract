@@ -16,7 +16,7 @@ use cutile::{
 };
 
 use crate::{
-    cuda::{cublas, execution::StreamExecution},
+    cuda::execution::StreamExecution,
     model::{
         ModelError,
         weights::{WeightDtype, WeightSource, WeightTensor},
@@ -32,6 +32,7 @@ const GROUPED_SMALL_TILE_M: usize = 16;
 const GROUPED_LARGE_TILE_M: usize = 64;
 const GROUPED_TILE_N: usize = 64;
 const GROUPED_TILE_K: usize = GROUP_K;
+const FP8_SUBNORMAL_SCALE: f32 = 1.0 / 512.0;
 
 #[cutile::module]
 mod kernels {
@@ -439,15 +440,16 @@ mod kernels {
     }
 }
 
-use kernels::{grouped_nvfp4_w4a16, grouped_nvfp4_w4a16_silu_mul, nvfp4_w4a16};
+use kernels::{fp8_w8a16, grouped_nvfp4_w4a16, grouped_nvfp4_w4a16_silu_mul, nvfp4_w4a16};
 
-/// Scalar-scaled ModelOpt FP8 projection expanded once to BF16 on SM80. This
-/// backend trades device memory for native BF16 tensor-core execution and
-/// avoids decoding the same immutable E4M3 weights on every forward pass.
+/// Scalar-scaled ModelOpt FP8 projection executed as W8A16 on SM80. The
+/// checkpoint's E4M3 bytes remain FP8 on device and are decoded in the MMA
+/// pipeline without changing the storage contract declared by the manifest.
 pub(crate) struct Fp8W8A16Linear {
     input_size: usize,
     output_size: usize,
-    weight: Arc<Tensor<bf16>>,
+    weight: Arc<Tensor<u8>>,
+    weight_scale: f32,
     device_bytes: usize,
 }
 
@@ -471,7 +473,7 @@ impl Fp8W8A16Linear {
         if input_size == 0
             || output_size == 0
             || !input_size.is_multiple_of(TILE_N)
-            || !output_size.is_multiple_of(TILE_N)
+            || !output_size.is_multiple_of(DENSE_TILE_N)
             || weight.byte_len() != output_size.saturating_mul(input_size)
         {
             return invalid_tensor(&weight_name, "unrepresentable W8A16 storage geometry");
@@ -486,21 +488,17 @@ impl Fp8W8A16Linear {
         if !weight_scale.is_finite() || weight_scale <= 0.0 {
             return invalid_tensor(&weight_scale_name, "scale must be finite and positive");
         }
-        let decoded_weight = weight
-            .bytes()
-            .iter()
-            .map(|encoded| bf16::from_f32(decode_e4m3fn(*encoded) * weight_scale))
-            .collect::<Vec<_>>();
-        let weight = api::copy_host_vec_to_device(&Arc::new(decoded_weight))
+        let weight = api::copy_host_vec_to_device(&Arc::new(weight.bytes().to_vec()))
             .sync_on(stream)
-            .map_err(|error| ModelError::Cuda(format!("upload expanded FP8 weight: {error:?}")))?
+            .map_err(|error| ModelError::Cuda(format!("upload FP8 weight: {error:?}")))?
             .reshape(&[output_size, input_size])
-            .map_err(|error| ModelError::Cuda(format!("reshape expanded FP8 weight: {error:?}")))?;
+            .map_err(|error| ModelError::Cuda(format!("reshape FP8 weight: {error:?}")))?;
         let device_bytes = weight.num_bytes();
         Ok(Self {
             input_size,
             output_size,
             weight: Arc::new(weight),
+            weight_scale,
             device_bytes,
         })
     }
@@ -546,7 +544,7 @@ impl Fp8W8A16Linear {
         &self,
         input: Arc<Tensor<bf16>>,
         rows: usize,
-        output: Tensor<bf16>,
+        mut output: Tensor<bf16>,
         execution: &mut StreamExecution<'_>,
     ) -> Result<Tensor<bf16>, ModelError> {
         if rows == 0 || !rows.is_multiple_of(TILE_M) {
@@ -564,18 +562,28 @@ impl Fp8W8A16Linear {
                 output.shape()
             )));
         }
-        let operation = cublas::gemm_bf16(
-            self.weight.clone(),
-            input,
-            output,
-            self.output_size,
-            rows,
-            self.input_size,
-        )
-        .map_err(|error| ModelError::Cuda(format!("prepare expanded FP8 GEMM: {error}")))?;
-        execution
-            .enqueue(operation, "execute expanded FP8 BF16 GEMM")?
-            .map_err(|error| ModelError::Cuda(format!("execute expanded FP8 GEMM: {error}")))
+        let logical_tiles = (rows / TILE_M)
+            .checked_mul(self.output_size / DENSE_TILE_N)
+            .ok_or_else(|| ModelError::Cuda("FP8 output tile count overflowed".into()))?;
+        let workers = logical_tiles.min(device_sm_count(execution.stream())?);
+        let output_partition = (&mut output).partition([TILE_M, DENSE_TILE_N]).map(
+            [8, 1],
+            u32::try_from(workers)
+                .map_err(|_| ModelError::Cuda("persistent FP8 worker count overflowed".into()))?,
+        );
+        let (output_partition, ..) = execution.enqueue(
+            fp8_w8a16(
+                output_partition,
+                input,
+                self.weight.clone(),
+                self.weight_scale,
+                FP8_SUBNORMAL_SCALE,
+            )
+            .generics(vec![(self.input_size / TILE_N).to_string()]),
+            "execute FP8 W8A16",
+        )?;
+        drop(output_partition);
+        Ok(output)
     }
 }
 
@@ -1313,7 +1321,7 @@ fn probe_fp8_w8a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     let mut execution = StreamExecution::new(stream);
     if linear.input_size() != input_size
         || linear.output_size() != output_size
-        || linear.device_bytes() != encoded.len() * std::mem::size_of::<bf16>()
+        || linear.device_bytes() != encoded.len()
     {
         return Err(ModelError::Cuda(
             "FP8 loader did not preserve geometry/device-byte accounting".into(),
