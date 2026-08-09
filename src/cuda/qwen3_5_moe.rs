@@ -15,7 +15,9 @@ use crate::model::{
 };
 
 use super::{
-    cublas, kernels,
+    cublas,
+    gdn::{self as gdn_backend, GdnState},
+    kernels,
     linear::{ExpertProjection, Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear},
     moe::{self as moe_backend, RoutingPlan},
 };
@@ -135,7 +137,12 @@ impl Checkpoint {
                     let prefix = format!("{prefix}.linear_attn");
                     Attention::Linear(LinearAttention {
                         a_log: load_f32(source, &format!("{prefix}.A_log"), stream)?,
-                        conv1d: load_bf16(source, &format!("{prefix}.conv1d.weight"), stream)?,
+                        conv1d: load_bf16_as(
+                            source,
+                            &format!("{prefix}.conv1d.weight"),
+                            &[8192, 4],
+                            stream,
+                        )?,
                         dt_bias: load_f32(source, &format!("{prefix}.dt_bias"), stream)?,
                         input_a: load_bf16(source, &format!("{prefix}.in_proj_a.weight"), stream)?,
                         input_b: load_bf16(source, &format!("{prefix}.in_proj_b.weight"), stream)?,
@@ -268,6 +275,74 @@ impl LinearAttention {
             + self.input_z.device_bytes()
             + self.norm.num_bytes()
             + self.output.device_bytes()
+    }
+
+    fn forward_decode(
+        &self,
+        hidden: Bf16Tensor,
+        state: &mut GdnState,
+        state_slots: Arc<Tensor<i32>>,
+        rows: usize,
+        epsilon: f32,
+        stream: &Arc<Stream>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        const HIDDEN_SIZE: usize = 2048;
+        const VALUE_SIZE: usize = 4096;
+        if !rows.is_multiple_of(16) || hidden.shape() != [rows as i32, HIDDEN_SIZE as i32] {
+            return Err(ModelError::Cuda("invalid Qwen GDN input geometry".into()));
+        }
+        let mixed_qkv = Arc::new(self.input_qkv.enqueue(hidden.clone(), rows, stream)?);
+        let mixed_qkv = Arc::new(state.decode_conv(
+            mixed_qkv,
+            self.conv1d.clone(),
+            state_slots.clone(),
+            rows,
+            stream,
+        )?);
+        let a = bf16_gemm(
+            self.input_a.clone(),
+            hidden.clone(),
+            32,
+            rows,
+            HIDDEN_SIZE,
+            "Qwen GDN a projection",
+            stream,
+        )?;
+        let b = bf16_gemm(
+            self.input_b.clone(),
+            hidden.clone(),
+            32,
+            rows,
+            HIDDEN_SIZE,
+            "Qwen GDN b projection",
+            stream,
+        )?;
+        let recurrent = Arc::new(state.decode(
+            mixed_qkv,
+            a,
+            b,
+            self.a_log.clone(),
+            self.dt_bias.clone(),
+            state_slots,
+            rows,
+            stream,
+        )?);
+        let gate = self
+            .input_z
+            .enqueue(hidden, rows, stream)?
+            .reshape(&[rows, 32, 128])
+            .map_err(|error| ModelError::Cuda(format!("reshape Qwen GDN z gate: {error:?}")))?;
+        let gated = gdn_backend::output_gate(
+            recurrent,
+            Arc::new(gate),
+            self.norm.clone(),
+            epsilon,
+            rows,
+            stream,
+        )?
+        .reshape(&[rows, VALUE_SIZE])
+        .map_err(|error| ModelError::Cuda(format!("reshape Qwen GDN output: {error:?}")))?;
+        self.output.enqueue(Arc::new(gated), rows, stream)
     }
 }
 
@@ -449,6 +524,16 @@ fn load_bf16(
     name: &str,
     stream: &Arc<Stream>,
 ) -> Result<Bf16Tensor, ModelError> {
+    let shape = source.tensor(name)?.shape().to_vec();
+    load_bf16_as(source, name, &shape, stream)
+}
+
+fn load_bf16_as(
+    source: &dyn WeightSource,
+    name: &str,
+    shape: &[usize],
+    stream: &Arc<Stream>,
+) -> Result<Bf16Tensor, ModelError> {
     let tensor = source.tensor(name)?;
     if tensor.dtype() != &WeightDtype::Bf16 {
         return Err(ModelError::WrongDtype {
@@ -467,7 +552,7 @@ fn load_bf16(
     let device = api::copy_host_vec_to_device(&host)
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("upload `{name}`: {error:?}")))?
-        .reshape(tensor.shape())
+        .reshape(shape)
         .map_err(|error| ModelError::Cuda(format!("reshape `{name}`: {error:?}")))?;
     Ok(Arc::new(device))
 }

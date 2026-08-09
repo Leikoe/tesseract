@@ -382,13 +382,13 @@ pub(crate) fn output_gate(
     Ok(output)
 }
 
-pub(crate) struct RecurrentState {
+pub(crate) struct GdnState {
     conv: Tensor<bf16>,
     tensor: Tensor<f32>,
     slots: usize,
 }
 
-impl RecurrentState {
+impl GdnState {
     pub(crate) fn zeros(slots: usize, stream: &Arc<Stream>) -> Result<Self, ModelError> {
         let conv = api::zeros::<bf16>(&[slots, CONV_FEATURES, CONV_STATE_WIDTH])
             .sync_on(stream)
@@ -519,7 +519,7 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
         );
     }
     let state_slots = vec![1i32, 0i32];
-    let mut state = RecurrentState::zeros(2, stream)?;
+    let mut state = GdnState::zeros(2, stream)?;
     let mixed_qkv = upload_bf16(&mixed_qkv_host, &[rows, CONV_FEATURES], stream)?;
     let a = upload_bf16(&a_host, &[rows, VALUE_HEADS], stream)?;
     let b = upload_bf16(&b_host, &[rows, VALUE_HEADS], stream)?;
@@ -609,7 +609,7 @@ fn probe_conv(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     let weight_host = host_bf16(CONV_FEATURES * CONV_WIDTH, 13, 23.0);
     let state_slots = upload_i32(&[1i32, 0i32], stream)?;
     let weight = upload_bf16(&weight_host, &[CONV_FEATURES, CONV_WIDTH], stream)?;
-    let mut state = RecurrentState::zeros(rows, stream)?;
+    let mut state = GdnState::zeros(rows, stream)?;
     let _first = state.decode_conv(
         upload_bf16(&first_host, &[rows, CONV_FEATURES], stream)?,
         weight.clone(),
