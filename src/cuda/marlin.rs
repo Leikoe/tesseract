@@ -8,6 +8,7 @@ use cutile::{
     DType, api,
     core::{bf16, f16},
     tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
+    tile_kernel::TileKernel,
 };
 use serde::Serialize;
 
