@@ -4,7 +4,30 @@ fn main() {
         return;
     }
 
+    let nvcc = std::env::var_os("NVCC")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("CUDA_HOME")
+                .map(std::path::PathBuf::from)
+                .map(|root| root.join("bin/nvcc"))
+        })
+        .or_else(|| {
+            [
+                "/usr/local/cuda/bin/nvcc",
+                "/usr/local/cuda-13.3/bin/nvcc",
+                "/usr/local/cuda-13.2/bin/nvcc",
+                "/usr/local/cuda-13.1/bin/nvcc",
+                "/usr/local/cuda-13.0/bin/nvcc",
+                "/usr/local/cuda-12.9/bin/nvcc",
+            ]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .find(|candidate| candidate.is_file())
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("nvcc"));
+
     cc::Build::new()
+        .compiler(nvcc)
         .cuda(true)
         .cpp(true)
         .include("src/cuda/marlin/native")
