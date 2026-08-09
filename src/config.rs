@@ -57,7 +57,7 @@ pub struct BenchmarkConfig {
     #[arg(long, default_value_t = 128)]
     pub output_len: usize,
 
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = 1024, help = "Mean random context token count")]
     pub input_len: usize,
 
     #[arg(
@@ -67,7 +67,11 @@ pub struct BenchmarkConfig {
     )]
     pub length_variation: f64,
 
-    #[arg(long, default_value_t = 0)]
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Shared prefix tokens prepended in addition to input-len"
+    )]
     pub shared_prefix_len: usize,
 
     #[arg(long, default_value_t = 1)]

@@ -25,7 +25,7 @@ use dataset::prepare;
 struct RequestResult {
     index: usize,
     prompt: String,
-    expected_input_tokens: Option<usize>,
+    generated_prompt_tokens: Option<usize>,
     requested_output_tokens: usize,
     latency_seconds: f64,
     ttft_seconds: f64,
@@ -41,7 +41,7 @@ struct RequestSpec<'a> {
     api: BenchmarkApi,
     model: &'a str,
     prompt: &'a str,
-    expected_input_tokens: Option<usize>,
+    generated_prompt_tokens: Option<usize>,
     output_len: usize,
     seed: u64,
     index: usize,
@@ -112,7 +112,7 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
                 api: config.api,
                 model: &config.model,
                 prompt: &sample.prompt,
-                expected_input_tokens: sample.expected_input_tokens,
+                generated_prompt_tokens: sample.generated_prompt_tokens,
                 output_len: sample.output_tokens.min(32),
                 seed: config.seed.wrapping_add(index as u64),
                 index,
@@ -137,7 +137,7 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
         let model = config.model.clone();
         let sample = &samples[index];
         let prompt = sample.prompt.clone();
-        let expected_input_tokens = sample.expected_input_tokens;
+        let generated_prompt_tokens = sample.generated_prompt_tokens;
         let permits = Arc::clone(&permits);
         let due = started + arrivals[index];
         let output_len = sample.output_tokens;
@@ -155,7 +155,7 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
                     api,
                     model: &model,
                     prompt: &prompt,
-                    expected_input_tokens,
+                    generated_prompt_tokens,
                     output_len,
                     seed,
                     index,
@@ -340,7 +340,7 @@ async fn request_once(client: &Client, request: RequestSpec<'_>) -> Result<Reque
     Ok(RequestResult {
         index: request.index,
         prompt: request.prompt.to_owned(),
-        expected_input_tokens: request.expected_input_tokens,
+        generated_prompt_tokens: request.generated_prompt_tokens,
         requested_output_tokens: request.output_len,
         latency_seconds,
         ttft_seconds: token_times.first().copied().unwrap_or(latency_seconds),

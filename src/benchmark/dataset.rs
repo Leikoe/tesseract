@@ -18,7 +18,7 @@ const BUILTIN_PROMPTS: &[&str] = &[
 
 pub(super) struct Sample {
     pub(super) prompt: String,
-    pub(super) expected_input_tokens: Option<usize>,
+    pub(super) generated_prompt_tokens: Option<usize>,
     pub(super) output_tokens: usize,
 }
 
@@ -37,7 +37,7 @@ fn prepare_builtin(config: &BenchmarkConfig) -> Vec<Sample> {
     (0..config.num_prompts)
         .map(|index| Sample {
             prompt: prompts[index % prompts.len()].to_owned(),
-            expected_input_tokens: None,
+            generated_prompt_tokens: None,
             output_tokens: config.output_len,
         })
         .collect()
@@ -117,7 +117,7 @@ fn prepare_random(config: &BenchmarkConfig) -> Result<Vec<Sample>> {
             .with_context(|| format!("construct random prompt {index}"))?;
         samples.push(Sample {
             prompt,
-            expected_input_tokens: Some(adjusted.len() + special_tokens),
+            generated_prompt_tokens: Some(adjusted.len() + special_tokens),
             output_tokens: output_len,
         });
     }
