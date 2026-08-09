@@ -165,6 +165,117 @@ mod kernels {
         }
     }
 
+    /// Fused routed-expert FC1. Gate and up projections share the dispatched
+    /// activation load, retain independent ModelOpt scales, and feed a
+    /// register-resident SwiGLU epilogue. Only the activated BF16 down-input
+    /// reaches global memory.
+    #[cutile::entry(unchecked_accesses = false)]
+    fn grouped_nvfp4_w4a16_silu_mul<const K_TILES: i32>(
+        mut output: MappedPartitionMut<bf16, { [16, 64] }, { [8, 1] }>,
+        dispatched: &Tensor<bf16, { [-1, -1] }>,
+        expert_by_row_tile: &Tensor<i32, { [-1] }>,
+        gate_packed_weight: &Tensor<u8, { [-1, -1, -1] }>,
+        gate_weight_scale: &Tensor<bf16, { [-1, -1, -1] }>,
+        gate_weight_global_scale: &Tensor<f32, { [-1] }>,
+        up_packed_weight: &Tensor<u8, { [-1, -1, -1] }>,
+        up_weight_scale: &Tensor<bf16, { [-1, -1, -1] }>,
+        up_weight_global_scale: &Tensor<f32, { [-1] }>,
+    ) {
+        const LOW_MASK: i32 = 0x0f;
+        let low_mask: Tile<i32, { [1, 64, 8] }> =
+            broadcast_scalar(LOW_MASK, const_shape![1, 64, 8]);
+        const NIBBLE_SHIFT: i32 = 4;
+        let nibble_shift: Tile<i32, { [1, 64, 8] }> =
+            broadcast_scalar(NIBBLE_SHIFT, const_shape![1, 64, 8]);
+        const ZERO_I32: i32 = 0;
+        let zero_i32: Tile<i32, { [1, 64, 8] }> =
+            broadcast_scalar(ZERO_I32, const_shape![1, 64, 8]);
+        const BYTE_MODULUS: i32 = 256;
+        let byte_modulus: Tile<i32, { [1, 64, 8] }> =
+            broadcast_scalar(BYTE_MODULUS, const_shape![1, 64, 8]);
+        let k_tiles = Dim::new(K_TILES);
+
+        for out_idx in output.iter_indices() {
+            let (row_tile, column_tile) = out_idx.components();
+            let expert_tile = expert_by_row_tile.load_tile(const_shape![1], [row_tile]);
+            let expert: i32 = tile_to_scalar(expert_tile.reshape(const_shape![]));
+            let gate_global = gate_weight_global_scale
+                .load_tile(const_shape![1], [expert])
+                .reshape(const_shape![1, 1])
+                .broadcast(const_shape![64, 16]);
+            let up_global = up_weight_global_scale
+                .load_tile(const_shape![1], [expert])
+                .reshape(const_shape![1, 1])
+                .broadcast(const_shape![64, 16]);
+            const ZERO_F32: f32 = 0.0;
+            let mut gate_accumulator = broadcast_scalar(ZERO_F32, const_shape![16, 64]);
+            let mut up_accumulator = broadcast_scalar(ZERO_F32, const_shape![16, 64]);
+
+            for k_tile in k_tiles {
+                let activation = dispatched.load_tile(const_shape![16, 16], [row_tile, k_tile]);
+
+                let gate_packed: Tile<i32, { [1, 64, 8] }> = exti(
+                    gate_packed_weight
+                        .load_tile(const_shape![1, 64, 8], [expert, column_tile, k_tile]),
+                );
+                let gate_packed = select(
+                    lt_tile(gate_packed, zero_i32),
+                    gate_packed + byte_modulus,
+                    gate_packed,
+                );
+                let gate_low = andi(gate_packed, low_mask).reshape(const_shape![64, 8, 1]);
+                let gate_high = shri(gate_packed, nibble_shift).reshape(const_shape![64, 8, 1]);
+                let gate_nibbles: Tile<i32, { [64, 8, 2] }> = cat(gate_low, gate_high, 2);
+                let gate_weight = decode_fp4_grouped(gate_nibbles.reshape(const_shape![64, 16]));
+                let gate_scale: Tile<f32, { [64, 16] }> = convert_tile(
+                    gate_weight_scale
+                        .load_tile(const_shape![1, 64, 1], [expert, column_tile, k_tile])
+                        .reshape(const_shape![64, 1])
+                        .broadcast(const_shape![64, 16]),
+                );
+                let gate_weight: Tile<bf16, { [64, 16] }> = ftof(
+                    gate_weight * gate_scale * gate_global,
+                    rounding::NearestEven,
+                );
+                gate_accumulator = mma(activation, gate_weight.transpose(), gate_accumulator);
+
+                let up_packed: Tile<i32, { [1, 64, 8] }> = exti(
+                    up_packed_weight
+                        .load_tile(const_shape![1, 64, 8], [expert, column_tile, k_tile]),
+                );
+                let up_packed = select(
+                    lt_tile(up_packed, zero_i32),
+                    up_packed + byte_modulus,
+                    up_packed,
+                );
+                let up_low = andi(up_packed, low_mask).reshape(const_shape![64, 8, 1]);
+                let up_high = shri(up_packed, nibble_shift).reshape(const_shape![64, 8, 1]);
+                let up_nibbles: Tile<i32, { [64, 8, 2] }> = cat(up_low, up_high, 2);
+                let up_weight = decode_fp4_grouped(up_nibbles.reshape(const_shape![64, 16]));
+                let up_scale: Tile<f32, { [64, 16] }> = convert_tile(
+                    up_weight_scale
+                        .load_tile(const_shape![1, 64, 1], [expert, column_tile, k_tile])
+                        .reshape(const_shape![64, 1])
+                        .broadcast(const_shape![64, 16]),
+                );
+                let up_weight: Tile<bf16, { [64, 16] }> =
+                    ftof(up_weight * up_scale * up_global, rounding::NearestEven);
+                up_accumulator = mma(activation, up_weight.transpose(), up_accumulator);
+            }
+
+            const ONE_F32: f32 = 1.0;
+            let one = broadcast_scalar(ONE_F32, const_shape![16, 64]);
+            let activated = gate_accumulator
+                * true_div(
+                    one,
+                    one + exp(broadcast_scalar(ZERO_F32, const_shape![16, 64]) - gate_accumulator),
+                )
+                * up_accumulator;
+            let output_tile: Tile<bf16, { [16, 64] }> = ftof(activated, rounding::NearestEven);
+            output.store(output_tile, out_idx);
+        }
+    }
+
     fn decode_fp4_grouped(nibbles: Tile<i32, { [64, 16] }>) -> Tile<f32, { [64, 16] }> {
         const EIGHT: i32 = 8;
         let eight: Tile<i32, { [64, 16] }> = broadcast_scalar(EIGHT, const_shape![64, 16]);
@@ -271,7 +382,7 @@ mod kernels {
     }
 }
 
-use kernels::{fp8_w8a16, grouped_nvfp4_w4a16, nvfp4_w4a16};
+use kernels::{fp8_w8a16, grouped_nvfp4_w4a16, grouped_nvfp4_w4a16_silu_mul, nvfp4_w4a16};
 
 /// Scalar-scaled ModelOpt FP8 projection executed as W8A16 on SM80. The
 /// checkpoint's E4M3 bytes stay packed on device; the kernel decodes one tile,
@@ -914,6 +1025,64 @@ impl GroupedNvfp4W4A16 {
         drop(output_partition);
         Ok(output)
     }
+
+    /// Executes gate and up expert banks together and writes
+    /// `silu(gate) * up` directly into `output`.
+    pub(crate) fn enqueue_silu_mul_device_plan_into(
+        &self,
+        up: &Self,
+        dispatched: Arc<Tensor<bf16>>,
+        rows: usize,
+        expert_by_row_tile: Arc<Tensor<i32>>,
+        mut output: Tensor<bf16>,
+        execution: &mut StreamExecution<'_>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        if self.input_size != up.input_size
+            || self.output_size != up.output_size
+            || self.num_experts != up.num_experts
+        {
+            return Err(ModelError::Cuda(
+                "fused grouped NVFP4 gate/up banks have incompatible geometry".into(),
+            ));
+        }
+        if rows == 0
+            || !rows.is_multiple_of(TILE_M)
+            || dispatched.shape() != [rows as i32, self.input_size as i32]
+            || expert_by_row_tile.shape() != [(rows / TILE_M) as i32]
+            || output.shape() != [rows as i32, self.output_size as i32]
+        {
+            return Err(ModelError::Cuda(
+                "invalid fused grouped NVFP4 gate/up dispatch/output plan".into(),
+            ));
+        }
+        let logical_tiles = (rows / TILE_M)
+            .checked_mul(self.output_size / GROUPED_TILE_N)
+            .ok_or_else(|| ModelError::Cuda("grouped output tile count overflowed".into()))?;
+        let workers = logical_tiles.min(device_sm_count(execution.stream())?);
+        let output_partition = (&mut output).partition([TILE_M, GROUPED_TILE_N]).map(
+            [8, 1],
+            u32::try_from(workers).map_err(|_| {
+                ModelError::Cuda("persistent grouped worker count overflowed u32".into())
+            })?,
+        );
+        let (output_partition, ..) = execution.enqueue(
+            grouped_nvfp4_w4a16_silu_mul(
+                output_partition,
+                dispatched,
+                expert_by_row_tile,
+                self.packed_weight.clone(),
+                self.weight_scale.clone(),
+                self.weight_global_scale.clone(),
+                up.packed_weight.clone(),
+                up.weight_scale.clone(),
+                up.weight_global_scale.clone(),
+            )
+            .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()]),
+            "execute fused grouped NVFP4 gate/up SwiGLU",
+        )?;
+        drop(output_partition);
+        Ok(output)
+    }
 }
 
 fn device_sm_count(stream: &Arc<Stream>) -> Result<usize, ModelError> {
@@ -1147,6 +1316,28 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     };
     let grouped =
         GroupedNvfp4W4A16::load(&source, "experts", ExpertProjection::Gate, EXPERTS, stream)?;
+    let up_packed = packed
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| byte.rotate_left((index % 7) as u32))
+        .collect::<Vec<_>>();
+    let up_scale_bytes = scale_bytes
+        .iter()
+        .map(|scale| if *scale == 0x38 { 0x40 } else { 0x38 })
+        .collect::<Vec<_>>();
+    let up_global_scales = [0.125f32, 0.75f32];
+    let up_global_scale_bytes = up_global_scales.map(f32::to_le_bytes);
+    let up_source = GroupedNvfp4ValidationSource {
+        prefix: "experts",
+        input_size,
+        output_size,
+        packed: &up_packed,
+        scales: &up_scale_bytes,
+        global_scales: &up_global_scale_bytes,
+        input_scales: &input_scale_bytes,
+    };
+    let up_grouped =
+        GroupedNvfp4W4A16::load(&up_source, "experts", ExpertProjection::Up, EXPERTS, stream)?;
     let mut execution = StreamExecution::new(stream);
     for projection in [ExpertProjection::Up, ExpertProjection::Down] {
         let parsed = GroupedNvfp4W4A16::load(&source, "experts", projection, EXPERTS, stream)?;
@@ -1176,12 +1367,35 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         .reshape(&[rows, input_size])
         .map_err(|error| ModelError::Cuda(format!("reshape grouped test input: {error:?}")))?;
     let expert_by_row_tile = [1i32, 0i32];
+    let input = Arc::new(input);
     let output =
-        Arc::new(grouped.enqueue(Arc::new(input), rows, &expert_by_row_tile, &mut execution)?);
+        Arc::new(grouped.enqueue(input.clone(), rows, &expert_by_row_tile, &mut execution)?);
+    let expert_by_row_tile_device =
+        api::copy_host_vec_to_device(&Arc::new(expert_by_row_tile.to_vec()))
+            .sync_on(stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!("upload fused grouped expert map: {error:?}"))
+            })?;
+    let fused_output = execution.enqueue(
+        api::zeros::<bf16>(&[rows, output_size]),
+        "allocate fused grouped probe output",
+    )?;
+    let fused_output = Arc::new(grouped.enqueue_silu_mul_device_plan_into(
+        &up_grouped,
+        input,
+        rows,
+        Arc::new(expert_by_row_tile_device),
+        fused_output,
+        &mut execution,
+    )?);
     let actual: Vec<bf16> = output
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("copy grouped test output: {error:?}")))?;
+    let fused_actual: Vec<bf16> = fused_output
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("copy fused grouped test output: {error:?}")))?;
     execution.mark_synchronized();
 
     let mut max_abs_error = 0.0f32;
@@ -1198,12 +1412,36 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
                 let weight = bf16::from_f32(decode_e2m1(nibble) * scale).to_f32();
                 expected += input_host[row * input_size + k].to_f32() * weight;
             }
+            let expected_accumulator = expected;
             let expected = bf16::from_f32(expected).to_f32();
             let actual = actual[row * output_size + column].to_f32();
             max_abs_error = max_abs_error.max((actual - expected).abs());
             if !actual.is_finite() || (actual - expected).abs() > 0.25 {
                 return Err(ModelError::Cuda(format!(
                     "grouped NVFP4 mismatch at ({row}, {column}), expert {expert}: {actual} != {expected}"
+                )));
+            }
+
+            let up_scale_index = (expert * output_size + column) * (input_size / GROUP_K);
+            let up_scale = decode_e4m3fn(up_scale_bytes[up_scale_index]) * up_global_scales[expert];
+            let mut expected_up = 0.0f32;
+            for k in 0..input_size {
+                let byte_index = (expert * output_size + column) * (input_size / 2) + k / 2;
+                let byte = up_packed[byte_index];
+                let nibble = if k % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                let weight = bf16::from_f32(decode_e2m1(nibble) * up_scale).to_f32();
+                expected_up += input_host[row * input_size + k].to_f32() * weight;
+            }
+            let expected_fused =
+                expected_accumulator * (1.0 / (1.0 + (-expected_accumulator).exp())) * expected_up;
+            let expected_fused = bf16::from_f32(expected_fused).to_f32();
+            let fused_actual = fused_actual[row * output_size + column].to_f32();
+            max_abs_error = max_abs_error.max((fused_actual - expected_fused).abs());
+            let fused_tolerance = 1.0f32.max(expected_fused.abs() * 0.02);
+            if !fused_actual.is_finite() || (fused_actual - expected_fused).abs() > fused_tolerance
+            {
+                return Err(ModelError::Cuda(format!(
+                    "fused grouped NVFP4 SwiGLU mismatch at ({row}, {column}), expert {expert}: {fused_actual} != {expected_fused}"
                 )));
             }
         }
