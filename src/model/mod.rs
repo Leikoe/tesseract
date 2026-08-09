@@ -84,16 +84,6 @@ struct ModelManifest {
     model_type: String,
 }
 
-impl ModelManifest {
-    fn unsupported(&self, model_id: &str) -> ModelError {
-        ModelError::UnsupportedArchitecture {
-            model_id: model_id.into(),
-            architectures: self.architectures.clone(),
-            model_type: self.model_type.clone(),
-        }
-    }
-}
-
 fn model_manifest(model_dir: &Path) -> Result<ModelManifest, ModelError> {
     let path = model_dir.join("config.json");
     let text = read_file(&path)?;
@@ -120,7 +110,10 @@ pub fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelErr
         qwen3_5_moe::Qwen35MoeText::ARCH_NAME => Ok(Arc::new(qwen3_5_moe::Qwen35MoeText::load(
             model_id, model_dir,
         )?)),
-        _ => Err(manifest.unsupported(model_id)),
+        _ => Err(ModelError::UnsupportedArchitecture {
+            architectures: manifest.architectures,
+            model_type: manifest.model_type,
+        }),
     }
 }
 
@@ -152,7 +145,10 @@ pub fn load_cuda_executor(
             max_batch_tokens,
             max_running,
         ),
-        _ => Err(manifest.unsupported(model_id)),
+        _ => Err(ModelError::UnsupportedArchitecture {
+            architectures: manifest.architectures,
+            model_type: manifest.model_type,
+        }),
     }
 }
 
@@ -171,7 +167,10 @@ pub fn validate_cuda_model(
         qwen3_5_moe::Qwen35MoeText::ARCH_NAME => {
             qwen3_5_moe::validate_cuda_model(model_id, model_dir, device_id)
         }
-        _ => Err(manifest.unsupported(model_id)),
+        _ => Err(ModelError::UnsupportedArchitecture {
+            architectures: manifest.architectures,
+            model_type: manifest.model_type,
+        }),
     }
 }
 
@@ -191,7 +190,10 @@ pub fn validate_cuda_next_token(
         qwen3_5_moe::Qwen35MoeText::ARCH_NAME => {
             qwen3_5_moe::validate_cuda_next_token(model_id, model_dir, device_id, prompt)
         }
-        _ => Err(manifest.unsupported(model_id)),
+        _ => Err(ModelError::UnsupportedArchitecture {
+            architectures: manifest.architectures,
+            model_type: manifest.model_type,
+        }),
     }
 }
 
@@ -203,11 +205,8 @@ pub enum ModelError {
     NoArchitecture(String),
     #[error("unsupported execution path: {0}")]
     UnsupportedExecution(String),
-    #[error(
-        "model `{model_id}` declares unsupported architecture(s) {architectures:?} and model type `{model_type}`"
-    )]
+    #[error("unsupported architecture(s) {architectures:?} for model type `{model_type}`")]
     UnsupportedArchitecture {
-        model_id: String,
         architectures: Vec<String>,
         model_type: String,
     },

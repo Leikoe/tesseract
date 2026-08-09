@@ -184,6 +184,10 @@ use .first then lmao
 
 don't .map the model but rather Arc::new(<ModelType>::load(..)?)
 
+## User
+
+UnsupportedArchitecture.model_id is useless. just inline the error variant creation, it'll be simpler
+
 ```text
 you will need good grouped gemm kernels (nfp4 weights loads + bf16 activations loads + bf16 tensor cores w fp32 acc + cast back to bf16 before store)
 ```
