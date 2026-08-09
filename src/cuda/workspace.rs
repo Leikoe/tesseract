@@ -8,7 +8,7 @@
 
 use std::{collections::VecDeque, sync::Arc};
 
-use cuda_core::DType;
+use cuda_core::{DType, IntoResult};
 use cutile::{api, core::bf16, tensor::Tensor};
 
 use crate::{cuda::execution::StreamExecution, model::ModelError};
@@ -75,10 +75,19 @@ impl<T: DType> TensorPool<T> {
         });
         let tensor = self.take(shape, execution, allocation_name)?;
         if had_matching_tensor {
-            execution.enqueue(api::fill(tensor, T::zero()), clear_name)
-        } else {
-            Ok(tensor)
+            execution.mark_pending();
+            unsafe {
+                cuda_core::sys::cuMemsetD8Async(
+                    tensor.device_pointer().cu_deviceptr(),
+                    0,
+                    tensor.num_bytes(),
+                    execution.stream().cu_stream(),
+                )
+                .result()
+                .map_err(|error| ModelError::Cuda(format!("{clear_name}: {error:?}")))?;
+            }
         }
+        Ok(tensor)
     }
 
     fn retire(&mut self, tensor: Tensor<T>) {
