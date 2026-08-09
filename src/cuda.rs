@@ -122,8 +122,8 @@ mod nvfp4_probe_kernels {
             .reshape(const_shape![16, 128]);
 
         let lhs: Tile<bf16, { [16, 128] }> = ftof(lhs * lhs_scales, rounding::NearestEven);
-        let rhs: Tile<bf16, { [128, 16] }> =
-            ftof(rhs * rhs_scales, rounding::NearestEven).transpose();
+        let rhs: Tile<bf16, { [16, 128] }> = ftof(rhs * rhs_scales, rounding::NearestEven);
+        let rhs = rhs.transpose();
         let accumulator = constant(0.0f32, const_shape![16, 16]);
         out.store(mmaf(lhs, rhs, accumulator));
     }
