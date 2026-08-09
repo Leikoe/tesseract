@@ -11,7 +11,7 @@ use cuda_core::{Device, f4e2m1fnx2, f8e4m3fn};
 use cutile::{
     api::{self, DeviceOpReshape},
     core::bf16,
-    tensor::{PartitionMut, Reshape, ToHostVec},
+    tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
 };
 use thiserror::Error;
 
@@ -156,26 +156,30 @@ pub fn probe_nvfp4_scaled_mma(device_id: usize) -> Result<Nvfp4ScaledMmaReport, 
     // 0x2 is FP4 +1.0 and 0x38 is E4M3 +1.0. Thus every result must be K.
     let fp4_one = f4e2m1fnx2::from_nibbles(0x2, 0x2);
     let scale_one = f8e4m3fn(0x38);
-    let lhs = api::copy_host_vec_to_device(&Arc::new(vec![fp4_one; TILE * K / 2]))
-        .reshape(&[TILE, K / 2])
-        .sync_on(&stream)
-        .map_err(|error| nvfp4_kernel_error("upload lhs", error))?
-        .into();
-    let rhs = api::copy_host_vec_to_device(&Arc::new(vec![fp4_one; TILE * K / 2]))
-        .reshape(&[TILE, K / 2])
-        .sync_on(&stream)
-        .map_err(|error| nvfp4_kernel_error("upload rhs", error))?
-        .into();
-    let lhs_scales = api::copy_host_vec_to_device(&Arc::new(vec![scale_one; TILE * K / 16]))
-        .reshape(&[TILE, K / 16])
-        .sync_on(&stream)
-        .map_err(|error| nvfp4_kernel_error("upload lhs scales", error))?
-        .into();
-    let rhs_scales = api::copy_host_vec_to_device(&Arc::new(vec![scale_one; TILE * K / 16]))
-        .reshape(&[TILE, K / 16])
-        .sync_on(&stream)
-        .map_err(|error| nvfp4_kernel_error("upload rhs scales", error))?
-        .into();
+    let lhs: Arc<Tensor<f4e2m1fnx2>> =
+        api::copy_host_vec_to_device(&Arc::new(vec![fp4_one; TILE * K / 2]))
+            .reshape(&[TILE, K / 2])
+            .sync_on(&stream)
+            .map_err(|error| nvfp4_kernel_error("upload lhs", error))?
+            .into();
+    let rhs: Arc<Tensor<f4e2m1fnx2>> =
+        api::copy_host_vec_to_device(&Arc::new(vec![fp4_one; TILE * K / 2]))
+            .reshape(&[TILE, K / 2])
+            .sync_on(&stream)
+            .map_err(|error| nvfp4_kernel_error("upload rhs", error))?
+            .into();
+    let lhs_scales: Arc<Tensor<f8e4m3fn>> =
+        api::copy_host_vec_to_device(&Arc::new(vec![scale_one; TILE * K / 16]))
+            .reshape(&[TILE, K / 16])
+            .sync_on(&stream)
+            .map_err(|error| nvfp4_kernel_error("upload lhs scales", error))?
+            .into();
+    let rhs_scales: Arc<Tensor<f8e4m3fn>> =
+        api::copy_host_vec_to_device(&Arc::new(vec![scale_one; TILE * K / 16]))
+            .reshape(&[TILE, K / 16])
+            .sync_on(&stream)
+            .map_err(|error| nvfp4_kernel_error("upload rhs scales", error))?
+            .into();
     let out = api::zeros::<f32>(&[TILE, TILE])
         .sync_on(&stream)
         .map_err(|error| nvfp4_kernel_error("allocate output", error))?
