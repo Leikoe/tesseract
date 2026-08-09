@@ -27,6 +27,16 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    fn tesseract_marlin_repack_experts(
+        input: *const c_void,
+        output: *mut c_void,
+        experts: i32,
+        size_k: i32,
+        size_n: i32,
+        num_bits: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
     fn tesseract_marlin_gemm_bf16(
         a: *const c_void,
         b: *const c_void,
@@ -39,6 +49,24 @@ unsafe extern "C" {
         n: i32,
         k: i32,
         quant_bits: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    fn tesseract_marlin_moe_gemm_bf16(
+        activations: *const c_void,
+        packed_expert_weights: *const c_void,
+        output: *mut c_void,
+        fp32_temporary: *mut c_void,
+        block_scales: *const c_void,
+        expert_global_scales_bf16: *const c_void,
+        workspace: *mut i32,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        num_tokens_past_padded: *const i32,
+        rows: i32,
+        output_size: i32,
+        input_size: i32,
+        moe_block_size: i32,
         stream: *mut c_void,
     ) -> i32;
 }
@@ -202,6 +230,154 @@ impl MarlinLinear {
     }
 }
 
+pub struct MarlinMoe {
+    input_size: usize,
+    output_size: usize,
+    num_experts: usize,
+    packed_weight: Arc<Tensor<u32>>,
+    scales: Arc<Tensor<u8>>,
+    global_scales: Arc<Tensor<bf16>>,
+    workspace: Arc<Tensor<i32>>,
+}
+
+impl MarlinMoe {
+    pub fn nvfp4(
+        packed_enk: &[u8],
+        scale_bytes_eng: &[u8],
+        weight_global_scales: &[f32],
+        input_size: usize,
+        output_size: usize,
+        stream: &Arc<Stream>,
+    ) -> Result<Self, ModelError> {
+        let num_experts = weight_global_scales.len();
+        let weight_bytes_per_expert = output_size.saturating_mul(input_size / 2);
+        let scale_bytes_per_expert = output_size.saturating_mul(input_size / 16);
+        if num_experts == 0
+            || input_size % 16 != 0
+            || output_size % 64 != 0
+            || packed_enk.len() != num_experts.saturating_mul(weight_bytes_per_expert)
+            || scale_bytes_eng.len() != num_experts.saturating_mul(scale_bytes_per_expert)
+            || weight_global_scales
+                .iter()
+                .any(|scale| !scale.is_finite() || *scale <= 0.0)
+        {
+            return Err(ModelError::Cuda(
+                "invalid grouped Marlin NVFP4 artifact".into(),
+            ));
+        }
+
+        let mut packed_kn = Vec::with_capacity(num_experts * input_size * output_size / 8);
+        let mut scales = Vec::with_capacity(num_experts * scale_bytes_per_expert);
+        let mut global_scales = Vec::with_capacity(num_experts);
+        for expert in 0..num_experts {
+            let weight_start = expert * weight_bytes_per_expert;
+            packed_kn.extend(pack_k_major(
+                &packed_enk[weight_start..weight_start + weight_bytes_per_expert],
+                input_size,
+                output_size,
+                4,
+            )?);
+            let scale_start = expert * scale_bytes_per_expert;
+            let (expert_scales, adjusted_global_scale) = prepare_nvfp4_scales(
+                &scale_bytes_eng[scale_start..scale_start + scale_bytes_per_expert],
+                input_size,
+                output_size,
+                weight_global_scales[expert],
+            )?;
+            scales.extend(expert_scales);
+            global_scales.push(bf16::from_f32(adjusted_global_scale));
+        }
+
+        let source = upload(packed_kn, stream, "upload grouped Marlin source weights")?;
+        let packed_weight = api::zeros::<u32>(&[source.shape()[0] as usize])
+            .sync_on(stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!("allocate grouped Marlin weights: {error:?}"))
+            })?;
+        let status = unsafe {
+            tesseract_marlin_repack_experts(
+                source.device_pointer().cu_deviceptr() as usize as *const c_void,
+                packed_weight.device_pointer().cu_deviceptr() as usize as *mut c_void,
+                num_experts as i32,
+                input_size as i32,
+                output_size as i32,
+                4,
+                stream.cu_stream().cast(),
+            )
+        };
+        status_result(status, "repack grouped Marlin weights")?;
+        unsafe { stream.synchronize() }.map_err(|error| {
+            ModelError::Cuda(format!("synchronize grouped Marlin repack: {error:?}"))
+        })?;
+        Ok(Self {
+            input_size,
+            output_size,
+            num_experts,
+            packed_weight: Arc::new(packed_weight),
+            scales: upload(scales, stream, "upload grouped Marlin scales")?,
+            global_scales: upload(global_scales, stream, "upload grouped Marlin global scales")?,
+            workspace: workspace_len(stream, sm_count(stream)?.saturating_mul(4))?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute(
+        &self,
+        input: &Tensor<bf16>,
+        output: &Tensor<bf16>,
+        temporary: &Tensor<f32>,
+        sorted_token_ids: &Tensor<i32>,
+        expert_ids: &Tensor<i32>,
+        num_tokens_past_padded: &Tensor<i32>,
+        rows: usize,
+        block_rows: usize,
+        stream: &Arc<Stream>,
+    ) -> Result<(), ModelError> {
+        if rows == 0
+            || !rows.is_multiple_of(block_rows)
+            || !matches!(block_rows, 8 | 16 | 32 | 48 | 64)
+            || input.shape() != [rows as i32, self.input_size as i32]
+            || output.shape() != [rows as i32, self.output_size as i32]
+            || temporary.shape() != [rows as i32, self.output_size as i32]
+            || sorted_token_ids.shape() != [rows as i32]
+            || expert_ids.shape() != [(rows / block_rows) as i32]
+            || num_tokens_past_padded.shape() != [1]
+        {
+            return Err(ModelError::Cuda(
+                "invalid grouped Marlin execution geometry".into(),
+            ));
+        }
+        stream
+            .device()
+            .bind_to_thread()
+            .map_err(|error| ModelError::Cuda(format!("bind Marlin device: {error:?}")))?;
+        let status = unsafe {
+            tesseract_marlin_moe_gemm_bf16(
+                input.device_pointer().cu_deviceptr() as usize as *const c_void,
+                self.packed_weight.device_pointer().cu_deviceptr() as usize as *const c_void,
+                output.device_pointer().cu_deviceptr() as usize as *mut c_void,
+                temporary.device_pointer().cu_deviceptr() as usize as *mut c_void,
+                self.scales.device_pointer().cu_deviceptr() as usize as *const c_void,
+                self.global_scales.device_pointer().cu_deviceptr() as usize as *const c_void,
+                self.workspace.device_pointer().cu_deviceptr() as usize as *mut i32,
+                sorted_token_ids.device_pointer().cu_deviceptr() as usize as *const i32,
+                expert_ids.device_pointer().cu_deviceptr() as usize as *const i32,
+                num_tokens_past_padded.device_pointer().cu_deviceptr() as usize as *const i32,
+                rows as i32,
+                self.output_size as i32,
+                self.input_size as i32,
+                block_rows as i32,
+                stream.cu_stream().cast(),
+            )
+        };
+        status_result(status, "launch grouped Marlin GEMM")
+    }
+
+    pub const fn num_experts(&self) -> usize {
+        self.num_experts
+    }
+}
+
 fn pack_k_major(
     encoded_nk: &[u8],
     input_size: usize,
@@ -261,6 +437,10 @@ fn repack(
 }
 
 fn workspace(stream: &Arc<Stream>) -> Result<Arc<Tensor<i32>>, ModelError> {
+    workspace_len(stream, sm_count(stream)?)
+}
+
+fn sm_count(stream: &Arc<Stream>) -> Result<usize, ModelError> {
     let mut sms = 0i32;
     unsafe {
         sys::cuDeviceGetAttribute(
@@ -271,7 +451,14 @@ fn workspace(stream: &Arc<Stream>) -> Result<Arc<Tensor<i32>>, ModelError> {
         .result()
         .map_err(|error| ModelError::Cuda(format!("query Marlin SM count: {error:?}")))?;
     }
-    let workspace = api::zeros::<i32>(&[sms as usize])
+    usize::try_from(sms)
+        .ok()
+        .filter(|sms| *sms > 0)
+        .ok_or_else(|| ModelError::Cuda(format!("invalid Marlin SM count {sms}")))
+}
+
+fn workspace_len(stream: &Arc<Stream>, length: usize) -> Result<Arc<Tensor<i32>>, ModelError> {
+    let workspace = api::zeros::<i32>(&[length])
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("allocate Marlin workspace: {error:?}")))?;
     Ok(Arc::new(workspace))
@@ -371,6 +558,7 @@ fn status_result(status: i32, operation: &str) -> Result<(), ModelError> {
 pub struct MarlinProbe {
     pub fp8_max_abs_error: f32,
     pub nvfp4_max_abs_error: f32,
+    pub grouped_nvfp4_max_abs_error: f32,
 }
 
 #[derive(Debug, Serialize)]
@@ -769,6 +957,7 @@ pub fn probe(stream: &Arc<Stream>) -> Result<MarlinProbe, ModelError> {
     Ok(MarlinProbe {
         fp8_max_abs_error: probe_fp8(stream)?,
         nvfp4_max_abs_error: probe_nvfp4(stream)?,
+        grouped_nvfp4_max_abs_error: probe_grouped_nvfp4(stream)?,
     })
 }
 
@@ -833,6 +1022,110 @@ fn probe_nvfp4(stream: &Arc<Stream>) -> Result<f32, ModelError> {
             * decode_e4m3fn(scales[column * (K / 16) + k / 16])
             * GLOBAL
     })
+}
+
+fn probe_grouped_nvfp4(stream: &Arc<Stream>) -> Result<f32, ModelError> {
+    const EXPERTS: usize = 2;
+    const BLOCK_ROWS: usize = 16;
+    const M: usize = EXPERTS * BLOCK_ROWS;
+    const N: usize = 128;
+    const K: usize = 128;
+    const GLOBALS: [f32; EXPERTS] = [0.25, 0.75];
+    let packed = (0..EXPERTS * N * K / 2)
+        .map(|index| {
+            let expert = index / (N * K / 2);
+            let low = ((index * 2 + expert * 3) % 16) as u8;
+            let high = ((index * 2 + 1 + expert * 5) % 16) as u8;
+            low | (high << 4)
+        })
+        .collect::<Vec<_>>();
+    let scales = (0..EXPERTS * N * (K / 16))
+        .map(|index| {
+            let expert = index / (N * (K / 16));
+            if (index + expert) % 2 == 0 {
+                0x38
+            } else {
+                0x40
+            }
+        })
+        .collect::<Vec<_>>();
+    let linear = MarlinMoe::nvfp4(&packed, &scales, &GLOBALS, K, N, stream)?;
+    if linear.num_experts() != EXPERTS {
+        return Err(ModelError::Cuda(
+            "grouped Marlin expert count changed".into(),
+        ));
+    }
+    let input_host = (0..M * K)
+        .map(|index| bf16::from_f32((index % 7) as f32 - 3.0))
+        .collect::<Vec<_>>();
+    let input = upload(
+        input_host.clone(),
+        stream,
+        "upload grouped Marlin probe input",
+    )?
+    .reshape(&[M, K])
+    .map_err(|error| ModelError::Cuda(format!("reshape grouped Marlin input: {error:?}")))?;
+    let output = api::zeros::<bf16>(&[M, N])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate grouped Marlin output: {error:?}")))?;
+    let temporary = api::zeros::<f32>(&[M, N])
+        .sync_on(stream)
+        .map_err(|error| {
+            ModelError::Cuda(format!("allocate grouped Marlin temporary: {error:?}"))
+        })?;
+    let sorted_token_ids = upload(
+        (0..M as i32).collect(),
+        stream,
+        "upload grouped Marlin sorted token IDs",
+    )?;
+    let expert_ids = upload(
+        (0..EXPERTS as i32).collect(),
+        stream,
+        "upload grouped Marlin expert IDs",
+    )?;
+    let padded_count = upload(vec![M as i32], stream, "upload grouped Marlin padded count")?;
+    linear.execute(
+        &input,
+        &output,
+        &temporary,
+        &sorted_token_ids,
+        &expert_ids,
+        &padded_count,
+        M,
+        BLOCK_ROWS,
+        stream,
+    )?;
+    let actual: Vec<bf16> = output
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("download grouped Marlin probe: {error:?}")))?;
+    let mut max_error = 0.0f32;
+    for row in 0..M {
+        let expert = row / BLOCK_ROWS;
+        for column in 0..N {
+            let mut expected = 0.0f32;
+            for k in 0..K {
+                let weight_base = expert * N * K / 2 + column * K / 2;
+                let byte = packed[weight_base + k / 2];
+                let nibble = if k % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                let scale_base = expert * N * (K / 16) + column * (K / 16);
+                let weight = crate::quantization::decode_e2m1(nibble)
+                    * decode_e4m3fn(scales[scale_base + k / 16])
+                    * GLOBALS[expert];
+                expected += input_host[row * K + k].to_f32() * bf16::from_f32(weight).to_f32();
+            }
+            let expected = bf16::from_f32(expected).to_f32();
+            let value = actual[row * N + column].to_f32();
+            let error = (value - expected).abs();
+            max_error = max_error.max(error);
+            if !value.is_finite() || error > 0.5 {
+                return Err(ModelError::Cuda(format!(
+                    "grouped Marlin mismatch at expert {expert}, ({row}, {column}): {value} != {expected}"
+                )));
+            }
+        }
+    }
+    Ok(max_error)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -465,6 +465,27 @@ extern "C" int tesseract_marlin_repack(const void* input, void* output,
   return static_cast<int>(cudaPeekAtLastError());
 }
 
+extern "C" int tesseract_marlin_repack_experts(
+    const void* input, void* output, int experts, int size_k, int size_n,
+    int num_bits, void* raw_stream) {
+  if (input == nullptr || output == nullptr || experts <= 0 || size_k <= 0 ||
+      size_n <= 0 || (num_bits != 4 && num_bits != 8)) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  const size_t words_per_expert =
+      static_cast<size_t>(size_k) * static_cast<size_t>(size_n) * num_bits / 32;
+  const auto* source = static_cast<const uint32_t*>(input);
+  auto* destination = static_cast<uint32_t*>(output);
+  for (int expert = 0; expert < experts; ++expert) {
+    const int status = tesseract_marlin_repack(
+        source + static_cast<size_t>(expert) * words_per_expert,
+        destination + static_cast<size_t>(expert) * words_per_expert,
+        size_k, size_n, num_bits, raw_stream);
+    if (status != static_cast<int>(cudaSuccess)) return status;
+  }
+  return static_cast<int>(cudaSuccess);
+}
+
 extern "C" int tesseract_marlin_gemm_bf16(
     const void* a, const void* b, void* c, void* c_tmp, const void* scales,
     const float* global_scale, int* workspace, int m, int n, int k,
