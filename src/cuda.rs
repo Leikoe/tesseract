@@ -26,6 +26,7 @@ pub(crate) mod kernels;
 pub(crate) mod linear;
 pub(crate) mod moe;
 pub(crate) mod qwen3_5_moe;
+pub(crate) mod qwen_attention;
 
 #[cutile::module]
 mod smoke_kernels {
