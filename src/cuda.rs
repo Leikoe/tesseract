@@ -125,7 +125,7 @@ mod nvfp4_probe_kernels {
         let rhs: Tile<bf16, { [16, 128] }> = ftof(rhs * rhs_scales, rounding::NearestEven);
         let rhs = rhs.transpose();
         let accumulator = constant(0.0f32, const_shape![16, 16]);
-        out.store(mmaf(lhs, rhs, accumulator));
+        out.store(mma(lhs, rhs, accumulator));
     }
 
     fn decode_fp4(nibbles: Tile<u8, { [16, 128] }>) -> Tile<f32, { [16, 128] }> {
