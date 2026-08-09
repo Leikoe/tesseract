@@ -1608,3 +1608,18 @@ impl WeightSource for GroupedNvfp4ValidationSource<'_> {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use cuda_core::Device;
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU and CUDA 13.2+"]
+    fn fused_grouped_gate_up_matches_the_reference() {
+        let device = Device::new(0).expect("initialize CUDA device");
+        let stream = device.new_stream().expect("create CUDA stream");
+        let error =
+            super::probe_grouped_nvfp4_w4a16(&stream).expect("run fused grouped NVFP4 probe");
+        assert!(error.is_finite(), "probe returned non-finite error");
+    }
+}

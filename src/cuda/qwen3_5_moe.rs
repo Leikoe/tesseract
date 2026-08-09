@@ -112,6 +112,7 @@ struct PaddedBatch {
 }
 
 const ROW_ALIGNMENT: usize = 16;
+const CONTEXT_ALIGNMENT: usize = 64;
 const PRIVATE_PADDING_SLOTS: usize = ROW_ALIGNMENT - 1;
 const HIDDEN_SIZE: usize = 2048;
 const EMBEDDING_BLOCK: usize = 256;
@@ -200,8 +201,8 @@ impl PaddedBatch {
             .map(Vec::len)
             .max()
             .unwrap_or(1)
-            .div_ceil(16)
-            * 16;
+            .div_ceil(CONTEXT_ALIGNMENT)
+            * CONTEXT_ALIGNMENT;
         let sentinel = u32::try_from(kv_capacity)
             .map_err(|_| ModelError::Cuda("Qwen KV sentinel overflowed".into()))?;
         let mut context_slots = Vec::with_capacity(requests * context_bucket);
@@ -484,6 +485,17 @@ impl Program {
         let positions = upload_u32(&padded.positions, stream, "Qwen positions")?;
         let current_slots = upload_u32(&padded.current_slots, stream, "Qwen current KV slots")?;
         let request_indices = upload_u32(&padded.request_indices, stream, "Qwen request indices")?;
+        let query_start_offsets = upload_u32(
+            &padded.query_start_offsets,
+            stream,
+            "Qwen query start offsets",
+        )?;
+        let max_query_tokens = padded
+            .query_start_offsets
+            .windows(2)
+            .map(|offsets| (offsets[1] - offsets[0]) as usize)
+            .max()
+            .unwrap_or(1);
         let recurrent_slots =
             upload_i32_named(&padded.recurrent_slots, stream, "Qwen recurrent slots")?;
         let context_lengths =
@@ -559,6 +571,9 @@ impl Program {
                         positions.clone(),
                         current_slots.clone(),
                         request_indices.clone(),
+                        query_start_offsets.clone(),
+                        padded.requests,
+                        max_query_tokens,
                         &context_slots,
                         context_lengths.clone(),
                         rows,
@@ -932,6 +947,9 @@ impl Layer {
         positions: Arc<Tensor<u32>>,
         current_slots: Arc<Tensor<u32>>,
         request_indices: Arc<Tensor<u32>>,
+        query_start_offsets: Arc<Tensor<u32>>,
+        requests: usize,
+        max_query_tokens: usize,
         context_slots: &TensorView<'_, u32>,
         context_lengths: Arc<Tensor<i32>>,
         rows: usize,
@@ -974,6 +992,9 @@ impl Layer {
             positions,
             current_slots,
             request_indices,
+            query_start_offsets,
+            requests,
+            max_query_tokens,
             context_slots,
             context_lengths,
             rows,
@@ -1178,6 +1199,9 @@ impl FullAttention {
         positions: Arc<Tensor<u32>>,
         current_slots: Arc<Tensor<u32>>,
         request_indices: Arc<Tensor<u32>>,
+        query_start_offsets: Arc<Tensor<u32>>,
+        requests: usize,
+        max_query_tokens: usize,
         context_slots: &TensorView<'_, u32>,
         context_lengths: Arc<Tensor<i32>>,
         rows: usize,
@@ -1198,8 +1222,11 @@ impl FullAttention {
             positions,
             current_slots,
             request_indices,
+            query_start_offsets,
             context_slots,
             context_lengths,
+            requests,
+            max_query_tokens,
             rows,
             epsilon,
             stream: &stream,
@@ -1257,37 +1284,17 @@ impl Moe {
             workspace,
         )?;
         let dispatched_rows = routing.max_dispatched_rows;
-        let routed_gate_output = workspace.take_bf16(
+        let routed_activation_output = workspace.take_bf16(
             &[dispatched_rows, self.routed_gate.output_size()],
             execution,
-            "allocate routed gate output",
+            "allocate routed activation output",
         )?;
-        let routed_gate = self.routed_gate.enqueue_device_plan_into(
+        let routed_activated = self.routed_gate.enqueue_silu_mul_device_plan_into(
+            &self.routed_up,
             dispatched.hidden.clone(),
             dispatched_rows,
             dispatched.expert_by_row_tile.clone(),
-            routed_gate_output,
-            execution,
-        )?;
-        let routed_up_output = workspace.take_bf16(
-            &[dispatched_rows, self.routed_up.output_size()],
-            execution,
-            "allocate routed up output",
-        )?;
-        let routed_up = self.routed_up.enqueue_device_plan_into(
-            dispatched.hidden.clone(),
-            dispatched_rows,
-            dispatched.expert_by_row_tile.clone(),
-            routed_up_output,
-            execution,
-        )?;
-        let routed_gate = Arc::new(routed_gate);
-        let routed_up = Arc::new(routed_up);
-        let routed_activated = silu_mul(
-            routed_gate.clone(),
-            routed_up.clone(),
-            dispatched_rows,
-            self.routed_gate.output_size(),
+            routed_activation_output,
             execution,
         )?;
         let routed_activated = Arc::new(routed_activated);
@@ -1371,8 +1378,6 @@ impl Moe {
             HIDDEN_SIZE,
             execution,
         )?;
-        workspace.retire_shared_bf16(routed_gate, "routed gate output")?;
-        workspace.retire_shared_bf16(routed_up, "routed up output")?;
         workspace.retire_shared_bf16(routed_activated, "routed activation")?;
         workspace.retire_shared_bf16(routed_down, "routed down output")?;
         workspace.retire_shared_bf16(shared_gate, "shared gate output")?;
