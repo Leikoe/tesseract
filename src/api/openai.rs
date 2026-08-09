@@ -1,10 +1,16 @@
-use std::{convert::Infallible, time::SystemTime};
+use std::{
+    convert::Infallible,
+    time::{Duration, SystemTime},
+};
 
 use async_stream::stream;
 use axum::{
     Json,
     extract::State,
-    response::{IntoResponse, Response, Sse, sse::Event},
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -20,6 +26,10 @@ use crate::{
 };
 
 const DEFAULT_MAX_TOKENS: usize = 128;
+#[cfg(not(test))]
+const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -279,7 +289,13 @@ async fn streaming_response(
             }
         }
     };
-    Sse::new(events).into_response()
+    Sse::new(events)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(SSE_KEEP_ALIVE_INTERVAL)
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 fn unix_timestamp() -> u64 {

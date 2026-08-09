@@ -116,7 +116,7 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use axum::{
         body::{Body, to_bytes},
@@ -197,19 +197,32 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_chat_is_sse_and_terminates() {
-        let response = test_app()
-            .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(chat_body(true).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = test_app_with(
+            DeterministicExecutor::new().with_submission_delay(Duration::from_millis(30)),
+            EngineConfig {
+                max_pending: 8,
+                max_running: 2,
+                max_batch_tokens: 16,
+                prefill_chunk_tokens: 4,
+                max_sequence_length: 128,
+                kv_capacity_tokens: 128,
+                output_buffer: 8,
+            },
+        )
+        .0
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(chat_body(true).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "text/event-stream");
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains(": keep-alive"));
         assert!(body.contains("\"role\":\"assistant\""));
         assert!(body.contains(" token0"));
         assert!(body.contains("\"completion_tokens\":2"));
