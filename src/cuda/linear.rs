@@ -26,6 +26,8 @@ use crate::{
 const TILE_M: usize = 16;
 const TILE_N: usize = 16;
 const GROUP_K: usize = 16;
+const GROUPED_TILE_N: usize = 64;
+const GROUPED_TILE_K: usize = 32;
 const FP8_SUBNORMAL_SCALE: f32 = 1.0 / 512.0;
 
 #[cutile::module]
@@ -102,17 +104,23 @@ mod kernels {
     /// required.
     #[cutile::entry(unchecked_accesses = false)]
     fn grouped_nvfp4_w4a16<const K_TILES: i32>(
-        mut output: MappedPartitionMut<bf16, { [16, 16] }, { [8, 1] }>,
+        mut output: MappedPartitionMut<bf16, { [16, 64] }, { [8, 1] }>,
         dispatched: &Tensor<bf16, { [-1, -1] }>,
         expert_by_row_tile: &Tensor<i32, { [-1] }>,
         packed_weight: &Tensor<u8, { [-1, -1, -1] }>,
         weight_scale: &Tensor<bf16, { [-1, -1, -1] }>,
         weight_global_scale: &Tensor<f32, { [-1] }>,
     ) {
-        let low_mask: Tile<i32, { [1, 16, 8] }> = constant(0x0fi32, const_shape![1, 16, 8]);
-        let nibble_shift: Tile<i32, { [1, 16, 8] }> = constant(4i32, const_shape![1, 16, 8]);
-        let zero_i32: Tile<i32, { [1, 16, 8] }> = constant(0i32, const_shape![1, 16, 8]);
-        let byte_modulus: Tile<i32, { [1, 16, 8] }> = constant(256i32, const_shape![1, 16, 8]);
+        const LOW_MASK: i32 = 0x0f;
+        let low_mask: Tile<i32, { [1, 64, 16] }> = constant(LOW_MASK, const_shape![1, 64, 16]);
+        const NIBBLE_SHIFT: i32 = 4;
+        let nibble_shift: Tile<i32, { [1, 64, 16] }> =
+            constant(NIBBLE_SHIFT, const_shape![1, 64, 16]);
+        const ZERO_I32: i32 = 0;
+        let zero_i32: Tile<i32, { [1, 64, 16] }> = constant(ZERO_I32, const_shape![1, 64, 16]);
+        const BYTE_MODULUS: i32 = 256;
+        let byte_modulus: Tile<i32, { [1, 64, 16] }> =
+            constant(BYTE_MODULUS, const_shape![1, 64, 16]);
         let k_tiles = Dim::new(K_TILES);
 
         // `iter_indices` maps the full logical output grid onto a physical
@@ -125,32 +133,80 @@ mod kernels {
             let global = weight_global_scale
                 .load_tile(const_shape![1], [expert])
                 .reshape(const_shape![1, 1])
-                .broadcast(const_shape![16, 16]);
-            let mut accumulator = constant(0.0f32, const_shape![16, 16]);
+                .broadcast(const_shape![64, 32]);
+            const ZERO_F32: f32 = 0.0;
+            let mut accumulator = constant(ZERO_F32, const_shape![16, 64]);
 
             for k_tile in k_tiles {
-                let activation = dispatched.load_tile(const_shape![16, 16], [row_tile, k_tile]);
-                let packed: Tile<i32, { [1, 16, 8] }> = exti(
-                    packed_weight.load_tile(const_shape![1, 16, 8], [expert, column_tile, k_tile]),
+                let activation = dispatched.load_tile(const_shape![16, 32], [row_tile, k_tile]);
+                let packed: Tile<i32, { [1, 64, 16] }> = exti(
+                    packed_weight.load_tile(const_shape![1, 64, 16], [expert, column_tile, k_tile]),
                 );
                 let packed = select(lt_tile(packed, zero_i32), packed + byte_modulus, packed);
-                let low = andi(packed, low_mask).reshape(const_shape![16, 8, 1]);
-                let high = shri(packed, nibble_shift).reshape(const_shape![16, 8, 1]);
-                let nibbles: Tile<i32, { [16, 8, 2] }> = cat(low, high, 2);
-                let weight = decode_fp4(nibbles.reshape(const_shape![16, 16]));
-                let scale: Tile<f32, { [16, 16] }> = convert_tile(
+                let low = andi(packed, low_mask).reshape(const_shape![64, 16, 1]);
+                let high = shri(packed, nibble_shift).reshape(const_shape![64, 16, 1]);
+                let nibbles: Tile<i32, { [64, 16, 2] }> = cat(low, high, 2);
+                let weight = decode_fp4_grouped(nibbles.reshape(const_shape![64, 32]));
+                let scale: Tile<f32, { [64, 32] }> = convert_tile(
                     weight_scale
-                        .load_tile(const_shape![1, 16, 1], [expert, column_tile, k_tile])
-                        .reshape(const_shape![16, 1])
-                        .broadcast(const_shape![16, 16]),
+                        .load_tile(const_shape![1, 64, 2], [expert, column_tile, k_tile])
+                        .reshape(const_shape![64, 2, 1])
+                        .broadcast(const_shape![64, 2, 16])
+                        .reshape(const_shape![64, 32]),
                 );
-                let weight: Tile<bf16, { [16, 16] }> =
+                let weight: Tile<bf16, { [64, 32] }> =
                     ftof(weight * scale * global, rounding::NearestEven);
                 accumulator = mma(activation, weight.transpose(), accumulator);
             }
-            let output_tile: Tile<bf16, { [16, 16] }> = ftof(accumulator, rounding::NearestEven);
+            let output_tile: Tile<bf16, { [16, 64] }> = ftof(accumulator, rounding::NearestEven);
             output.store(output_tile, out_idx);
         }
+    }
+
+    fn decode_fp4_grouped(nibbles: Tile<i32, { [64, 32] }>) -> Tile<f32, { [64, 32] }> {
+        const EIGHT: i32 = 8;
+        let eight: Tile<i32, { [64, 32] }> = constant(EIGHT, const_shape![64, 32]);
+        let magnitude = nibbles % eight;
+        let sign = nibbles / eight;
+        const ONE: i32 = 1;
+        let one: Tile<i32, { [64, 32] }> = constant(ONE, const_shape![64, 32]);
+        const TWO: i32 = 2;
+        let two: Tile<i32, { [64, 32] }> = constant(TWO, const_shape![64, 32]);
+        const THREE: i32 = 3;
+        let three: Tile<i32, { [64, 32] }> = constant(THREE, const_shape![64, 32]);
+        const FOUR: i32 = 4;
+        let four: Tile<i32, { [64, 32] }> = constant(FOUR, const_shape![64, 32]);
+        const FIVE: i32 = 5;
+        let five: Tile<i32, { [64, 32] }> = constant(FIVE, const_shape![64, 32]);
+        const SIX: i32 = 6;
+        let six: Tile<i32, { [64, 32] }> = constant(SIX, const_shape![64, 32]);
+        const SEVEN: i32 = 7;
+        let seven: Tile<i32, { [64, 32] }> = constant(SEVEN, const_shape![64, 32]);
+        const ZERO_F: f32 = 0.0;
+        let zero_f: Tile<f32, { [64, 32] }> = constant(ZERO_F, const_shape![64, 32]);
+        const HALF_F: f32 = 0.5;
+        let half_f: Tile<f32, { [64, 32] }> = constant(HALF_F, const_shape![64, 32]);
+        const ONE_F: f32 = 1.0;
+        let one_f: Tile<f32, { [64, 32] }> = constant(ONE_F, const_shape![64, 32]);
+        const ONE_HALF_F: f32 = 1.5;
+        let one_half_f: Tile<f32, { [64, 32] }> = constant(ONE_HALF_F, const_shape![64, 32]);
+        const TWO_F: f32 = 2.0;
+        let two_f: Tile<f32, { [64, 32] }> = constant(TWO_F, const_shape![64, 32]);
+        const THREE_F: f32 = 3.0;
+        let three_f: Tile<f32, { [64, 32] }> = constant(THREE_F, const_shape![64, 32]);
+        const FOUR_F: f32 = 4.0;
+        let four_f: Tile<f32, { [64, 32] }> = constant(FOUR_F, const_shape![64, 32]);
+        const SIX_F: f32 = 6.0;
+        let six_f: Tile<f32, { [64, 32] }> = constant(SIX_F, const_shape![64, 32]);
+        let mut value = zero_f;
+        value = select(eq_tile(magnitude, one), half_f, value);
+        value = select(eq_tile(magnitude, two), one_f, value);
+        value = select(eq_tile(magnitude, three), one_half_f, value);
+        value = select(eq_tile(magnitude, four), two_f, value);
+        value = select(eq_tile(magnitude, five), three_f, value);
+        value = select(eq_tile(magnitude, six), four_f, value);
+        value = select(eq_tile(magnitude, seven), six_f, value);
+        select(eq_tile(sign, one), zero_f - value, value)
     }
 
     fn decode_fp4(nibbles: Tile<i32, { [16, 16] }>) -> Tile<f32, { [16, 16] }> {
@@ -638,8 +694,8 @@ impl GroupedNvfp4W4A16 {
         if num_experts == 0
             || input_size == 0
             || output_size == 0
-            || !input_size.is_multiple_of(GROUP_K)
-            || !output_size.is_multiple_of(TILE_N)
+            || !input_size.is_multiple_of(GROUPED_TILE_K)
+            || !output_size.is_multiple_of(GROUPED_TILE_N)
             || expected_weights != Some(packed_weight.len())
             || expected_scales != Some(scale_bytes.len())
             || weight_global_scale.len() != num_experts
@@ -737,10 +793,10 @@ impl GroupedNvfp4W4A16 {
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("allocate grouped output: {error:?}")))?;
         let logical_tiles = (rows / TILE_M)
-            .checked_mul(self.output_size / TILE_N)
+            .checked_mul(self.output_size / GROUPED_TILE_N)
             .ok_or_else(|| ModelError::Cuda("grouped output tile count overflowed".into()))?;
         let workers = logical_tiles.min(device_sm_count(stream)?);
-        let output_partition = (&mut output).partition([TILE_M, TILE_N]).map(
+        let output_partition = (&mut output).partition([TILE_M, GROUPED_TILE_N]).map(
             [8, 1],
             u32::try_from(workers).map_err(|_| {
                 ModelError::Cuda("persistent grouped worker count overflowed u32".into())
@@ -754,7 +810,7 @@ impl GroupedNvfp4W4A16 {
             self.weight_scale.clone(),
             self.weight_global_scale.clone(),
         )
-        .generics(vec![(self.input_size / GROUP_K).to_string()])
+        .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()])
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("execute grouped NVFP4 W4A16: {error:?}")))?;
         Ok(output)
@@ -780,10 +836,10 @@ impl GroupedNvfp4W4A16 {
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("allocate grouped output: {error:?}")))?;
         let logical_tiles = (rows / TILE_M)
-            .checked_mul(self.output_size / TILE_N)
+            .checked_mul(self.output_size / GROUPED_TILE_N)
             .ok_or_else(|| ModelError::Cuda("grouped output tile count overflowed".into()))?;
         let workers = logical_tiles.min(device_sm_count(stream)?);
-        let output_partition = (&mut output).partition([TILE_M, TILE_N]).map(
+        let output_partition = (&mut output).partition([TILE_M, GROUPED_TILE_N]).map(
             [8, 1],
             u32::try_from(workers).map_err(|_| {
                 ModelError::Cuda("persistent grouped worker count overflowed u32".into())
@@ -797,7 +853,7 @@ impl GroupedNvfp4W4A16 {
             self.weight_scale.clone(),
             self.weight_global_scale.clone(),
         )
-        .generics(vec![(self.input_size / GROUP_K).to_string()])
+        .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()])
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("execute grouped NVFP4 W4A16: {error:?}")))?;
         drop(output_partition);
@@ -1005,8 +1061,8 @@ fn probe_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<(f32, f32), ModelError> {
 
 fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     const EXPERTS: usize = 2;
-    let input_size = GROUP_K;
-    let output_size = TILE_N;
+    let input_size = GROUPED_TILE_K;
+    let output_size = GROUPED_TILE_N;
     let packed = (0..EXPERTS * output_size * input_size / 2)
         .map(|index| {
             let expert = index / (output_size * input_size / 2);
@@ -1015,7 +1071,7 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
             low | (high << 4)
         })
         .collect::<Vec<_>>();
-    let scale_bytes = (0..EXPERTS * output_size)
+    let scale_bytes = (0..EXPERTS * output_size * (input_size / GROUP_K))
         .map(|index| if index % 3 == 0 { 0x38 } else { 0x40 })
         .collect::<Vec<_>>();
     let global_scales = [0.5f32, 0.25f32];
