@@ -25,6 +25,7 @@ use super::{
     gdn::{self as gdn_backend, GdnPrefillPlan, GdnState},
     kernels,
     linear::{ExpertProjection, Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear},
+    marlin::MarlinMoe,
     moe::{self as moe_backend, RoutingPlan},
     qwen_attention::{AttentionInput, QwenFlatKvAttention},
     workspace::ExecutionWorkspace,
@@ -268,7 +269,9 @@ struct Moe {
     router: Bf16Tensor,
     routed_gate: GroupedNvfp4W4A16,
     routed_up: GroupedNvfp4W4A16,
-    routed_down: GroupedNvfp4W4A16,
+    routed_gate_marlin: MarlinMoe,
+    routed_up_marlin: MarlinMoe,
+    routed_down: MarlinMoe,
     shared_gate: Nvfp4W4A16Linear,
     shared_up: Nvfp4W4A16Linear,
     shared_down: Nvfp4W4A16Linear,
@@ -354,7 +357,21 @@ impl Checkpoint {
                     artifact.config.num_experts,
                     stream,
                 )?,
-                routed_down: GroupedNvfp4W4A16::load(
+                routed_gate_marlin: MarlinMoe::load(
+                    source,
+                    &experts_prefix,
+                    ExpertProjection::Gate,
+                    artifact.config.num_experts,
+                    stream,
+                )?,
+                routed_up_marlin: MarlinMoe::load(
+                    source,
+                    &experts_prefix,
+                    ExpertProjection::Up,
+                    artifact.config.num_experts,
+                    stream,
+                )?,
+                routed_down: MarlinMoe::load(
                     source,
                     &experts_prefix,
                     ExpertProjection::Down,
@@ -1284,32 +1301,99 @@ impl Moe {
             workspace,
         )?;
         let dispatched_rows = routing.max_dispatched_rows;
-        let routed_activation_output = workspace.take_bf16(
-            &[dispatched_rows, self.routed_gate.output_size()],
-            execution,
-            "allocate routed activation output",
-        )?;
-        let routed_activated = self.routed_gate.enqueue_silu_mul_device_plan_into(
-            &self.routed_up,
-            dispatched.hidden.clone(),
-            dispatched_rows,
-            dispatched.expert_by_row_tile.clone(),
-            routed_activation_output,
-            execution,
-        )?;
+        const MARLIN_GATE_UP_MIN_ROWS: usize = 768;
+        let routed_activated = if dispatched_rows >= MARLIN_GATE_UP_MIN_ROWS {
+            let gate_output = workspace.take_bf16(
+                &[dispatched_rows, self.routed_gate_marlin.output_size()],
+                execution,
+                "allocate routed Marlin gate output",
+            )?;
+            let up_output = workspace.take_bf16(
+                &[dispatched_rows, self.routed_up_marlin.output_size()],
+                execution,
+                "allocate routed Marlin up output",
+            )?;
+            let gate_temporary = workspace.take_f32(
+                &[dispatched_rows, self.routed_gate_marlin.output_size()],
+                execution,
+                "allocate routed Marlin gate temporary",
+            )?;
+            let up_temporary = workspace.take_f32(
+                &[dispatched_rows, self.routed_up_marlin.output_size()],
+                execution,
+                "allocate routed Marlin up temporary",
+            )?;
+            execution.mark_pending();
+            self.routed_gate_marlin.execute(
+                &dispatched.hidden,
+                &gate_output,
+                &gate_temporary,
+                &dispatched.expert_by_row_tile,
+                dispatched_rows,
+                routing.dispatch_tile_rows,
+                execution.stream(),
+            )?;
+            self.routed_up_marlin.execute(
+                &dispatched.hidden,
+                &up_output,
+                &up_temporary,
+                &dispatched.expert_by_row_tile,
+                dispatched_rows,
+                routing.dispatch_tile_rows,
+                execution.stream(),
+            )?;
+            workspace.retire_f32(gate_temporary);
+            workspace.retire_f32(up_temporary);
+            let gate_output = Arc::new(gate_output);
+            let up_output = Arc::new(up_output);
+            let activated = silu_mul(
+                gate_output.clone(),
+                up_output.clone(),
+                dispatched_rows,
+                self.routed_gate_marlin.output_size(),
+                execution,
+            )?;
+            workspace.retire_shared_bf16(gate_output, "routed Marlin gate output")?;
+            workspace.retire_shared_bf16(up_output, "routed Marlin up output")?;
+            activated
+        } else {
+            let output = workspace.take_bf16(
+                &[dispatched_rows, self.routed_gate.output_size()],
+                execution,
+                "allocate routed activation output",
+            )?;
+            self.routed_gate.enqueue_silu_mul_device_plan_into(
+                &self.routed_up,
+                dispatched.hidden.clone(),
+                dispatched_rows,
+                dispatched.expert_by_row_tile.clone(),
+                output,
+                execution,
+            )?
+        };
         let routed_activated = Arc::new(routed_activated);
         let routed_down_output = workspace.take_bf16(
             &[dispatched_rows, self.routed_down.output_size()],
             execution,
             "allocate routed down output",
         )?;
-        let routed_down = self.routed_down.enqueue_device_plan_into(
-            routed_activated.clone(),
-            dispatched_rows,
-            dispatched.expert_by_row_tile.clone(),
-            routed_down_output,
+        let routed_down_temporary = workspace.take_f32(
+            &[dispatched_rows, self.routed_down.output_size()],
             execution,
+            "allocate routed Marlin down temporary",
         )?;
+        execution.mark_pending();
+        self.routed_down.execute(
+            &routed_activated,
+            &routed_down_output,
+            &routed_down_temporary,
+            &dispatched.expert_by_row_tile,
+            dispatched_rows,
+            routing.dispatch_tile_rows,
+            execution.stream(),
+        )?;
+        workspace.retire_f32(routed_down_temporary);
+        let routed_down = routed_down_output;
         let routed_down = Arc::new(routed_down);
         let routed = routing.combine(
             routed_down.clone(),

@@ -414,6 +414,17 @@ impl MarlinMoe {
     pub const fn num_experts(&self) -> usize {
         self.num_experts
     }
+
+    pub const fn output_size(&self) -> usize {
+        self.output_size
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.packed_weight.num_bytes()
+            + self.scales.num_bytes()
+            + self.global_scales.num_bytes()
+            + self.workspace.num_bytes()
+    }
 }
 
 fn pack_k_major(
