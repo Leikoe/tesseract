@@ -57,20 +57,18 @@ Run all host/model/cuTile gates afterward:
 ssh ubuntu@NODE_IP '/home/ubuntu/tesseract/scripts/node/verify-a100.sh'
 ```
 
-Run the complete production serving benchmark with:
+Start the CUDA server, then run the backend-independent benchmark client:
 
 ```bash
 cd /home/ubuntu/tesseract
 cargo build --release --features cuda --bin tesseract
-target/release/tesseract bench
+target/release/tesseract --model-path /home/ubuntu/models/Llama-3.2-1B-Instruct &
+target/release/tesseract bench --num-prompts 1000 --max-concurrency 32 \
+  --output /tmp/tesseract-a100.json
 ```
 
-The command owns the release build and server lifecycle, waits for readiness,
-runs batch-1 and first/warm concurrency workloads, and writes a self-contained
-result directory under `target/benchmarks/`. To retain a particular run in Git,
-pass an explicit path such as
-`--output docs/benchmarks/$(date -u +%Y-%m-%d-a100)` and copy or commit it before
-the spot node disappears.
+The benchmark command only sends HTTP requests, so it can also be built without
+the `cuda` feature and run from another machine.
 
 For the slower memory-safety gate, build the CUDA smoke and next-token tools and
 run them under the CUDA toolkit's Compute Sanitizer:

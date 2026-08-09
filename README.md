@@ -62,24 +62,22 @@ evidence lives under `docs/validation/` and `docs/benchmarks/`.
 
 ## Benchmark
 
-On the validated A100 node, one command builds and runs the production server,
-waits for graph warmup/readiness, executes batch-1 plus first-shape and warm
-concurrency workloads, captures raw results/metrics/logs, writes a Markdown
-report, and shuts the server down:
+The built-in benchmark client targets any running OpenAI-compatible server. It
+does not require CUDA and keeps open-loop request rate separate from the
+client-side concurrency limit:
 
 ```bash
-target/release/tesseract bench
+cargo run --bin tesseract -- bench \
+  --base-url http://127.0.0.1:8000 \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --num-prompts 1000 \
+  --max-concurrency 32 \
+  --output results.json
 ```
 
-Results default to a timestamped directory under `target/benchmarks/`. The
-command refuses tracked worktree changes so every result names a reproducible
-Git revision. Use `target/release/tesseract bench --help` for workload, output,
-model, and server configuration overrides. An exact end-to-end command run is
-retained in
-[`docs/benchmarks/2026-08-08-bench-command/`](docs/benchmarks/2026-08-08-bench-command/README.md).
-
-`cargo bench-a100` is a convenience alias that builds the release CUDA binary
-and invokes the same `tesseract bench` Clap subcommand.
+Streaming is enabled so the report includes request throughput, output-token
+throughput, TTFT, and inter-token latency. Use `tesseract bench --help` for
+arrival-rate, warmup, prompt, header, endpoint, timeout, and output controls.
 
 
 ## Research notes

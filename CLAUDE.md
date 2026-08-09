@@ -5,6 +5,10 @@ Every user message in this project must be appended to this file verbatim.
 ## User Messages (verbatim)
 
 ```text
+we should not have a python bench script. it should be the builting clap command tesseract bench
+```
+
+```text
 dispatch subagents to analyze references/{vllm,sglang}. You will need an in-depth report of how each works.
 ```
 
@@ -1187,4 +1191,7 @@ Blocked audit:
 Do not call update_goal unless the goal is complete or the strict blocked audit above is satisfied. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.
 
 </codex_internal_context>
+```
+```text
+bench command should NOT require CUDA. it merely uses reqwests to make requests to the server. you can copy the args of sglang's bench or vllm's
 ```

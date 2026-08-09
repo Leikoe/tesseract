@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub const DEFAULT_MODEL_ID: &str = "meta-llama/Llama-3.2-1B-Instruct";
 
@@ -21,54 +21,75 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum CliCommand {
-    /// Benchmark production serving on an NVIDIA A100.
+    /// Benchmark an OpenAI-compatible serving endpoint.
     Bench(BenchmarkConfig),
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct BenchmarkConfig {
-    #[arg(long, env = "TESSERACT_MODEL_PATH")]
-    pub model_path: Option<PathBuf>,
+    #[arg(long, default_value = "http://127.0.0.1:8000")]
+    pub base_url: String,
 
-    #[arg(long, env = "TESSERACT_MODEL_REVISION")]
-    pub model_revision: Option<String>,
+    #[arg(long, value_enum, default_value_t = BenchmarkApi::ChatCompletions)]
+    pub api: BenchmarkApi,
 
-    #[arg(long, env = "TESSERACT_MODEL")]
-    pub model: Option<String>,
+    #[arg(long, help = "Override the API's default endpoint path")]
+    pub endpoint: Option<String>,
 
-    #[arg(long, default_value = "127.0.0.1:8000")]
-    pub listen: String,
+    #[arg(long, env = "TESSERACT_MODEL", default_value = DEFAULT_MODEL_ID)]
+    pub model: String,
+
+    #[arg(long, default_value_t = 1000)]
+    pub num_prompts: usize,
+
+    #[arg(long)]
+    pub max_concurrency: Option<usize>,
+
+    #[arg(long, default_value = "inf")]
+    pub request_rate: f64,
+
+    #[arg(long, default_value_t = 128)]
+    pub output_len: usize,
+
+    #[arg(long, default_value_t = 1)]
+    pub warmup_requests: usize,
+
+    #[arg(long, help = "Use this prompt for every request")]
+    pub prompt: Option<String>,
+
+    #[arg(long, default_value_t = 42)]
+    pub seed: u64,
+
+    #[arg(long, default_value_t = 300.0)]
+    pub timeout_seconds: f64,
+
+    #[arg(long, value_name = "NAME:VALUE")]
+    pub header: Vec<String>,
 
     #[arg(long)]
     pub output: Option<PathBuf>,
+}
 
-    #[arg(long, default_value_t = 8)]
-    pub batch1_requests: usize,
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum BenchmarkApi {
+    ChatCompletions,
+    Completions,
+}
 
-    #[arg(long, default_value_t = 8)]
-    pub concurrency: usize,
+impl BenchmarkApi {
+    pub const fn endpoint(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "/v1/chat/completions",
+            Self::Completions => "/v1/completions",
+        }
+    }
 
-    #[arg(long, default_value_t = 16)]
-    pub concurrent_requests: usize,
-
-    #[arg(long, default_value_t = 16)]
-    pub max_tokens: usize,
-
-    #[arg(long, default_value_t = 2)]
-    pub warmup_requests: usize,
-
-    #[arg(long, default_value_t = 600.0)]
-    pub ready_timeout_seconds: f64,
-
-    #[arg(
-        long,
-        value_name = "--FLAG=VALUE",
-        help = "Extra server argument; repeat as --server-arg=--flag=value"
-    )]
-    pub server_arg: Vec<String>,
-
-    #[arg(long, help = "Allow benchmarking tracked changes outside HEAD")]
-    pub allow_dirty: bool,
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat-completions",
+            Self::Completions => "completions",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -206,17 +227,20 @@ mod tests {
         let cli = Cli::try_parse_from([
             "tesseract",
             "bench",
-            "--concurrency",
+            "--max-concurrency",
             "4",
             "--output",
-            "/tmp/tesseract-bench",
+            "/tmp/tesseract-bench.json",
         ])
         .unwrap();
         let Some(CliCommand::Bench(bench)) = cli.command else {
             panic!("expected bench subcommand");
         };
-        assert_eq!(bench.concurrency, 4);
-        assert_eq!(bench.output, Some(PathBuf::from("/tmp/tesseract-bench")));
+        assert_eq!(bench.max_concurrency, Some(4));
+        assert_eq!(
+            bench.output,
+            Some(PathBuf::from("/tmp/tesseract-bench.json"))
+        );
         assert_eq!(cli.server.listen.to_string(), "0.0.0.0:8000");
     }
 }

@@ -1,7 +1,7 @@
 # A100 v1 benchmark — 2026-08-08
 
 These are measured results, not performance targets. The raw reports were
-produced by `scripts/benchmark/a100_v1.py` and copied back from the spot node.
+produced by the legacy benchmark harness and copied back from the spot node.
 
 ## Environment
 

@@ -1,4 +1,5 @@
 pub mod api;
+pub mod benchmark;
 mod chunking;
 pub mod config;
 #[cfg(feature = "cuda")]
