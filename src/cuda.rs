@@ -132,44 +132,51 @@ mod nvfp4_probe_kernels {
         let eight = constant(8u8, const_shape![16, 128]);
         let magnitude = nibbles % eight;
         let sign = nibbles / eight;
+        let one: Tile<u8, { [16, 128] }> = constant(1u8, const_shape![16, 128]);
+        let two: Tile<u8, { [16, 128] }> = constant(2u8, const_shape![16, 128]);
+        let three: Tile<u8, { [16, 128] }> = constant(3u8, const_shape![16, 128]);
+        let four: Tile<u8, { [16, 128] }> = constant(4u8, const_shape![16, 128]);
+        let five: Tile<u8, { [16, 128] }> = constant(5u8, const_shape![16, 128]);
+        let six: Tile<u8, { [16, 128] }> = constant(6u8, const_shape![16, 128]);
+        let seven: Tile<u8, { [16, 128] }> = constant(7u8, const_shape![16, 128]);
         let mut value = constant(0.0f32, const_shape![16, 128]);
         value = select(
-            eq_tile(magnitude, constant(1u8, const_shape![16, 128])),
+            eq_tile(magnitude, one),
             constant(0.5f32, const_shape![16, 128]),
             value,
         );
         value = select(
-            eq_tile(magnitude, constant(2u8, const_shape![16, 128])),
+            eq_tile(magnitude, two),
             constant(1.0f32, const_shape![16, 128]),
             value,
         );
         value = select(
-            eq_tile(magnitude, constant(3u8, const_shape![16, 128])),
+            eq_tile(magnitude, three),
             constant(1.5f32, const_shape![16, 128]),
             value,
         );
         value = select(
-            eq_tile(magnitude, constant(4u8, const_shape![16, 128])),
+            eq_tile(magnitude, four),
             constant(2.0f32, const_shape![16, 128]),
             value,
         );
         value = select(
-            eq_tile(magnitude, constant(5u8, const_shape![16, 128])),
+            eq_tile(magnitude, five),
             constant(3.0f32, const_shape![16, 128]),
             value,
         );
         value = select(
-            eq_tile(magnitude, constant(6u8, const_shape![16, 128])),
+            eq_tile(magnitude, six),
             constant(4.0f32, const_shape![16, 128]),
             value,
         );
         value = select(
-            eq_tile(magnitude, constant(7u8, const_shape![16, 128])),
+            eq_tile(magnitude, seven),
             constant(6.0f32, const_shape![16, 128]),
             value,
         );
         select(
-            eq_tile(sign, constant(1u8, const_shape![16, 128])),
+            eq_tile(sign, one),
             constant(0.0f32, const_shape![16, 128]) - value,
             value,
         )
@@ -180,6 +187,8 @@ mod nvfp4_probe_kernels {
         let sixteen = constant(16u8, const_shape![16, 8]);
         let exponent = (bytes / eight) % sixteen;
         let mantissa = bytes % eight;
+        let zero_u8: Tile<u8, { [16, 8] }> = constant(0u8, const_shape![16, 8]);
+        let one_u8: Tile<u8, { [16, 8] }> = constant(1u8, const_shape![16, 8]);
         let exponent_f: Tile<f32, { [16, 8] }> = itof(exponent, rounding::NearestEven);
         let mantissa_f: Tile<f32, { [16, 8] }> = itof(mantissa, rounding::NearestEven);
         let normal = (constant(1.0f32, const_shape![16, 8])
@@ -189,14 +198,10 @@ mod nvfp4_probe_kernels {
                 exponent_f - constant(7.0f32, const_shape![16, 8]),
             );
         let subnormal = mantissa_f / constant(512.0f32, const_shape![16, 8]);
-        let unsigned = select(
-            eq_tile(exponent, constant(0u8, const_shape![16, 8])),
-            subnormal,
-            normal,
-        );
+        let unsigned = select(eq_tile(exponent, zero_u8), subnormal, normal);
         let sign = bytes / constant(128u8, const_shape![16, 8]);
         select(
-            eq_tile(sign, constant(1u8, const_shape![16, 8])),
+            eq_tile(sign, one_u8),
             constant(0.0f32, const_shape![16, 8]) - unsigned,
             unsigned,
         )
