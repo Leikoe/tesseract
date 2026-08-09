@@ -5,7 +5,7 @@ use std::{ffi::c_void, sync::Arc};
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::{IntoResult, Stream, sys};
 use cutile::{
-    api,
+    DType, api,
     core::{bf16, f16},
     tensor::{Tensor, ToHostVec},
 };
@@ -273,7 +273,7 @@ fn workspace(stream: &Arc<Stream>) -> Result<Arc<Tensor<i32>>, ModelError> {
     Ok(Arc::new(workspace))
 }
 
-fn upload<T: cutile::core::DType + Send + Sync + 'static>(
+fn upload<T: DType + Send + Sync + 'static>(
     values: Vec<T>,
     stream: &Arc<Stream>,
     operation: &str,
