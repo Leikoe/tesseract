@@ -375,8 +375,8 @@ impl RoutingPlan {
                 (&mut weights).partition([1, TOP_K]),
                 counts.device_pointer(),
             )
+            .async_on(stream)
         }
-        .async_on(stream)
         .map_err(|error| ModelError::Cuda(format!("execute top-8 routing: {error:?}")))?;
         drop(expert_ids_partition);
         drop(weights_partition);
@@ -414,8 +414,8 @@ impl RoutingPlan {
                 (&mut positions).partition([1, 1]),
                 cursors.device_pointer(),
             )
+            .async_on(stream)
         }
-        .async_on(stream)
         .map_err(|error| ModelError::Cuda(format!("assign expert dispatch rows: {error:?}")))?;
         drop(positions_partition);
 
@@ -461,9 +461,9 @@ impl RoutingPlan {
                 (&mut tickets).partition([1, 1]),
                 dispatched.device_pointer(),
             )
+            .generics(vec![hidden_size.to_string(), BLOCK.to_string()])
+            .async_on(stream)
         }
-        .generics(vec![hidden_size.to_string(), BLOCK.to_string()])
-        .async_on(stream)
         .map_err(|error| ModelError::Cuda(format!("dispatch MoE activations: {error:?}")))?;
         drop(tickets_partition);
         drop(tickets);
@@ -520,9 +520,9 @@ impl RoutingPlan {
                 (&mut tickets).partition([1, 1]),
                 output.device_pointer(),
             )
+            .generics(vec![hidden_size.to_string(), BLOCK.to_string()])
+            .async_on(stream)
         }
-        .generics(vec![hidden_size.to_string(), BLOCK.to_string()])
-        .async_on(stream)
         .map_err(|error| ModelError::Cuda(format!("combine expert outputs: {error:?}")))?;
         drop(tickets_partition);
         drop(tickets);
