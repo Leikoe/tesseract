@@ -13,6 +13,7 @@ use serde::Serialize;
 
 use crate::cuda::{
     execution::StreamExecution,
+    kernels,
     linear::{Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear},
 };
 use crate::{model::ModelError, quantization::decode_e4m3fn};
@@ -798,6 +799,42 @@ fn benchmark_grouped_nvfp4_shape(
         stream,
     )?;
     let marlin = MarlinMoe::nvfp4(&packed, &scales, &globals, input_size, output_size, stream)?;
+    let gate_up = if input_size == 2048 && output_size == 512 {
+        let up_packed = packed
+            .iter()
+            .map(|byte| byte.rotate_left(4))
+            .collect::<Vec<_>>();
+        let mut up_scales = scales.clone();
+        up_scales.reverse();
+        let up_globals = globals
+            .iter()
+            .copied()
+            .cycle()
+            .skip(1)
+            .take(EXPERTS)
+            .collect::<Vec<_>>();
+        Some((
+            GroupedNvfp4W4A16::from_host_owned(
+                EXPERTS,
+                input_size,
+                output_size,
+                up_packed.clone(),
+                up_scales.clone(),
+                up_globals.clone(),
+                stream,
+            )?,
+            MarlinMoe::nvfp4(
+                &up_packed,
+                &up_scales,
+                &up_globals,
+                input_size,
+                output_size,
+                stream,
+            )?,
+        ))
+    } else {
+        None
+    };
     for &rows in row_counts {
         let block_rows = if rows >= 512 && rows.is_multiple_of(64) {
             64
@@ -826,8 +863,8 @@ fn benchmark_grouped_nvfp4_shape(
             )?);
             samples.push(time_marlin_grouped(
                 &marlin,
-                input,
-                expert_map,
+                input.clone(),
+                expert_map.clone(),
                 rows,
                 input_size,
                 output_size,
@@ -837,6 +874,36 @@ fn benchmark_grouped_nvfp4_shape(
                 iterations,
                 stream,
             )?);
+            if let Some((cutile_up, marlin_up)) = &gate_up {
+                samples.push(time_cutile_grouped_gate_up(
+                    &cutile,
+                    cutile_up,
+                    input.clone(),
+                    expert_map.clone(),
+                    rows,
+                    input_size,
+                    output_size,
+                    block_rows,
+                    pattern,
+                    warmup,
+                    iterations,
+                    stream,
+                )?);
+                samples.push(time_marlin_grouped_gate_up(
+                    &marlin,
+                    marlin_up,
+                    input.clone(),
+                    expert_map.clone(),
+                    rows,
+                    input_size,
+                    output_size,
+                    block_rows,
+                    pattern,
+                    warmup,
+                    iterations,
+                    stream,
+                )?);
+            }
         }
     }
     Ok(())
@@ -1095,6 +1162,178 @@ fn time_marlin_grouped(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn time_cutile_grouped_gate_up(
+    gate: &GroupedNvfp4W4A16,
+    up: &GroupedNvfp4W4A16,
+    input: Arc<Tensor<bf16>>,
+    expert_map: Arc<Tensor<i32>>,
+    rows: usize,
+    input_size: usize,
+    output_size: usize,
+    block_rows: usize,
+    routing_pattern: &'static str,
+    warmup: usize,
+    iterations: usize,
+    stream: &Arc<Stream>,
+) -> Result<KernelBenchmarkSample, ModelError> {
+    let mut activated = api::zeros::<bf16>(&[rows, output_size])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate fused gate/up output: {error:?}")))?;
+    for _ in 0..warmup {
+        let mut execution = StreamExecution::new(stream);
+        activated = gate.enqueue_silu_mul_device_plan_into(
+            up,
+            input.clone(),
+            rows,
+            expert_map.clone(),
+            activated,
+            &mut execution,
+        )?;
+        execution.synchronize("warm fused grouped cuTile gate/up")?;
+    }
+    let mut raw_ms = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = TimingEvent::new(stream)?;
+        let end = TimingEvent::new(stream)?;
+        start.record(stream)?;
+        let mut execution = StreamExecution::new(stream);
+        activated = gate.enqueue_silu_mul_device_plan_into(
+            up,
+            input.clone(),
+            rows,
+            expert_map.clone(),
+            activated,
+            &mut execution,
+        )?;
+        end.record(stream)?;
+        raw_ms.push(start.elapsed_ms(&end, stream)?);
+        execution.mark_synchronized();
+    }
+    Ok(summarize_gate_up(
+        "cutile_grouped_gate_up_silu",
+        rows,
+        output_size,
+        input_size,
+        routing_pattern,
+        gate.num_experts(),
+        block_rows,
+        raw_ms,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn time_marlin_grouped_gate_up(
+    gate: &MarlinMoe,
+    up: &MarlinMoe,
+    input: Arc<Tensor<bf16>>,
+    expert_map: Arc<Tensor<i32>>,
+    rows: usize,
+    input_size: usize,
+    output_size: usize,
+    block_rows: usize,
+    routing_pattern: &'static str,
+    warmup: usize,
+    iterations: usize,
+    stream: &Arc<Stream>,
+) -> Result<KernelBenchmarkSample, ModelError> {
+    const BLOCK: usize = 256;
+    let gate_output = Arc::new(
+        api::zeros::<bf16>(&[rows, output_size])
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("allocate Marlin gate output: {error:?}")))?,
+    );
+    let up_output = Arc::new(
+        api::zeros::<bf16>(&[rows, output_size])
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("allocate Marlin up output: {error:?}")))?,
+    );
+    let gate_temporary = api::zeros::<f32>(&[rows, output_size])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate Marlin gate temporary: {error:?}")))?;
+    let up_temporary = api::zeros::<f32>(&[rows, output_size])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate Marlin up temporary: {error:?}")))?;
+    let mut activated = api::zeros::<bf16>(&[rows, output_size])
+        .sync_on(stream)
+        .map_err(|error| {
+            ModelError::Cuda(format!("allocate Marlin activated output: {error:?}"))
+        })?;
+    let sorted_token_ids = upload(
+        (0..rows as i32).collect(),
+        stream,
+        "upload grouped gate/up sorted token IDs",
+    )?;
+    let padded_count = upload(
+        vec![rows as i32],
+        stream,
+        "upload grouped gate/up padded count",
+    )?;
+    let launch = |activated: &mut Tensor<bf16>,
+                  execution: &mut StreamExecution<'_>|
+     -> Result<(), ModelError> {
+        gate.execute(
+            &input,
+            &gate_output,
+            &gate_temporary,
+            &sorted_token_ids,
+            &expert_map,
+            &padded_count,
+            rows,
+            block_rows,
+            stream,
+        )?;
+        up.execute(
+            &input,
+            &up_output,
+            &up_temporary,
+            &sorted_token_ids,
+            &expert_map,
+            &padded_count,
+            rows,
+            block_rows,
+            stream,
+        )?;
+        let (_, _, output_partition) = execution.enqueue(
+            kernels::silu_mul_bf16(
+                gate_output.clone(),
+                up_output.clone(),
+                activated.partition([1, BLOCK]),
+            )
+            .generics(vec![BLOCK.to_string()]),
+            "execute Marlin comparison SiLU",
+        )?;
+        drop(output_partition);
+        Ok(())
+    };
+    for _ in 0..warmup {
+        let mut execution = StreamExecution::new(stream);
+        launch(&mut activated, &mut execution)?;
+        execution.synchronize("warm grouped Marlin gate/up")?;
+    }
+    let mut raw_ms = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = TimingEvent::new(stream)?;
+        let end = TimingEvent::new(stream)?;
+        start.record(stream)?;
+        let mut execution = StreamExecution::new(stream);
+        launch(&mut activated, &mut execution)?;
+        end.record(stream)?;
+        raw_ms.push(start.elapsed_ms(&end, stream)?);
+        execution.mark_synchronized();
+    }
+    Ok(summarize_gate_up(
+        "marlin_grouped_gate_up_silu",
+        rows,
+        output_size,
+        input_size,
+        routing_pattern,
+        gate.num_experts(),
+        block_rows,
+        raw_ms,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn time_marlin(
     linear: &MarlinLinear,
     input: Arc<Tensor<bf16>>,
@@ -1192,6 +1431,33 @@ fn summarize_grouped(
     sample.routing_pattern = Some(routing_pattern);
     sample.num_experts = Some(num_experts);
     sample.block_rows = Some(block_rows);
+    sample
+}
+
+#[allow(clippy::too_many_arguments)]
+fn summarize_gate_up(
+    implementation: &'static str,
+    rows: usize,
+    output_size: usize,
+    input_size: usize,
+    routing_pattern: &'static str,
+    num_experts: usize,
+    block_rows: usize,
+    raw_ms: Vec<f32>,
+) -> KernelBenchmarkSample {
+    let mut sample = summarize_grouped(
+        implementation,
+        rows,
+        output_size,
+        input_size,
+        routing_pattern,
+        num_experts,
+        block_rows,
+        raw_ms,
+    );
+    // Gate and up are two logical GEMMs over independent packed expert banks.
+    sample.logical_tflops *= 2.0;
+    sample.packed_weight_gb_per_second *= 2.0;
     sample
 }
 

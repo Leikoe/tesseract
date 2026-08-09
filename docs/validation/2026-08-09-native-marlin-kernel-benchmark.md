@@ -71,12 +71,55 @@ The raw report is
 The preliminary three-sample small-M run is retained separately as
 [`marlin-vs-cutile-quick.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/marlin-vs-cutile-quick.json).
 
-## Scope boundary and next gate
+## Grouped Marlin MoE follow-up
 
-The NVFP4 rows above compare dense GEMMs at the routed expert projection
-dimensions; they do not yet model a 256-expert routing histogram or invoke the
-grouped Marlin MoE kernel. They directly apply to the shared expert and prove
-the dequant/MMA pipeline gap. Production routed-MoE selection requires the same
-native extraction, correctness oracle, and routing-distribution benchmark for
-Marlin MoE. Cold-weight cache rotation is also pending. Neither omission
-invalidates the dense result, but both prevent claiming final server parity.
+Revision `92caa8f` additionally extracts TokenSpeed's grouped Marlin MoE device
+kernel behind a framework-independent C ABI. The selector is deliberately
+specialized to the checkpoint's BF16 × NVFP4/E4M3 contract; unrelated integer,
+FP8, MXFP4, zero-point, and act-order specializations are not compiled. The
+artifact owns all 256 repacked experts, retains 8-bit block scales and one BF16
+global scale per expert, and consumes device-resident padded expert blocks.
+
+A permanent two-expert differential test uses distinct packed weights, block
+scales, and global scales for each expert. It passed on the A100 with zero
+maximum absolute error. The benchmark then compared the same 256-expert
+artifact and BF16 inputs under two sorted routing distributions:
+
+- `uniform`: padded blocks distributed across the expert range;
+- `skewed`: 75% of padded blocks assigned to expert 0, with the remainder
+  distributed across other experts.
+
+The row count is the padded dispatched-row count seen by the expert GEMM, not
+the number of logical prompt tokens. Rows 512 and 8,192 use 64-row expert
+blocks; row 16 uses one 16-row block. Allocation, upload, and expert-bank
+repacking remain outside the CUDA-event interval.
+
+| Expert projection | Rows | Routing | cuTile grouped | Marlin grouped | Marlin speedup |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Gate/up `K=2048,N=512` | 16 | uniform | 0.105472 ms | 0.112640 ms | 0.94x |
+| Gate/up `K=2048,N=512` | 512 | uniform | 0.108544 ms | 0.114688 ms | 0.95x |
+| Gate/up `K=2048,N=512` | 512 | skewed | 0.102400 ms | 0.115712 ms | 0.88x |
+| Gate/up `K=2048,N=512` | 8192 | uniform | 1.059840 ms | 0.328704 ms | 3.22x |
+| Gate/up `K=2048,N=512` | 8192 | skewed | 1.024000 ms | 0.318464 ms | 3.22x |
+| Down `K=512,N=2048` | 16 | uniform | 0.063488 ms | 0.036864 ms | 1.72x |
+| Down `K=512,N=2048` | 512 | uniform | 0.172032 ms | 0.056320 ms | 3.05x |
+| Down `K=512,N=2048` | 512 | skewed | 0.169984 ms | 0.057344 ms | 2.96x |
+| Down `K=512,N=2048` | 8192 | uniform | 2.143232 ms | 0.354304 ms | 6.05x |
+| Down `K=512,N=2048` | 8192 | skewed | 2.089984 ms | 0.333824 ms | 6.26x |
+
+This rejects a single unconditional backend choice. The existing persistent
+cuTile gate/up kernel remains slightly faster at small dispatched batches;
+grouped Marlin wins gate/up once the dispatched batch is large and wins the
+down projection at every measured size. Production selection must therefore
+include projection geometry and dispatched rows. The raw reports are
+[`marlin-grouped-vs-cutile-quick.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/marlin-grouped-vs-cutile-quick.json)
+and
+[`marlin-grouped-vs-cutile-production.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/marlin-grouped-vs-cutile-production.json).
+
+## Remaining scope boundary
+
+These are steady-state synthetic uniform/skewed routing distributions. A trace
+captured from this exact model and representative prompts is still required to
+set and validate the production crossover policy. Cold-weight cache rotation
+is also pending. The measurements establish the kernel-level choice but do not
+yet claim end-to-end server parity.
