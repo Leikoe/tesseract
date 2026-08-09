@@ -457,21 +457,12 @@ MarlinFuncPtr get_marlin_kernel(
   if (false) {
   }
 
-  COMMON_GET_IF(host::kU4)
-  COMMON_GET_IF(host::kU4B8)
-  COMMON_GET_IF(host::kU8B128)
-
+  // Tesseract vendors this launcher for the checkpoint's declared
+  // NVFP4/E4M3 W4A16 contract. Do not instantiate TokenSpeed's unrelated
+  // integer, FP8, MXFP4, act-order, or zero-point kernel matrix here: those
+  // variants materially increase compile time and are unreachable from our
+  // typed C ABI.
   NVFP4_GET_IF(host::kFE2M1f)
-
-  BIGGROUP_GET_IF(host::kFE4M3fn)
-
-  ACT_GET_IF(host::kU4B8)
-  ACT_GET_IF(host::kU8B128)
-  if (std::is_same<scalar_t, nv_bfloat16>::value) {
-    if (false) {
-    }
-    MXFP4_GET_IF(host::kFE2M1f)
-  }
 
   return kernel;
 }
