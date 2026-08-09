@@ -50,11 +50,10 @@ mod kernels {
             let high = (packed / sixteen).reshape(const_shape![16, 8, 1]);
             let nibbles: Tile<u8, { [16, 8, 2] }> = cat(low, high, 2);
             let weight = decode_fp4(nibbles.reshape(const_shape![16, 16]));
-            let scale: Tile<f32, { [16, 16] }> = ftof(
+            let scale: Tile<f32, { [16, 16] }> = convert_tile(
                 weight_scale
                     .load_tile(const_shape![16, 1], [pid.1, k_tile])
                     .broadcast(const_shape![16, 16]),
-                rounding::NearestEven,
             );
             let global = broadcast_scalar(weight_global_scale, const_shape![16, 16]);
             let weight: Tile<bf16, { [16, 16] }> =
@@ -101,12 +100,11 @@ mod kernels {
                 let high = (packed / sixteen).reshape(const_shape![16, 8, 1]);
                 let nibbles: Tile<u8, { [16, 8, 2] }> = cat(low, high, 2);
                 let weight = decode_fp4(nibbles.reshape(const_shape![16, 16]));
-                let scale: Tile<f32, { [16, 16] }> = ftof(
+                let scale: Tile<f32, { [16, 16] }> = convert_tile(
                     weight_scale
                         .load_tile(const_shape![1, 16, 1], [expert, column_tile, k_tile])
                         .reshape(const_shape![16, 1])
                         .broadcast(const_shape![16, 16]),
-                    rounding::NearestEven,
                 );
                 let weight: Tile<bf16, { [16, 16] }> =
                     ftof(weight * scale * global, rounding::NearestEven);
