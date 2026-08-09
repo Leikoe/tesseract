@@ -116,6 +116,38 @@ include projection geometry and dispatched rows. The raw reports are
 and
 [`marlin-grouped-vs-cutile-production.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/marlin-grouped-vs-cutile-production.json).
 
+The gate/up rows above still time one projection. The production-equivalent
+follow-up compares Tesseract's fused two-bank cuTile kernel (independent gate
+and up global scales, register SwiGLU, one BF16 store) against two grouped
+Marlin launches with independent scale domains followed by the same BF16 SiLU
+kernel. Keeping independent scales is intentional: SGLang's SM80 Marlin
+fallback collapses differing gate/up global scales to the gate scale and warns
+that accuracy may be affected. Tesseract does not make that approximation.
+
+| Dispatched rows | Routing | Fused cuTile gate/up+SiLU | Faithful Marlin gate/up+SiLU | Marlin speedup |
+| ---: | --- | ---: | ---: | ---: |
+| 512 | uniform | 0.208896 ms | 0.232448 ms | 0.90x |
+| 512 | skewed | 0.199680 ms | 0.230400 ms | 0.87x |
+| 640 | uniform | 0.198656 ms | 0.196608 ms | 1.01x |
+| 640 | skewed | 0.197632 ms | 0.195584 ms | 1.01x |
+| 768 | uniform | 0.198656 ms | 0.164864 ms | 1.21x |
+| 768 | skewed | 0.196608 ms | 0.161792 ms | 1.22x |
+| 1024 | uniform | 0.385024 ms | 0.177152 ms | 2.17x |
+| 2048 | uniform | 0.580608 ms | 0.216064 ms | 2.69x |
+| 4096 | uniform | 0.906240 ms | 0.371712 ms | 2.44x |
+| 8192 | uniform | 1.720320 ms | 0.675840 ms | 2.55x |
+| 8192 | skewed | 1.713152 ms | 0.653312 ms | 2.62x |
+
+The measured conservative crossover is 768 padded dispatched rows. Down uses
+grouped Marlin for every measured size; gate/up should retain fused cuTile
+below 768 and use faithful dual-Marlin above it. The retained pipeline reports
+are
+[`marlin-gate-up-pipeline-quick.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/marlin-gate-up-pipeline-quick.json),
+[`marlin-gate-up-threshold.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/marlin-gate-up-threshold.json),
+[`marlin-gate-up-crossover.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/marlin-gate-up-crossover.json),
+and
+[`marlin-gate-up-pipeline-production.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/marlin-gate-up-pipeline-production.json).
+
 ## Remaining scope boundary
 
 These are steady-state synthetic uniform/skewed routing distributions. A trace

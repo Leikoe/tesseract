@@ -379,7 +379,8 @@ __global__ void Marlin(
       is_zp_float ? prob_n * prob_k / group_size / 8 : prob_n * prob_k / group_size / (pack_factor * 4);
   const int b_bias_expert_stride = prob_n / 8;
 
-  int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
+  int num_tokens_past_padded =
+      num_tokens_past_padded_ptr == nullptr ? prob_m : num_tokens_past_padded_ptr[0];
   int parallel = num_tokens_past_padded / moe_block_size;
   int num_valid_blocks = parallel;
   if constexpr (kIsEP) {
@@ -450,10 +451,16 @@ __global__ void Marlin(
   auto read_moe_block_data = [&](int block_id) {
     block_num_valid_tokens = moe_block_size;
 
-    cp_async4_pred(
-        sh_block_sorted_ids_int4 + threadIdx.x,
-        reinterpret_cast<const int4*>(sorted_token_ids_ptr) + (block_id * moe_block_size / 4 + threadIdx.x),
-        threadIdx.x < moe_block_size / 4);
+    if (threadIdx.x < moe_block_size / 4) {
+      if (sorted_token_ids_ptr == nullptr) {
+        const int row = block_id * moe_block_size + threadIdx.x * 4;
+        sh_block_sorted_ids_int4[threadIdx.x] = make_int4(row, row + 1, row + 2, row + 3);
+      } else {
+        cp_async4(
+            sh_block_sorted_ids_int4 + threadIdx.x,
+            reinterpret_cast<const int4*>(sorted_token_ids_ptr) + (block_id * moe_block_size / 4 + threadIdx.x));
+      }
+    }
 
     cp_async_fence();
     cp_async_wait<0>();
@@ -1906,4 +1913,3 @@ __global__ void Marlin(
 }  // namespace device::marlin_moe
 
 #endif
-

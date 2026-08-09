@@ -1,0 +1,355 @@
+{
+  "device_id": 0,
+  "warmup_iterations": 1,
+  "timed_iterations": 3,
+  "cutile_fp8_max_abs_error": 0.0,
+  "cutile_nvfp4_max_abs_error": 0.0,
+  "marlin_fp8_max_abs_error": 0.0,
+  "marlin_nvfp4_max_abs_error": 0.0,
+  "marlin_grouped_nvfp4_max_abs_error": 0.0,
+  "samples": [
+    {
+      "implementation": "cutile_packed",
+      "quantization": "fp8",
+      "rows": 512,
+      "output_size": 8192,
+      "input_size": 2048,
+      "raw_ms": [
+        4.743168,
+        4.716544,
+        4.708352
+      ],
+      "minimum_ms": 4.708352,
+      "median_ms": 4.716544,
+      "p90_ms": 4.743168,
+      "logical_tflops": 3.642469705121361,
+      "packed_weight_gb_per_second": 3.557099321407579
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "fp8",
+      "rows": 512,
+      "output_size": 8192,
+      "input_size": 2048,
+      "raw_ms": [
+        0.145408,
+        0.14336,
+        0.14336
+      ],
+      "minimum_ms": 0.14336,
+      "median_ms": 0.14336,
+      "p90_ms": 0.145408,
+      "logical_tflops": 119.8372539421238,
+      "packed_weight_gb_per_second": 117.02856830285528
+    },
+    {
+      "implementation": "cutile_packed",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 512,
+      "input_size": 2048,
+      "raw_ms": [
+        0.304128,
+        0.284672,
+        0.282624
+      ],
+      "minimum_ms": 0.282624,
+      "median_ms": 0.284672,
+      "p90_ms": 0.304128,
+      "logical_tflops": 3.771856220264911,
+      "packed_weight_gb_per_second": 1.8417266700512258
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 512,
+      "input_size": 2048,
+      "raw_ms": [
+        0.033792,
+        0.031744,
+        0.04608
+      ],
+      "minimum_ms": 0.031744,
+      "median_ms": 0.033792,
+      "p90_ms": 0.04608,
+      "logical_tflops": 31.7750300548543,
+      "packed_weight_gb_per_second": 15.515151393971827
+    },
+    {
+      "implementation": "cutile_packed",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 2048,
+      "input_size": 512,
+      "raw_ms": [
+        0.516096,
+        0.492544,
+        0.492544
+      ],
+      "minimum_ms": 0.492544,
+      "median_ms": 0.492544,
+      "p90_ms": 0.516096,
+      "logical_tflops": 2.1799917044379513,
+      "packed_weight_gb_per_second": 1.0644490744325934
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 2048,
+      "input_size": 512,
+      "raw_ms": [
+        0.03072,
+        0.029696,
+        0.029696
+      ],
+      "minimum_ms": 0.029696,
+      "median_ms": 0.029696,
+      "p90_ms": 0.03072,
+      "logical_tflops": 36.15779220250843,
+      "packed_weight_gb_per_second": 17.655171973881068
+    },
+    {
+      "implementation": "cutile_grouped",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 512,
+      "input_size": 2048,
+      "routing_pattern": "uniform",
+      "num_experts": 256,
+      "block_rows": 64,
+      "raw_ms": [
+        0.134144,
+        0.105472,
+        0.106496
+      ],
+      "minimum_ms": 0.105472,
+      "median_ms": 0.106496,
+      "p90_ms": 0.134144,
+      "logical_tflops": 10.08246165208986,
+      "packed_weight_gb_per_second": 4.923076978559502
+    },
+    {
+      "implementation": "marlin_grouped",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 512,
+      "input_size": 2048,
+      "routing_pattern": "uniform",
+      "num_experts": 256,
+      "block_rows": 64,
+      "raw_ms": [
+        0.11776,
+        0.114688,
+        0.115712
+      ],
+      "minimum_ms": 0.114688,
+      "median_ms": 0.115712,
+      "p90_ms": 0.11776,
+      "logical_tflops": 9.27943347436602,
+      "packed_weight_gb_per_second": 4.530973376155283
+    },
+    {
+      "implementation": "cutile_grouped_gate_up_silu",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 512,
+      "input_size": 2048,
+      "routing_pattern": "uniform",
+      "num_experts": 256,
+      "block_rows": 64,
+      "raw_ms": [
+        0.24064,
+        0.203776,
+        0.208896
+      ],
+      "minimum_ms": 0.203776,
+      "median_ms": 0.208896,
+      "p90_ms": 0.24064,
+      "logical_tflops": 10.280157049112349,
+      "packed_weight_gb_per_second": 5.019607934136889
+    },
+    {
+      "implementation": "marlin_grouped_gate_up_silu",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 512,
+      "input_size": 2048,
+      "routing_pattern": "uniform",
+      "num_experts": 256,
+      "block_rows": 64,
+      "raw_ms": [
+        0.272384,
+        0.232448,
+        0.232448
+      ],
+      "minimum_ms": 0.232448,
+      "median_ms": 0.232448,
+      "p90_ms": 0.272384,
+      "logical_tflops": 9.238555195822682,
+      "packed_weight_gb_per_second": 4.511013279210294
+    },
+    {
+      "implementation": "cutile_grouped",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 512,
+      "input_size": 2048,
+      "routing_pattern": "skewed",
+      "num_experts": 256,
+      "block_rows": 64,
+      "raw_ms": [
+        0.106496,
+        0.103424,
+        0.103424
+      ],
+      "minimum_ms": 0.103424,
+      "median_ms": 0.103424,
+      "p90_ms": 0.106496,
+      "logical_tflops": 10.381940818933963,
+      "packed_weight_gb_per_second": 5.069307040495099
+    },
+    {
+      "implementation": "marlin_grouped",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 512,
+      "input_size": 2048,
+      "routing_pattern": "skewed",
+      "num_experts": 256,
+      "block_rows": 64,
+      "raw_ms": [
+        0.115712,
+        0.115712,
+        0.116736
+      ],
+      "minimum_ms": 0.115712,
+      "median_ms": 0.115712,
+      "p90_ms": 0.116736,
+      "logical_tflops": 9.27943347436602,
+      "packed_weight_gb_per_second": 4.530973376155283
+    },
+    {
+      "implementation": "cutile_grouped_gate_up_silu",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 512,
+      "input_size": 2048,
+      "routing_pattern": "skewed",
+      "num_experts": 256,
+      "block_rows": 64,
+      "raw_ms": [
+        0.19968,
+        0.201728,
+        0.196608
+      ],
+      "minimum_ms": 0.196608,
+      "median_ms": 0.19968,
+      "p90_ms": 0.201728,
+      "logical_tflops": 10.754625611748027,
+      "packed_weight_gb_per_second": 5.251282036986342
+    },
+    {
+      "implementation": "marlin_grouped_gate_up_silu",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 512,
+      "input_size": 2048,
+      "routing_pattern": "skewed",
+      "num_experts": 256,
+      "block_rows": 64,
+      "raw_ms": [
+        0.23552,
+        0.2304,
+        0.229376
+      ],
+      "minimum_ms": 0.229376,
+      "median_ms": 0.2304,
+      "p90_ms": 0.23552,
+      "logical_tflops": 9.320675715663583,
+      "packed_weight_gb_per_second": 4.551111189288859
+    },
+    {
+      "implementation": "cutile_grouped",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 2048,
+      "input_size": 512,
+      "routing_pattern": "uniform",
+      "num_experts": 256,
+      "block_rows": 64,
+      "raw_ms": [
+        0.19968,
+        0.175104,
+        0.169984
+      ],
+      "minimum_ms": 0.169984,
+      "median_ms": 0.175104,
+      "p90_ms": 0.19968,
+      "logical_tflops": 6.1320231423036775,
+      "packed_weight_gb_per_second": 2.9941519249529676
+    },
+    {
+      "implementation": "marlin_grouped",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 2048,
+      "input_size": 512,
+      "routing_pattern": "uniform",
+      "num_experts": 256,
+      "block_rows": 64,
+      "raw_ms": [
+        0.057344,
+        0.05632,
+        0.055296
+      ],
+      "minimum_ms": 0.055296,
+      "median_ms": 0.05632,
+      "p90_ms": 0.057344,
+      "logical_tflops": 19.06501803291258,
+      "packed_weight_gb_per_second": 9.309090836383096
+    },
+    {
+      "implementation": "cutile_grouped",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 2048,
+      "input_size": 512,
+      "routing_pattern": "skewed",
+      "num_experts": 256,
+      "block_rows": 64,
+      "raw_ms": [
+        0.17408,
+        0.169984,
+        0.169984
+      ],
+      "minimum_ms": 0.169984,
+      "median_ms": 0.169984,
+      "p90_ms": 0.17408,
+      "logical_tflops": 6.316722968079492,
+      "packed_weight_gb_per_second": 3.084337386757564
+    },
+    {
+      "implementation": "marlin_grouped",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 2048,
+      "input_size": 512,
+      "routing_pattern": "skewed",
+      "num_experts": 256,
+      "block_rows": 64,
+      "raw_ms": [
+        0.05632,
+        0.058368,
+        0.05632
+      ],
+      "minimum_ms": 0.05632,
+      "median_ms": 0.05632,
+      "p90_ms": 0.058368,
+      "logical_tflops": 19.06501803291258,
+      "packed_weight_gb_per_second": 9.309090836383096
+    }
+  ]
+}
+

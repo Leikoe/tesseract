@@ -13,9 +13,7 @@ extern "C" int tesseract_marlin_moe_gemm_bf16(
     const void* block_scales,
     const void* expert_global_scales_bf16,
     int* workspace,
-    const int32_t* sorted_token_ids,
     const int32_t* expert_ids,
-    const int32_t* num_tokens_past_padded,
     int rows,
     int output_size,
     int input_size,
@@ -24,8 +22,7 @@ extern "C" int tesseract_marlin_moe_gemm_bf16(
   if (activations == nullptr || packed_expert_weights == nullptr ||
       output == nullptr || fp32_temporary == nullptr || block_scales == nullptr ||
       expert_global_scales_bf16 == nullptr || workspace == nullptr ||
-      sorted_token_ids == nullptr || expert_ids == nullptr ||
-      num_tokens_past_padded == nullptr || rows <= 0 || output_size <= 0 ||
+      expert_ids == nullptr || rows <= 0 || output_size <= 0 ||
       input_size <= 0 || input_size % 16 != 0 || output_size % 64 != 0 ||
       (moe_block_size != 8 &&
        (moe_block_size < 16 || moe_block_size > 64 || moe_block_size % 16 != 0))) {
@@ -52,9 +49,9 @@ extern "C" int tesseract_marlin_moe_gemm_bf16(
         nullptr,
         nullptr,
         nullptr,
-        const_cast<int32_t*>(sorted_token_ids),
+        nullptr,
         const_cast<int32_t*>(expert_ids),
-        const_cast<int32_t*>(num_tokens_past_padded),
+        nullptr,
         nullptr,
         moe_block_size,
         1,

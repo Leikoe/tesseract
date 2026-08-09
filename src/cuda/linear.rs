@@ -651,18 +651,18 @@ impl Fp8W8A16Linear {
 }
 
 #[derive(Clone, Copy)]
-struct ParsedNvfp4Projection<'a> {
-    input_size: usize,
-    output_size: usize,
-    packed_weight: &'a [u8],
-    scale_bytes: &'a [u8],
-    weight_global_scale: f32,
+pub(super) struct ParsedNvfp4Projection<'a> {
+    pub(super) input_size: usize,
+    pub(super) output_size: usize,
+    pub(super) packed_weight: &'a [u8],
+    pub(super) scale_bytes: &'a [u8],
+    pub(super) weight_global_scale: f32,
 }
 
 /// Parses ModelOpt's four-tensor W4A16 representation. Geometry comes from
 /// the checkpoint; these checks only establish that the bytes can be safely
 /// interpreted by the kernel.
-fn parse_nvfp4_projection<'a>(
+pub(super) fn parse_nvfp4_projection<'a>(
     source: &'a dyn WeightSource,
     prefix: &str,
 ) -> Result<ParsedNvfp4Projection<'a>, ModelError> {
@@ -904,7 +904,7 @@ pub(crate) enum ExpertProjection {
 }
 
 impl ExpertProjection {
-    const fn suffix(self) -> &'static str {
+    pub(super) const fn suffix(self) -> &'static str {
         match self {
             Self::Gate => "gate_proj",
             Self::Up => "up_proj",

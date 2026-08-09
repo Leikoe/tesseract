@@ -15,9 +15,15 @@ use serde::Serialize;
 use crate::cuda::{
     execution::StreamExecution,
     kernels,
-    linear::{Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear},
+    linear::{
+        ExpertProjection, Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear,
+        parse_nvfp4_projection,
+    },
 };
-use crate::{model::ModelError, quantization::decode_e4m3fn};
+use crate::{
+    model::{ModelError, weights::WeightSource},
+    quantization::decode_e4m3fn,
+};
 
 unsafe extern "C" {
     fn tesseract_marlin_repack(
@@ -62,9 +68,7 @@ unsafe extern "C" {
         block_scales: *const c_void,
         expert_global_scales_bf16: *const c_void,
         workspace: *mut i32,
-        sorted_token_ids: *const i32,
         expert_ids: *const i32,
-        num_tokens_past_padded: *const i32,
         rows: i32,
         output_size: i32,
         input_size: i32,
@@ -243,6 +247,44 @@ pub struct MarlinMoe {
 }
 
 impl MarlinMoe {
+    pub(crate) fn load(
+        source: &dyn WeightSource,
+        experts_prefix: &str,
+        projection: ExpertProjection,
+        num_experts: usize,
+        stream: &Arc<Stream>,
+    ) -> Result<Self, ModelError> {
+        if num_experts == 0 {
+            return Err(ModelError::InvalidTensor {
+                name: experts_prefix.into(),
+                message: "expert bank is empty".into(),
+            });
+        }
+        let mut packed = Vec::new();
+        let mut scales = Vec::new();
+        let mut globals = Vec::with_capacity(num_experts);
+        let mut geometry = None;
+        for expert in 0..num_experts {
+            let prefix = format!("{experts_prefix}.{expert}.{}", projection.suffix());
+            let parsed = parse_nvfp4_projection(source, &prefix)?;
+            match geometry {
+                None => geometry = Some((parsed.input_size, parsed.output_size)),
+                Some(expected) if expected != (parsed.input_size, parsed.output_size) => {
+                    return Err(ModelError::InvalidTensor {
+                        name: prefix,
+                        message: "expert projection geometry differs from expert 0".into(),
+                    });
+                }
+                Some(_) => {}
+            }
+            packed.extend_from_slice(parsed.packed_weight);
+            scales.extend_from_slice(parsed.scale_bytes);
+            globals.push(parsed.weight_global_scale);
+        }
+        let (input_size, output_size) = geometry.expect("non-empty expert bank has geometry");
+        Self::nvfp4(&packed, &scales, &globals, input_size, output_size, stream)
+    }
+
     pub fn nvfp4(
         packed_enk: &[u8],
         scale_bytes_eng: &[u8],
@@ -328,9 +370,7 @@ impl MarlinMoe {
         input: &Tensor<bf16>,
         output: &Tensor<bf16>,
         temporary: &Tensor<f32>,
-        sorted_token_ids: &Tensor<i32>,
         expert_ids: &Tensor<i32>,
-        num_tokens_past_padded: &Tensor<i32>,
         rows: usize,
         block_rows: usize,
         stream: &Arc<Stream>,
@@ -341,9 +381,7 @@ impl MarlinMoe {
             || input.shape() != [rows as i32, self.input_size as i32]
             || output.shape() != [rows as i32, self.output_size as i32]
             || temporary.shape() != [rows as i32, self.output_size as i32]
-            || sorted_token_ids.shape() != [rows as i32]
             || expert_ids.shape() != [(rows / block_rows) as i32]
-            || num_tokens_past_padded.shape() != [1]
         {
             return Err(ModelError::Cuda(
                 "invalid grouped Marlin execution geometry".into(),
@@ -362,9 +400,7 @@ impl MarlinMoe {
                 self.scales.device_pointer().cu_deviceptr() as usize as *const c_void,
                 self.global_scales.device_pointer().cu_deviceptr() as usize as *const c_void,
                 self.workspace.device_pointer().cu_deviceptr() as usize as *mut i32,
-                sorted_token_ids.device_pointer().cu_deviceptr() as usize as *const i32,
                 expert_ids.device_pointer().cu_deviceptr() as usize as *const i32,
-                num_tokens_past_padded.device_pointer().cu_deviceptr() as usize as *const i32,
                 rows as i32,
                 self.output_size as i32,
                 self.input_size as i32,
@@ -1106,24 +1142,12 @@ fn time_marlin_grouped(
         .map_err(|error| {
             ModelError::Cuda(format!("allocate grouped Marlin temporary: {error:?}"))
         })?;
-    let sorted_token_ids = upload(
-        (0..rows as i32).collect(),
-        stream,
-        "upload grouped benchmark sorted token IDs",
-    )?;
-    let padded_count = upload(
-        vec![rows as i32],
-        stream,
-        "upload grouped benchmark padded count",
-    )?;
     for _ in 0..warmup {
         linear.execute(
             &input,
             &output,
             &temporary,
-            &sorted_token_ids,
             &expert_map,
-            &padded_count,
             rows,
             block_rows,
             stream,
@@ -1140,9 +1164,7 @@ fn time_marlin_grouped(
             &input,
             &output,
             &temporary,
-            &sorted_token_ids,
             &expert_map,
-            &padded_count,
             rows,
             block_rows,
             stream,
@@ -1259,16 +1281,6 @@ fn time_marlin_grouped_gate_up(
         .map_err(|error| {
             ModelError::Cuda(format!("allocate Marlin activated output: {error:?}"))
         })?;
-    let sorted_token_ids = upload(
-        (0..rows as i32).collect(),
-        stream,
-        "upload grouped gate/up sorted token IDs",
-    )?;
-    let padded_count = upload(
-        vec![rows as i32],
-        stream,
-        "upload grouped gate/up padded count",
-    )?;
     let launch = |activated: &mut Tensor<bf16>,
                   execution: &mut StreamExecution<'_>|
      -> Result<(), ModelError> {
@@ -1276,9 +1288,7 @@ fn time_marlin_grouped_gate_up(
             &input,
             &gate_output,
             &gate_temporary,
-            &sorted_token_ids,
             &expert_map,
-            &padded_count,
             rows,
             block_rows,
             stream,
@@ -1287,9 +1297,7 @@ fn time_marlin_grouped_gate_up(
             &input,
             &up_output,
             &up_temporary,
-            &sorted_token_ids,
             &expert_map,
-            &padded_count,
             rows,
             block_rows,
             stream,
@@ -1632,24 +1640,16 @@ fn probe_grouped_nvfp4(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         .map_err(|error| {
             ModelError::Cuda(format!("allocate grouped Marlin temporary: {error:?}"))
         })?;
-    let sorted_token_ids = upload(
-        (0..M as i32).collect(),
-        stream,
-        "upload grouped Marlin sorted token IDs",
-    )?;
     let expert_ids = upload(
         (0..EXPERTS as i32).collect(),
         stream,
         "upload grouped Marlin expert IDs",
     )?;
-    let padded_count = upload(vec![M as i32], stream, "upload grouped Marlin padded count")?;
     linear.execute(
         &input,
         &output,
         &temporary,
-        &sorted_token_ids,
         &expert_ids,
-        &padded_count,
         M,
         BLOCK_ROWS,
         stream,
