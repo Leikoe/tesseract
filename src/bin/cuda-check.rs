@@ -20,6 +20,7 @@ fn main() -> anyhow::Result<()> {
     print_capability("nvfp4_byte_decode_mma", quantized.byte_decode_mma);
     print_capability("nvfp4_w4a16_linear", quantized.w4a16_linear);
     print_capability("nvfp4_grouped_w4a16", quantized.grouped_w4a16);
+    print_capability("moe_device_routing", quantized.moe_routing);
     println!("cutile_probe=ok");
     Ok(())
 }
