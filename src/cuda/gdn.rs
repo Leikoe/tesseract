@@ -441,8 +441,10 @@ mod kernels {
                 .reshape(const_shape![]),
         );
 
-        let row: Tile<i32, { [16, 1] }> = iota(const_shape![16]).reshape(const_shape![16, 1]);
-        let column: Tile<i32, { [1, 128] }> = iota(const_shape![128]).reshape(const_shape![1, 128]);
+        let row: Tile<i32, { [16] }> = iota(const_shape![16]);
+        let row: Tile<i32, { [16, 1] }> = row.reshape(const_shape![16, 1]);
+        let column: Tile<i32, { [128] }> = iota(const_shape![128]);
+        let column: Tile<i32, { [1, 128] }> = column.reshape(const_shape![1, 128]);
         let row_shape = const_shape![16, 1];
         let key_offset = ((start.broadcast(row_shape) + row) * 8192i32.broadcast(row_shape)
             + ((key_head + 16i32) * 128i32).broadcast(row_shape))
@@ -506,8 +508,8 @@ mod kernels {
         );
         let beta: Tile<f32, { [16, 1] }> = convert_tile(beta);
 
-        let causal_column: Tile<i32, { [1, 16] }> =
-            iota(const_shape![16]).reshape(const_shape![1, 16]);
+        let causal_column: Tile<i32, { [16] }> = iota(const_shape![16]);
+        let causal_column: Tile<i32, { [1, 16] }> = causal_column.reshape(const_shape![1, 16]);
         let valid_column: Tile<bool, { [1, 16] }> =
             lt_tile(causal_column, len.broadcast(const_shape![1, 16]));
         let strict_lower = gt_tile(
