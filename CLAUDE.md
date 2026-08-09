@@ -1198,3 +1198,6 @@ bench command should NOT require CUDA. it merely uses reqwests to make requests 
 ```text
 you might want to look at how random dataset works in vllm bench
 ```
+```text
+can we have serious benchmarks ?
+```

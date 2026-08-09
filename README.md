@@ -81,7 +81,9 @@ cargo run --bin tesseract -- bench \
 The default random dataset constructs deterministic token-length prompts with a
 local tokenizer, including optional length variation and a shared prefix.
 Streaming is enabled so the report includes request and token throughput, TTFT,
-and inter-token latency. Use `tesseract bench --help` for all controls.
+TPOT, inter-token latency, failures, and observed peak concurrency. Per-request
+records are opt-in with `--output-details`; repeatable labels can be attached
+with `--metadata KEY=VALUE`. Use `tesseract bench --help` for all controls.
 
 
 ## Research notes

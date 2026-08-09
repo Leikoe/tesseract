@@ -89,6 +89,12 @@ pub struct BenchmarkConfig {
     #[arg(long, value_name = "NAME:VALUE")]
     pub header: Vec<String>,
 
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub metadata: Vec<String>,
+
+    #[arg(long, help = "Include per-request prompts and latency details")]
+    pub output_details: bool,
+
     #[arg(long)]
     pub output: Option<PathBuf>,
 }

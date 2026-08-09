@@ -1,7 +1,11 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,10 +34,26 @@ struct RequestResult {
     latency_seconds: f64,
     ttft_seconds: f64,
     mean_inter_token_seconds: f64,
+    #[serde(skip)]
+    inter_token_intervals: Vec<f64>,
     token_events: usize,
     prompt_tokens: usize,
     completion_tokens: usize,
     finish_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum RequestOutcome {
+    Success {
+        #[serde(flatten)]
+        result: RequestResult,
+    },
+    Failed {
+        index: usize,
+        prompt: String,
+        error: String,
+    },
 }
 
 struct RequestSpec<'a> {
@@ -57,7 +77,8 @@ struct Distribution {
 
 #[derive(Debug, Serialize)]
 struct Summary {
-    requests: usize,
+    successful_requests: usize,
+    failed_requests: usize,
     prompt_tokens: usize,
     completion_tokens: usize,
     wall_seconds: f64,
@@ -65,8 +86,10 @@ struct Summary {
     prompt_tokens_per_second: f64,
     completion_tokens_per_second: f64,
     total_tokens_per_second: f64,
+    peak_concurrency: usize,
     request_latency_seconds: Distribution,
     ttft_seconds: Distribution,
+    time_per_output_token_seconds: Distribution,
     inter_token_seconds: Distribution,
 }
 
@@ -88,8 +111,31 @@ struct Report<'a> {
     output_len: usize,
     warmup_requests: usize,
     seed: u64,
+    metadata: &'a BTreeMap<String, String>,
     summary: &'a Summary,
-    results: &'a [RequestResult],
+    results: Option<&'a [RequestOutcome]>,
+}
+
+#[derive(Default)]
+struct Concurrency {
+    current: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl Concurrency {
+    fn enter(&self) -> ConcurrencyGuard<'_> {
+        let current = self.current.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak.fetch_max(current, Ordering::AcqRel);
+        ConcurrencyGuard(self)
+    }
+}
+
+struct ConcurrencyGuard<'a>(&'a Concurrency);
+
+impl Drop for ConcurrencyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.current.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub async fn run(config: BenchmarkConfig) -> Result<()> {
@@ -129,6 +175,7 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
     let arrivals = arrival_offsets(config.num_prompts, config.request_rate, config.seed);
     let started = Instant::now();
     let permits = Arc::new(Semaphore::new(max_concurrency));
+    let concurrency = Arc::new(Concurrency::default());
     let mut tasks = JoinSet::new();
     for index in 0..config.num_prompts {
         let client = client.clone();
@@ -139,16 +186,27 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
         let prompt = sample.prompt.clone();
         let generated_prompt_tokens = sample.generated_prompt_tokens;
         let permits = Arc::clone(&permits);
+        let concurrency = Arc::clone(&concurrency);
         let due = started + arrivals[index];
         let output_len = sample.output_tokens;
         let seed = config.seed.wrapping_add(index as u64);
         tasks.spawn(async move {
             tokio::time::sleep_until(due.into()).await;
-            let _permit = permits
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow!("benchmark concurrency limiter closed"))?;
-            let result = request_once(
+            let _permit = match permits.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return (
+                        index,
+                        RequestOutcome::Failed {
+                            index,
+                            prompt,
+                            error: "benchmark concurrency limiter closed".to_owned(),
+                        },
+                    );
+                }
+            };
+            let _in_flight = concurrency.enter();
+            let outcome = match request_once(
                 &client,
                 RequestSpec {
                     endpoint: &endpoint,
@@ -162,28 +220,41 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
                 },
             )
             .await
-            .with_context(|| format!("request {index}"))?;
-            Ok::<_, anyhow::Error>((index, result))
+            .with_context(|| format!("request {index}"))
+            {
+                Ok(result) => RequestOutcome::Success { result },
+                Err(error) => RequestOutcome::Failed {
+                    index,
+                    prompt,
+                    error: format!("{error:#}"),
+                },
+            };
+            (index, outcome)
         });
     }
     let mut indexed = Vec::with_capacity(config.num_prompts);
     while let Some(result) = tasks.join_next().await {
-        indexed.push(result.context("benchmark task panicked")??);
+        indexed.push(result.context("benchmark task panicked")?);
     }
     let wall_seconds = started.elapsed().as_secs_f64();
 
-    let mut slots: Vec<Option<RequestResult>> = (0..config.num_prompts).map(|_| None).collect();
-    for (index, result) in indexed {
-        slots[index] = Some(result);
+    let mut slots: Vec<Option<RequestOutcome>> = (0..config.num_prompts).map(|_| None).collect();
+    for (index, outcome) in indexed {
+        slots[index] = Some(outcome);
     }
     let results = slots
         .into_iter()
         .enumerate()
         .map(|(index, result)| result.ok_or_else(|| anyhow!("missing result {index}")))
         .collect::<Result<Vec<_>>>()?;
-    let summary = summarize(&results, wall_seconds);
+    let summary = summarize(
+        &results,
+        wall_seconds,
+        concurrency.peak.load(Ordering::Acquire),
+    );
 
-    println!("Successful requests: {}", summary.requests);
+    println!("Successful requests: {}", summary.successful_requests);
+    println!("Failed requests: {}", summary.failed_requests);
     println!("Benchmark duration: {:.2} s", summary.wall_seconds);
     println!(
         "Request throughput: {:.2} req/s",
@@ -203,8 +274,10 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
         "Mean inter-token latency: {:.2} ms",
         summary.inter_token_seconds.mean * 1000.0
     );
+    println!("Peak concurrency: {}", summary.peak_concurrency);
 
     if let Some(path) = &config.output {
+        let metadata = metadata(&config.metadata)?;
         let report = Report {
             schema_version: 1,
             timestamp_unix_seconds: SystemTime::now()
@@ -228,8 +301,9 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
             output_len: config.output_len,
             warmup_requests: config.warmup_requests,
             seed: config.seed,
+            metadata: &metadata,
             summary: &summary,
-            results: &results,
+            results: config.output_details.then_some(results.as_slice()),
         };
         write_report(path, &report)?;
         println!("Results written to {}", path.display());
@@ -286,6 +360,19 @@ fn headers(values: &[String]) -> Result<HeaderMap> {
     Ok(headers)
 }
 
+fn metadata(values: &[String]) -> Result<BTreeMap<String, String>> {
+    values
+        .iter()
+        .map(|value| {
+            let (key, value) = value
+                .split_once('=')
+                .with_context(|| format!("metadata must have KEY=VALUE form: {value}"))?;
+            ensure!(!key.trim().is_empty(), "metadata key cannot be empty");
+            Ok((key.trim().to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
 async fn request_once(client: &Client, request: RequestSpec<'_>) -> Result<RequestResult> {
     let started = Instant::now();
     let body = match request.api {
@@ -337,6 +424,13 @@ async fn request_once(client: &Client, request: RequestSpec<'_>) -> Result<Reque
         .windows(2)
         .map(|pair| pair[1] - pair[0])
         .collect::<Vec<_>>();
+    let prompt_tokens = usage["prompt_tokens"]
+        .as_u64()
+        .context("stream ended without prompt token usage")? as usize;
+    let completion_tokens = usage["completion_tokens"]
+        .as_u64()
+        .context("stream ended without completion token usage")?
+        as usize;
     Ok(RequestResult {
         index: request.index,
         prompt: request.prompt.to_owned(),
@@ -345,9 +439,10 @@ async fn request_once(client: &Client, request: RequestSpec<'_>) -> Result<Reque
         latency_seconds,
         ttft_seconds: token_times.first().copied().unwrap_or(latency_seconds),
         mean_inter_token_seconds: mean(&intervals),
+        inter_token_intervals: intervals,
         token_events: token_times.len(),
-        prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as usize,
-        completion_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as usize,
+        prompt_tokens,
+        completion_tokens,
         finish_reason,
     })
 }
@@ -440,30 +535,47 @@ fn splitmix64(state: &mut u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn summarize(results: &[RequestResult], wall_seconds: f64) -> Summary {
-    let prompt_tokens = results.iter().map(|r| r.prompt_tokens).sum();
-    let completion_tokens = results.iter().map(|r| r.completion_tokens).sum();
-    let latencies = results
+fn summarize(results: &[RequestOutcome], wall_seconds: f64, peak_concurrency: usize) -> Summary {
+    let successful = results
+        .iter()
+        .filter_map(|outcome| match outcome {
+            RequestOutcome::Success { result } => Some(result),
+            RequestOutcome::Failed { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let prompt_tokens = successful.iter().map(|r| r.prompt_tokens).sum();
+    let completion_tokens = successful.iter().map(|r| r.completion_tokens).sum();
+    let latencies = successful
         .iter()
         .map(|r| r.latency_seconds)
         .collect::<Vec<_>>();
-    let ttfts = results.iter().map(|r| r.ttft_seconds).collect::<Vec<_>>();
-    let inter_tokens = results
+    let ttfts = successful
+        .iter()
+        .map(|r| r.ttft_seconds)
+        .collect::<Vec<_>>();
+    let tpots = successful
         .iter()
         .filter(|r| r.token_events > 1)
         .map(|r| r.mean_inter_token_seconds)
         .collect::<Vec<_>>();
+    let inter_tokens = successful
+        .iter()
+        .flat_map(|r| r.inter_token_intervals.iter().copied())
+        .collect::<Vec<_>>();
     Summary {
-        requests: results.len(),
+        successful_requests: successful.len(),
+        failed_requests: results.len() - successful.len(),
         prompt_tokens,
         completion_tokens,
         wall_seconds,
-        request_throughput: results.len() as f64 / wall_seconds,
+        request_throughput: successful.len() as f64 / wall_seconds,
         prompt_tokens_per_second: prompt_tokens as f64 / wall_seconds,
         completion_tokens_per_second: completion_tokens as f64 / wall_seconds,
         total_tokens_per_second: (prompt_tokens + completion_tokens) as f64 / wall_seconds,
+        peak_concurrency,
         request_latency_seconds: distribution(&latencies),
         ttft_seconds: distribution(&ttfts),
+        time_per_output_token_seconds: distribution(&tpots),
         inter_token_seconds: distribution(&inter_tokens),
     }
 }
