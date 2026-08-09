@@ -1025,26 +1025,39 @@ impl LinearAttention {
         if !rows.is_multiple_of(16) || hidden.shape() != [rows as i32, HIDDEN_SIZE as i32] {
             return Err(ModelError::Cuda("invalid Qwen GDN input geometry".into()));
         }
-        let stream = execution.stream().clone();
-        let mixed_qkv = Arc::new(self.input_qkv.enqueue(hidden.clone(), rows, execution)?);
+        let projected_qkv = workspace.take_bf16(
+            &[rows, self.input_qkv.output_size()],
+            execution,
+            "allocate Qwen GDN QKV projection",
+        )?;
+        let projected_qkv = Arc::new(self.input_qkv.enqueue_into(
+            hidden.clone(),
+            rows,
+            projected_qkv,
+            execution,
+        )?);
         let mixed_qkv = Arc::new(match prefill {
             Some(plan) => state.prefill_conv(
-                mixed_qkv,
+                projected_qkv.clone(),
                 self.conv1d.clone(),
                 plan.query_start_offsets(),
                 state_slots.clone(),
                 rows,
                 plan.requests(),
-                &stream,
+                execution,
+                workspace,
             )?,
             None => state.decode_conv(
-                mixed_qkv,
+                projected_qkv.clone(),
                 self.conv1d.clone(),
                 state_slots.clone(),
                 rows,
-                &stream,
+                execution,
+                workspace,
             )?,
         });
+        workspace.retire_shared_bf16(projected_qkv, "GDN QKV projection")?;
+        workspace.reclaim(execution)?;
         let a = bf16_gemm(
             self.input_a.clone(),
             hidden.clone(),
@@ -1067,44 +1080,70 @@ impl LinearAttention {
         )?;
         let recurrent = Arc::new(match prefill {
             Some(plan) => state.prefill(
-                mixed_qkv,
+                mixed_qkv.clone(),
                 a.clone(),
                 b.clone(),
                 self.a_log.clone(),
                 self.dt_bias.clone(),
                 state_slots,
                 plan,
-                &stream,
+                execution,
+                workspace,
             )?,
             None => state.decode(
-                mixed_qkv,
+                mixed_qkv.clone(),
                 a.clone(),
                 b.clone(),
                 self.a_log.clone(),
                 self.dt_bias.clone(),
                 state_slots,
                 rows,
-                &stream,
+                execution,
+                workspace,
             )?,
         });
+        workspace.retire_shared_bf16(mixed_qkv, "GDN convolution output")?;
+        workspace.reclaim(execution)?;
+        let gate_output = workspace.take_bf16(
+            &[rows, self.input_z.output_size()],
+            execution,
+            "allocate Qwen GDN z projection",
+        )?;
         let gate = self
             .input_z
-            .enqueue(hidden, rows, execution)?
+            .enqueue_into(hidden, rows, gate_output, execution)?
             .reshape(&[rows, 32, 128])
             .map_err(|error| ModelError::Cuda(format!("reshape Qwen GDN z gate: {error:?}")))?;
+        let gate = Arc::new(gate);
         let gated = gdn_backend::output_gate(
-            recurrent,
-            Arc::new(gate),
+            recurrent.clone(),
+            gate.clone(),
             self.norm.clone(),
             epsilon,
             rows,
-            &stream,
+            execution,
+            workspace,
         )?
         .reshape(&[rows, VALUE_SIZE])
         .map_err(|error| ModelError::Cuda(format!("reshape Qwen GDN output: {error:?}")))?;
-        let output = self.output.enqueue(Arc::new(gated), rows, execution)?;
+        workspace.retire_shared_bf16(recurrent, "GDN recurrent output")?;
+        let gate = Arc::try_unwrap(gate)
+            .map_err(|_| ModelError::Cuda("GDN z projection still has host aliases".into()))?
+            .reshape(&[rows, VALUE_SIZE])
+            .map_err(|error| ModelError::Cuda(format!("restore Qwen GDN z shape: {error:?}")))?;
+        workspace.retire_shared_bf16(Arc::new(gate), "GDN z projection")?;
+        let gated = Arc::new(gated);
+        let output = self.output.enqueue(gated.clone(), rows, execution)?;
+        let gated = Arc::try_unwrap(gated)
+            .map_err(|_| ModelError::Cuda("GDN gated output still has host aliases".into()))?
+            .reshape(&[rows, 32, 128])
+            .map_err(|error| {
+                ModelError::Cuda(format!("restore Qwen GDN output shape: {error:?}"))
+            })?;
+        workspace.retire_shared_bf16(Arc::new(gated), "GDN gated output")?;
         workspace.retire_shared_bf16(a, "GDN a projection")?;
         workspace.retire_shared_bf16(b, "GDN b projection")?;
+        workspace.reclaim(execution)?;
         Ok(output)
     }
 }

@@ -1,10 +1,11 @@
-//! Reusable, stream-safe tensor storage for synchronous CUDA model programs.
+//! Reusable, stream-ordered tensor storage for CUDA model programs.
 //!
 //! A workspace has three states for each allocation:
-//! available, checked out by the current forward, or retired while kernels may
-//! still reference it. Retired storage only becomes available again after the
-//! execution scope proves that its stream is synchronized. This prevents a
-//! fast producer from overwriting an input that a queued consumer has not read.
+//! available, checked out by host code, or retired after its last GPU consumer
+//! has been enqueued. Retired storage can be reused immediately by a later
+//! operation on the same stream: CUDA stream order guarantees that the later
+//! writer cannot overtake the earlier consumer. Storage is only evicted (and
+//! therefore freed) after the stream has synchronized.
 
 use std::{collections::VecDeque, sync::Arc};
 
@@ -108,13 +109,13 @@ impl<T: DType> TensorPool<T> {
         Ok(())
     }
 
-    fn reclaim(&mut self) {
+    fn reclaim(&mut self, can_evict: bool) {
         for tensor in self.retired.drain(..) {
             let bytes = tensor.num_bytes();
-            if bytes > self.byte_limit {
+            if can_evict && bytes > self.byte_limit {
                 continue;
             }
-            while self.cached_bytes.saturating_add(bytes) > self.byte_limit {
+            while can_evict && self.cached_bytes.saturating_add(bytes) > self.byte_limit {
                 let Some(evicted) = self.available.pop_front() else {
                     break;
                 };
@@ -123,14 +124,24 @@ impl<T: DType> TensorPool<T> {
             self.cached_bytes += bytes;
             self.available.push_back(tensor);
         }
+        if can_evict {
+            while self.cached_bytes > self.byte_limit {
+                let Some(evicted) = self.available.pop_front() else {
+                    break;
+                };
+                self.cached_bytes -= evicted.num_bytes();
+            }
+        }
     }
 }
 
 /// Shape-keyed scratch storage owned by one model executor.
 ///
-/// The executor is single-threaded, so the workspace requires no locking. The
-/// byte limit is shared proportionally across supported activation dtypes and
-/// bounds retained storage when serving a changing mix of batch shapes.
+/// The executor is single-threaded and submits all workspace users to one CUDA
+/// stream, so the workspace requires no locking or per-layer host barrier. The
+/// byte limit is shared proportionally across supported activation dtypes. It
+/// is enforced at synchronized boundaries, because freeing a pending allocation
+/// would be unsafe even though reusing it later on the same stream is ordered.
 pub(crate) struct ExecutionWorkspace {
     bf16: TensorPool<bf16>,
     f32: TensorPool<f32>,
@@ -244,15 +255,11 @@ impl ExecutionWorkspace {
     }
 
     pub(crate) fn reclaim(&mut self, execution: &StreamExecution<'_>) -> Result<(), ModelError> {
-        if !execution.is_synchronized() {
-            return Err(ModelError::Cuda(
-                "cannot reclaim CUDA workspace before stream completion".into(),
-            ));
-        }
-        self.bf16.reclaim();
-        self.f32.reclaim();
-        self.i32.reclaim();
-        self.u32.reclaim();
+        let can_evict = execution.is_synchronized();
+        self.bf16.reclaim(can_evict);
+        self.f32.reclaim(can_evict);
+        self.i32.reclaim(can_evict);
+        self.u32.reclaim(can_evict);
         Ok(())
     }
 }

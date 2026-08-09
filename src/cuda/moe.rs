@@ -325,7 +325,6 @@ pub(crate) fn combine_shared(
         "combine shared expert",
     )?;
     drop(output_partition);
-    execution.synchronize("complete Qwen MoE layer")?;
     Ok(output)
 }
 

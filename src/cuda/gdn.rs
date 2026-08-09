@@ -10,7 +10,11 @@ use cutile::{
     tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
 };
 
-use crate::{chunking::plan_packed_queries, cuda::execution::StreamExecution, model::ModelError};
+use crate::{
+    chunking::plan_packed_queries,
+    cuda::{execution::StreamExecution, workspace::ExecutionWorkspace},
+    model::ModelError,
+};
 
 const KEY_HEADS: usize = 16;
 const VALUE_HEADS: usize = 32;
@@ -1320,8 +1324,8 @@ impl GdnPrefillPlan {
 }
 
 struct GdnPrefillGates {
-    log_decay_cumsum: Tensor<f32>,
-    beta: Tensor<bf16>,
+    log_decay_cumsum: Arc<Tensor<f32>>,
+    beta: Arc<Tensor<bf16>>,
 }
 
 fn prepare_prefill_gates(
@@ -1330,7 +1334,8 @@ fn prepare_prefill_gates(
     a_log: Arc<Tensor<f32>>,
     dt_bias: Arc<Tensor<f32>>,
     plan: &GdnPrefillPlan,
-    stream: &Arc<Stream>,
+    execution: &mut StreamExecution<'_>,
+    workspace: &mut ExecutionWorkspace,
 ) -> Result<GdnPrefillGates, ModelError> {
     let rows = plan.rows();
     if plan.chunks() == 0
@@ -1341,36 +1346,43 @@ fn prepare_prefill_gates(
     {
         return Err(ModelError::Cuda("invalid GDN prefill gate geometry".into()));
     }
-    let log_decay_cumsum = api::zeros::<f32>(&[rows, VALUE_HEADS])
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("allocate GDN prefill log gates: {error:?}")))?;
-    let beta = api::zeros::<bf16>(&[rows, VALUE_HEADS])
-        .sync_on(stream)
-        .map_err(|error| {
-            ModelError::Cuda(format!("allocate GDN prefill update gates: {error:?}"))
-        })?;
-    let mut completion = api::zeros::<i32>(&[plan.chunks(), VALUE_HEADS])
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("allocate GDN gate launch grid: {error:?}")))?;
-    let (_, _, _, _, _, _, _, _, completion_partition) = unsafe {
-        qwen_gdn_prefill_gates(
-            a,
-            b,
-            a_log,
-            dt_bias,
-            plan.chunk_starts.clone(),
-            plan.chunk_lengths.clone(),
-            log_decay_cumsum.device_pointer(),
-            beta.device_pointer(),
-            (&mut completion).partition([1, 1]),
-        )
-    }
-    .sync_on(stream)
-    .map_err(|error| ModelError::Cuda(format!("execute GDN prefill gates: {error:?}")))?;
+    let log_decay_cumsum = workspace.take_f32(
+        &[rows, VALUE_HEADS],
+        execution,
+        "allocate GDN prefill log gates",
+    )?;
+    let beta = workspace.take_bf16(
+        &[rows, VALUE_HEADS],
+        execution,
+        "allocate GDN prefill update gates",
+    )?;
+    let mut completion = workspace.take_i32(
+        &[plan.chunks(), VALUE_HEADS],
+        execution,
+        "allocate GDN gate launch grid",
+    )?;
+    let (_, _, _, _, _, _, _, _, completion_partition) = execution.enqueue(
+        unsafe {
+            qwen_gdn_prefill_gates(
+                a,
+                b,
+                a_log,
+                dt_bias,
+                plan.chunk_starts.clone(),
+                plan.chunk_lengths.clone(),
+                log_decay_cumsum.device_pointer(),
+                beta.device_pointer(),
+                (&mut completion).partition([1, 1]),
+            )
+        },
+        "execute GDN prefill gates",
+    )?;
     drop(completion_partition);
+    workspace.retire_i32(completion);
+    workspace.reclaim(execution)?;
     Ok(GdnPrefillGates {
-        log_decay_cumsum,
-        beta,
+        log_decay_cumsum: Arc::new(log_decay_cumsum),
+        beta: Arc::new(beta),
     })
 }
 
@@ -1378,29 +1390,30 @@ fn solve_prefill_kkt(
     mixed_qkv: Arc<Tensor<bf16>>,
     gates: &GdnPrefillGates,
     plan: &GdnPrefillPlan,
-    stream: &Arc<Stream>,
+    execution: &mut StreamExecution<'_>,
+    workspace: &mut ExecutionWorkspace,
 ) -> Result<Arc<Tensor<bf16>>, ModelError> {
     if mixed_qkv.shape() != [plan.rows() as i32, CONV_FEATURES as i32] {
         return Err(ModelError::Cuda("invalid GDN prefill KKT geometry".into()));
     }
-    let mut inverse =
-        api::zeros::<bf16>(&[plan.chunks(), VALUE_HEADS, PREFILL_CHUNK * PREFILL_CHUNK])
-            .sync_on(stream)
-            .map_err(|error| {
-                ModelError::Cuda(format!("allocate GDN prefill inverse: {error:?}"))
-            })?;
-    let (_, _, _, _, _, inverse_partition) = unsafe {
-        qwen_gdn_prefill_kkt_solve(
-            mixed_qkv.device_pointer(),
-            gates.log_decay_cumsum.device_pointer(),
-            gates.beta.device_pointer(),
-            plan.chunk_starts.clone(),
-            plan.chunk_lengths.clone(),
-            (&mut inverse).partition([1, 1, PREFILL_CHUNK * PREFILL_CHUNK]),
-        )
-    }
-    .sync_on(stream)
-    .map_err(|error| ModelError::Cuda(format!("execute GDN prefill KKT solve: {error:?}")))?;
+    let mut inverse = workspace.take_bf16(
+        &[plan.chunks(), VALUE_HEADS, PREFILL_CHUNK * PREFILL_CHUNK],
+        execution,
+        "allocate GDN prefill inverse",
+    )?;
+    let (_, _, _, _, _, inverse_partition) = execution.enqueue(
+        unsafe {
+            qwen_gdn_prefill_kkt_solve(
+                mixed_qkv.device_pointer(),
+                gates.log_decay_cumsum.device_pointer(),
+                gates.beta.device_pointer(),
+                plan.chunk_starts.clone(),
+                plan.chunk_lengths.clone(),
+                (&mut inverse).partition([1, 1, PREFILL_CHUNK * PREFILL_CHUNK]),
+            )
+        },
+        "execute GDN prefill KKT solve",
+    )?;
     drop(inverse_partition);
     Ok(Arc::new(inverse))
 }
@@ -1415,29 +1428,27 @@ fn recompute_prefill_w_u(
     gates: &GdnPrefillGates,
     inverse: Arc<Tensor<bf16>>,
     plan: &GdnPrefillPlan,
-    stream: &Arc<Stream>,
+    execution: &mut StreamExecution<'_>,
+    workspace: &mut ExecutionWorkspace,
 ) -> Result<GdnPrefillWy, ModelError> {
     let shape = [plan.chunks(), VALUE_HEADS, PREFILL_CHUNK * HEAD_DIM];
-    let mut w = api::zeros::<bf16>(&shape)
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("allocate GDN prefill W: {error:?}")))?;
-    let u = api::zeros::<bf16>(&shape)
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("allocate GDN prefill U: {error:?}")))?;
-    let (_, _, _, _, _, _, _, w_partition) = unsafe {
-        qwen_gdn_prefill_recompute_w_u(
-            mixed_qkv.device_pointer(),
-            gates.log_decay_cumsum.device_pointer(),
-            gates.beta.device_pointer(),
-            inverse,
-            plan.chunk_starts.clone(),
-            plan.chunk_lengths.clone(),
-            u.device_pointer(),
-            (&mut w).partition([1, 1, PREFILL_CHUNK * HEAD_DIM]),
-        )
-    }
-    .sync_on(stream)
-    .map_err(|error| ModelError::Cuda(format!("execute GDN prefill W/U: {error:?}")))?;
+    let mut w = workspace.take_bf16(&shape, execution, "allocate GDN prefill W")?;
+    let u = workspace.take_bf16(&shape, execution, "allocate GDN prefill U")?;
+    let (_, _, _, _, _, _, _, w_partition) = execution.enqueue(
+        unsafe {
+            qwen_gdn_prefill_recompute_w_u(
+                mixed_qkv.device_pointer(),
+                gates.log_decay_cumsum.device_pointer(),
+                gates.beta.device_pointer(),
+                inverse.clone(),
+                plan.chunk_starts.clone(),
+                plan.chunk_lengths.clone(),
+                u.device_pointer(),
+                (&mut w).partition([1, 1, PREFILL_CHUNK * HEAD_DIM]),
+            )
+        },
+        "execute GDN prefill W/U",
+    )?;
     drop(w_partition);
     Ok(GdnPrefillWy {
         w: Arc::new(w),
@@ -1451,7 +1462,8 @@ pub(crate) fn output_gate(
     weight: Arc<Tensor<bf16>>,
     epsilon: f32,
     rows: usize,
-    stream: &Arc<Stream>,
+    execution: &mut StreamExecution<'_>,
+    workspace: &mut ExecutionWorkspace,
 ) -> Result<Tensor<bf16>, ModelError> {
     if input.shape() != [rows as i32, VALUE_HEADS as i32, HEAD_DIM as i32]
         || gate.shape() != input.shape()
@@ -1461,18 +1473,21 @@ pub(crate) fn output_gate(
     {
         return Err(ModelError::Cuda("invalid GDN output gate geometry".into()));
     }
-    let mut output = api::zeros::<bf16>(&[rows, VALUE_HEADS, HEAD_DIM])
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("allocate GDN gated output: {error:?}")))?;
-    let (_, _, _, _, output_partition) = qwen_gdn_output_gate(
-        input,
-        gate,
-        weight,
-        epsilon,
-        (&mut output).partition([1, 1, HEAD_DIM]),
-    )
-    .sync_on(stream)
-    .map_err(|error| ModelError::Cuda(format!("execute GDN output gate: {error:?}")))?;
+    let mut output = workspace.take_bf16(
+        &[rows, VALUE_HEADS, HEAD_DIM],
+        execution,
+        "allocate GDN gated output",
+    )?;
+    let (_, _, _, _, output_partition) = execution.enqueue(
+        qwen_gdn_output_gate(
+            input,
+            gate,
+            weight,
+            epsilon,
+            (&mut output).partition([1, 1, HEAD_DIM]),
+        ),
+        "execute GDN output gate",
+    )?;
     drop(output_partition);
     Ok(output)
 }
@@ -1569,7 +1584,8 @@ impl GdnState {
         weight: Arc<Tensor<bf16>>,
         state_slots: Arc<Tensor<i32>>,
         rows: usize,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
+        workspace: &mut ExecutionWorkspace,
     ) -> Result<Tensor<bf16>, ModelError> {
         if self.slots == 0
             || input.shape() != [rows as i32, CONV_FEATURES as i32]
@@ -1578,22 +1594,23 @@ impl GdnState {
         {
             return Err(ModelError::Cuda("invalid GDN convolution geometry".into()));
         }
-        let mut output = api::zeros::<bf16>(&[rows, CONV_FEATURES])
-            .sync_on(stream)
-            .map_err(|error| {
-                ModelError::Cuda(format!("allocate GDN convolution output: {error:?}"))
-            })?;
-        let (_, _, _, _, output_partition) = unsafe {
-            qwen_gdn_conv_decode(
-                input,
-                weight,
-                state_slots,
-                self.conv.device_pointer(),
-                (&mut output).partition([1, CONV_BLOCK]),
-            )
-        }
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("execute GDN convolution decode: {error:?}")))?;
+        let mut output = workspace.take_bf16(
+            &[rows, CONV_FEATURES],
+            execution,
+            "allocate GDN convolution output",
+        )?;
+        let (_, _, _, _, output_partition) = execution.enqueue(
+            unsafe {
+                qwen_gdn_conv_decode(
+                    input,
+                    weight,
+                    state_slots,
+                    self.conv.device_pointer(),
+                    (&mut output).partition([1, CONV_BLOCK]),
+                )
+            },
+            "execute GDN convolution decode",
+        )?;
         drop(output_partition);
         Ok(output)
     }
@@ -1606,7 +1623,8 @@ impl GdnState {
         state_slots: Arc<Tensor<i32>>,
         rows: usize,
         requests: usize,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
+        workspace: &mut ExecutionWorkspace,
     ) -> Result<Tensor<bf16>, ModelError> {
         if self.slots == 0
             || requests == 0
@@ -1619,35 +1637,36 @@ impl GdnState {
                 "invalid GDN convolution prefill geometry".into(),
             ));
         }
-        let output = api::zeros::<bf16>(&[rows, CONV_FEATURES])
-            .sync_on(stream)
-            .map_err(|error| {
-                ModelError::Cuda(format!(
-                    "allocate GDN convolution prefill output: {error:?}"
-                ))
-            })?;
+        let output = workspace.take_bf16(
+            &[rows, CONV_FEATURES],
+            execution,
+            "allocate GDN convolution prefill output",
+        )?;
         // cuTile derives the launch grid from tensor partitions. This tiny
         // completion matrix provides exactly one block per request/channel tile
         // while the packed-token output is written through its device pointer.
-        let mut completion = api::zeros::<i32>(&[requests, CONV_FEATURES / CONV_BLOCK])
-            .sync_on(stream)
-            .map_err(|error| {
-                ModelError::Cuda(format!("allocate GDN convolution launch grid: {error:?}"))
-            })?;
-        let (_, _, _, _, _, _, completion_partition) = unsafe {
-            qwen_gdn_conv_prefill(
-                input,
-                weight,
-                query_start_offsets,
-                state_slots,
-                self.conv.device_pointer(),
-                output.device_pointer(),
-                (&mut completion).partition([1, 1]),
-            )
-        }
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("execute GDN convolution prefill: {error:?}")))?;
+        let mut completion = workspace.take_i32(
+            &[requests, CONV_FEATURES / CONV_BLOCK],
+            execution,
+            "allocate GDN convolution launch grid",
+        )?;
+        let (_, _, _, _, _, _, completion_partition) = execution.enqueue(
+            unsafe {
+                qwen_gdn_conv_prefill(
+                    input,
+                    weight,
+                    query_start_offsets,
+                    state_slots,
+                    self.conv.device_pointer(),
+                    output.device_pointer(),
+                    (&mut completion).partition([1, 1]),
+                )
+            },
+            "execute GDN convolution prefill",
+        )?;
         drop(completion_partition);
+        workspace.retire_i32(completion);
+        workspace.reclaim(execution)?;
         Ok(output)
     }
 
@@ -1661,7 +1680,8 @@ impl GdnState {
         dt_bias: Arc<Tensor<f32>>,
         state_slots: Arc<Tensor<i32>>,
         plan: &GdnPrefillPlan,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
+        workspace: &mut ExecutionWorkspace,
     ) -> Result<Tensor<bf16>, ModelError> {
         if self.slots == 0
             || state_slots.shape() != [plan.requests() as i32]
@@ -1669,37 +1689,52 @@ impl GdnState {
         {
             return Err(ModelError::Cuda("invalid GDN prefill geometry".into()));
         }
-        let gates = prepare_prefill_gates(a, b, a_log, dt_bias, plan, stream)?;
-        let inverse = solve_prefill_kkt(mixed_qkv.clone(), &gates, plan, stream)?;
-        let wy = recompute_prefill_w_u(mixed_qkv.clone(), &gates, inverse, plan, stream)?;
-        let output = api::zeros::<bf16>(&[plan.rows(), VALUE_HEADS, HEAD_DIM])
-            .sync_on(stream)
-            .map_err(|error| ModelError::Cuda(format!("allocate GDN prefill output: {error:?}")))?;
-        let mut completion = api::zeros::<i32>(&[plan.requests(), VALUE_HEADS, 4])
-            .sync_on(stream)
-            .map_err(|error| {
-                ModelError::Cuda(format!("allocate GDN prefill state launch grid: {error:?}"))
-            })?;
-        let (_, _, _, _, _, _, _, _, _, _, completion_partition) = unsafe {
-            qwen_gdn_prefill_state_output(
-                mixed_qkv.device_pointer(),
-                gates.log_decay_cumsum.device_pointer(),
-                wy.w,
-                wy.u,
-                plan.chunk_starts.clone(),
-                plan.chunk_lengths.clone(),
-                plan.request_chunk_offsets.clone(),
-                state_slots,
-                self.tensor.device_pointer(),
-                output.device_pointer(),
-                (&mut completion).partition([1, 1, 1]),
-            )
-        }
-        .sync_on(stream)
-        .map_err(|error| {
-            ModelError::Cuda(format!("execute GDN prefill state/output: {error:?}"))
-        })?;
+        let gates = prepare_prefill_gates(a, b, a_log, dt_bias, plan, execution, workspace)?;
+        let inverse = solve_prefill_kkt(mixed_qkv.clone(), &gates, plan, execution, workspace)?;
+        let wy = recompute_prefill_w_u(
+            mixed_qkv.clone(),
+            &gates,
+            inverse.clone(),
+            plan,
+            execution,
+            workspace,
+        )?;
+        let output = workspace.take_bf16(
+            &[plan.rows(), VALUE_HEADS, HEAD_DIM],
+            execution,
+            "allocate GDN prefill output",
+        )?;
+        let mut completion = workspace.take_i32(
+            &[plan.requests(), VALUE_HEADS, 4],
+            execution,
+            "allocate GDN prefill state launch grid",
+        )?;
+        let (_, _, _, _, _, _, _, _, _, _, completion_partition) = execution.enqueue(
+            unsafe {
+                qwen_gdn_prefill_state_output(
+                    mixed_qkv.device_pointer(),
+                    gates.log_decay_cumsum.device_pointer(),
+                    wy.w.clone(),
+                    wy.u.clone(),
+                    plan.chunk_starts.clone(),
+                    plan.chunk_lengths.clone(),
+                    plan.request_chunk_offsets.clone(),
+                    state_slots,
+                    self.tensor.device_pointer(),
+                    output.device_pointer(),
+                    (&mut completion).partition([1, 1, 1]),
+                )
+            },
+            "execute GDN prefill state/output",
+        )?;
         drop(completion_partition);
+        workspace.retire_i32(completion);
+        workspace.retire_shared_bf16(inverse, "GDN prefill inverse")?;
+        workspace.retire_shared_f32(gates.log_decay_cumsum, "GDN log decay")?;
+        workspace.retire_shared_bf16(gates.beta, "GDN update gate")?;
+        workspace.retire_shared_bf16(wy.w, "GDN W factor")?;
+        workspace.retire_shared_bf16(wy.u, "GDN U factor")?;
+        workspace.reclaim(execution)?;
         Ok(output)
     }
 
@@ -1713,7 +1748,8 @@ impl GdnState {
         dt_bias: Arc<Tensor<f32>>,
         state_slots: Arc<Tensor<i32>>,
         rows: usize,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
+        workspace: &mut ExecutionWorkspace,
     ) -> Result<Tensor<bf16>, ModelError> {
         if self.slots == 0 {
             return Err(ModelError::Cuda("GDN state has no slots".into()));
@@ -1727,23 +1763,26 @@ impl GdnState {
         {
             return Err(ModelError::Cuda("invalid GDN decode geometry".into()));
         }
-        let mut output = api::zeros::<bf16>(&[rows, VALUE_HEADS, HEAD_DIM])
-            .sync_on(stream)
-            .map_err(|error| ModelError::Cuda(format!("allocate GDN output: {error:?}")))?;
-        let (_, _, _, _, _, _, _, output_partition) = unsafe {
-            qwen_gdn_decode(
-                mixed_qkv,
-                a,
-                b,
-                a_log,
-                dt_bias,
-                state_slots,
-                self.tensor.device_pointer(),
-                (&mut output).partition([1, 1, VALUE_BLOCK]),
-            )
-        }
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("execute GDN decode: {error:?}")))?;
+        let mut output = workspace.take_bf16(
+            &[rows, VALUE_HEADS, HEAD_DIM],
+            execution,
+            "allocate GDN output",
+        )?;
+        let (_, _, _, _, _, _, _, output_partition) = execution.enqueue(
+            unsafe {
+                qwen_gdn_decode(
+                    mixed_qkv,
+                    a,
+                    b,
+                    a_log,
+                    dt_bias,
+                    state_slots,
+                    self.tensor.device_pointer(),
+                    (&mut output).partition([1, 1, VALUE_BLOCK]),
+                )
+            },
+            "execute GDN decode",
+        )?;
         drop(output_partition);
         Ok(output)
     }
@@ -1752,6 +1791,10 @@ impl GdnState {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct GdnProbe {
     pub(crate) max_abs_error: f32,
+}
+
+fn probe_workspace() -> ExecutionWorkspace {
+    ExecutionWorkspace::new(512 * 1024 * 1024)
 }
 
 pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
@@ -1792,6 +1835,8 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
     let a_log_device = upload_f32(&a_log, &[VALUE_HEADS], stream)?;
     let dt_bias_device = upload_f32(&dt_bias, &[VALUE_HEADS], stream)?;
     let state_slots = upload_i32(&state_slots, stream)?;
+    let mut execution = StreamExecution::new(stream);
+    let mut workspace = probe_workspace();
     let _first = state.decode(
         mixed_qkv.clone(),
         a.clone(),
@@ -1800,7 +1845,8 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
         dt_bias_device.clone(),
         state_slots.clone(),
         rows,
-        stream,
+        &mut execution,
+        &mut workspace,
     )?;
     let output = state.decode(
         mixed_qkv,
@@ -1810,12 +1856,14 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
         dt_bias_device,
         state_slots,
         rows,
-        stream,
+        &mut execution,
+        &mut workspace,
     )?;
     let actual: Vec<bf16> = output
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("download GDN probe: {error:?}")))?;
+    execution.mark_synchronized();
     let mut max_abs_error = conv_max_abs_error
         .max(prefill_gate_max_abs_error)
         .max(prefill_kkt_max_abs_error)
@@ -1893,6 +1941,8 @@ fn probe_prefill_recurrence(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     let a_log_device = upload_f32(&a_log, &[VALUE_HEADS], stream)?;
     let dt_bias_device = upload_f32(&dt_bias, &[VALUE_HEADS], stream)?;
     let mut state = GdnState::zeros(requests, stream)?;
+    let mut execution = StreamExecution::new(stream);
+    let mut workspace = probe_workspace();
     let output = state.prefill(
         upload_bf16(&mixed_qkv_host, &[rows, CONV_FEATURES], stream)?,
         upload_bf16(&a_host, &[rows, VALUE_HEADS], stream)?,
@@ -1901,12 +1951,14 @@ fn probe_prefill_recurrence(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         dt_bias_device.clone(),
         state_slots.clone(),
         &plan,
-        stream,
+        &mut execution,
+        &mut workspace,
     )?;
     let actual: Vec<bf16> = output
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("download GDN prefill recurrence: {error:?}")))?;
+    execution.mark_synchronized();
     let continuation = state.decode(
         upload_bf16(&continuation_qkv, &[requests, CONV_FEATURES], stream)?,
         upload_bf16(&continuation_a, &[requests, VALUE_HEADS], stream)?,
@@ -1915,7 +1967,8 @@ fn probe_prefill_recurrence(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         dt_bias_device,
         state_slots,
         requests,
-        stream,
+        &mut execution,
+        &mut workspace,
     )?;
     let continuation_actual: Vec<bf16> =
         continuation
@@ -1924,6 +1977,7 @@ fn probe_prefill_recurrence(stream: &Arc<Stream>) -> Result<f32, ModelError> {
             .map_err(|error| {
                 ModelError::Cuda(format!("download GDN prefill continuation: {error:?}"))
             })?;
+    execution.mark_synchronized();
 
     let mut reference_state = vec![0.0f32; requests * VALUE_HEADS * HEAD_DIM * HEAD_DIM];
     let mut max_abs_error = 0.0f32;
@@ -2067,16 +2121,32 @@ fn probe_prefill_kkt(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         .collect::<Vec<_>>();
     let plan = GdnPrefillPlan::from_offsets(&offsets, stream)?;
     let mixed_qkv = upload_bf16(&mixed_qkv_host, &[rows, CONV_FEATURES], stream)?;
+    let mut execution = StreamExecution::new(stream);
+    let mut workspace = probe_workspace();
     let gates = prepare_prefill_gates(
         upload_bf16(&a_host, &[rows, VALUE_HEADS], stream)?,
         upload_bf16(&b_host, &[rows, VALUE_HEADS], stream)?,
         upload_f32(&a_log, &[VALUE_HEADS], stream)?,
         upload_f32(&dt_bias, &[VALUE_HEADS], stream)?,
         &plan,
-        stream,
+        &mut execution,
+        &mut workspace,
     )?;
-    let inverse = solve_prefill_kkt(mixed_qkv.clone(), &gates, &plan, stream)?;
-    let wy = recompute_prefill_w_u(mixed_qkv, &gates, inverse.clone(), &plan, stream)?;
+    let inverse = solve_prefill_kkt(
+        mixed_qkv.clone(),
+        &gates,
+        &plan,
+        &mut execution,
+        &mut workspace,
+    )?;
+    let wy = recompute_prefill_w_u(
+        mixed_qkv,
+        &gates,
+        inverse.clone(),
+        &plan,
+        &mut execution,
+        &mut workspace,
+    )?;
     let actual: Vec<bf16> = inverse
         .to_host_vec()
         .sync_on(stream)
@@ -2098,6 +2168,7 @@ fn probe_prefill_kkt(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         wy.u.to_host_vec()
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("download GDN prefill U: {error:?}")))?;
+    execution.mark_synchronized();
     let chunks = plan_packed_queries(&offsets, PREFILL_CHUNK as u32)
         .map_err(|error| ModelError::Cuda(format!("plan GDN KKT reference: {error}")))?;
 
@@ -2232,13 +2303,16 @@ fn probe_prefill_gates(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         .map(|index| -0.5 + index as f32 / 64.0)
         .collect::<Vec<_>>();
     let plan = GdnPrefillPlan::from_offsets(&offsets, stream)?;
+    let mut execution = StreamExecution::new(stream);
+    let mut workspace = probe_workspace();
     let gates = prepare_prefill_gates(
         upload_bf16(&a_host, &[rows, VALUE_HEADS], stream)?,
         upload_bf16(&b_host, &[rows, VALUE_HEADS], stream)?,
         upload_f32(&a_log, &[VALUE_HEADS], stream)?,
         upload_f32(&dt_bias, &[VALUE_HEADS], stream)?,
         &plan,
-        stream,
+        &mut execution,
+        &mut workspace,
     )?;
     let actual_log_decay: Vec<f32> = gates
         .log_decay_cumsum
@@ -2248,6 +2322,7 @@ fn probe_prefill_gates(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     let actual_beta: Vec<bf16> = gates.beta.to_host_vec().sync_on(stream).map_err(|error| {
         ModelError::Cuda(format!("download GDN prefill update gates: {error:?}"))
     })?;
+    execution.mark_synchronized();
 
     let chunks = plan_packed_queries(&offsets, PREFILL_CHUNK as u32)
         .map_err(|error| ModelError::Cuda(format!("plan GDN gate reference: {error}")))?;
@@ -2292,24 +2367,29 @@ fn probe_conv(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     let state_slots = upload_i32(&[1i32, 0i32], stream)?;
     let weight = upload_bf16(&weight_host, &[CONV_FEATURES, CONV_WIDTH], stream)?;
     let mut state = GdnState::zeros(rows, stream)?;
+    let mut execution = StreamExecution::new(stream);
+    let mut workspace = probe_workspace();
     let _first = state.decode_conv(
         upload_bf16(&first_host, &[rows, CONV_FEATURES], stream)?,
         weight.clone(),
         state_slots.clone(),
         rows,
-        stream,
+        &mut execution,
+        &mut workspace,
     )?;
     let second = state.decode_conv(
         upload_bf16(&second_host, &[rows, CONV_FEATURES], stream)?,
         weight,
         state_slots,
         rows,
-        stream,
+        &mut execution,
+        &mut workspace,
     )?;
     let actual: Vec<bf16> = second
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("download GDN convolution probe: {error:?}")))?;
+    execution.mark_synchronized();
     let mut max_abs_error = 0.0f32;
     for index in 0..actual.len() {
         let feature = index % CONV_FEATURES;
@@ -2342,6 +2422,8 @@ fn probe_conv_prefill(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     let mut state = GdnState::zeros(requests, stream)?;
     let weight = upload_bf16(&weight_host, &[CONV_FEATURES, CONV_WIDTH], stream)?;
     let state_slots = upload_i32(&slots, stream)?;
+    let mut execution = StreamExecution::new(stream);
+    let mut workspace = probe_workspace();
     let output = state.prefill_conv(
         upload_bf16(&input_host, &[rows, CONV_FEATURES], stream)?,
         weight.clone(),
@@ -2349,17 +2431,20 @@ fn probe_conv_prefill(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         state_slots.clone(),
         rows,
         requests,
-        stream,
+        &mut execution,
+        &mut workspace,
     )?;
     let actual: Vec<bf16> = output.to_host_vec().sync_on(stream).map_err(|error| {
         ModelError::Cuda(format!("download GDN convolution prefill probe: {error:?}"))
     })?;
+    execution.mark_synchronized();
     let continuation = state.decode_conv(
         upload_bf16(&continuation_host, &[requests, CONV_FEATURES], stream)?,
         weight,
         state_slots,
         requests,
-        stream,
+        &mut execution,
+        &mut workspace,
     )?;
     let continuation_actual: Vec<bf16> =
         continuation
@@ -2370,6 +2455,7 @@ fn probe_conv_prefill(stream: &Arc<Stream>) -> Result<f32, ModelError> {
                     "download GDN convolution continuation probe: {error:?}"
                 ))
             })?;
+    execution.mark_synchronized();
 
     let mut max_abs_error = 0.0f32;
     for request in 0..requests {
@@ -2420,18 +2506,22 @@ fn probe_output_gate(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     let gate_host = host_bf16(rows * VALUE_HEADS * HEAD_DIM, 37, 17.0);
     let weight_host = host_bf16(HEAD_DIM, 19, 11.0);
     const EPSILON: f32 = 1.0e-6;
+    let mut execution = StreamExecution::new(stream);
+    let mut workspace = probe_workspace();
     let output = output_gate(
         upload_bf16(&input_host, &[rows, VALUE_HEADS, HEAD_DIM], stream)?,
         upload_bf16(&gate_host, &[rows, VALUE_HEADS, HEAD_DIM], stream)?,
         upload_bf16(&weight_host, &[HEAD_DIM], stream)?,
         EPSILON,
         rows,
-        stream,
+        &mut execution,
+        &mut workspace,
     )?;
     let actual: Vec<bf16> = output
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("download GDN output gate probe: {error:?}")))?;
+    execution.mark_synchronized();
     let mut max_abs_error = 0.0f32;
     for row_head in 0..rows * VALUE_HEADS {
         let start = row_head * HEAD_DIM;
