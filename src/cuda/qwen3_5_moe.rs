@@ -630,9 +630,18 @@ impl Program {
         )?;
         drop(sampled_partition);
         let sampled_hidden = Arc::new(sampled_hidden);
-        let logits = checkpoint
-            .lm_head
-            .enqueue(sampled_hidden.clone(), sample_rows, execution)?;
+        let logits = workspace.take_bf16(
+            &[sample_rows, config.vocab_size],
+            execution,
+            "allocate Qwen logits",
+        )?;
+        let logits = checkpoint.lm_head.enqueue_into(
+            sampled_hidden.clone(),
+            sample_rows,
+            logits,
+            execution,
+        )?;
+        let logits = Arc::new(logits);
         if batch.all_samples_greedy {
             let blocks = config.vocab_size.div_ceil(ARGMAX_BLOCK);
             let mut block_max =
@@ -644,7 +653,7 @@ impl Program {
             )?;
             let (_, block_max_partition, block_index_partition, _) = execution.enqueue(
                 kernels::argmax_blocks_batch_bf16(
-                    Arc::new(logits),
+                    logits.clone(),
                     (&mut block_max).partition([1, 1]),
                     (&mut block_index).partition([1, 1]),
                     config.vocab_size as i32,
@@ -679,6 +688,7 @@ impl Program {
                 })?;
             execution.mark_synchronized();
             workspace.retire_shared_bf16(sampled_hidden, "sampled hidden states")?;
+            workspace.retire_shared_bf16(logits, "Qwen logits")?;
             workspace.retire_f32(Arc::try_unwrap(block_max).map_err(|_| {
                 ModelError::Cuda("Qwen argmax maxima still have host aliases".into())
             })?);
@@ -694,14 +704,19 @@ impl Program {
                 sampled_host.into_iter().map(TokenId::new).collect(),
             ));
         }
-        let logits = logits
+        let logits_host = logits
+            .clone()
             .to_host_vec()
             .sync_on(execution.stream())
             .map_err(|error| ModelError::Cuda(format!("download Qwen logits: {error:?}")))?;
         execution.mark_synchronized();
         workspace.retire_shared_bf16(sampled_hidden, "sampled hidden states")?;
+        workspace.retire_shared_bf16(logits, "Qwen logits")?;
         workspace.reclaim(execution)?;
-        let mut logits = logits.into_iter().map(bf16::to_f32).collect::<Vec<_>>();
+        let mut logits = logits_host
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect::<Vec<_>>();
         logits.truncate(samples * config.vocab_size);
         Ok(ProgramOutput::HostLogits {
             values: logits,
@@ -884,6 +899,7 @@ impl Layer {
             rows,
             epsilon,
             execution,
+            workspace,
         )?;
         let (moe_input, residual) = gemma_add_rms_norm(
             residual,
@@ -1002,6 +1018,7 @@ impl LinearAttention {
         rows: usize,
         epsilon: f32,
         execution: &mut StreamExecution<'_>,
+        workspace: &mut ExecutionWorkspace,
     ) -> Result<Tensor<bf16>, ModelError> {
         const HIDDEN_SIZE: usize = 2048;
         const VALUE_SIZE: usize = 4096;
@@ -1036,6 +1053,7 @@ impl LinearAttention {
             HIDDEN_SIZE,
             "Qwen GDN a projection",
             execution,
+            workspace,
         )?;
         let b = bf16_gemm(
             self.input_b.clone(),
@@ -1045,12 +1063,13 @@ impl LinearAttention {
             HIDDEN_SIZE,
             "Qwen GDN b projection",
             execution,
+            workspace,
         )?;
         let recurrent = Arc::new(match prefill {
             Some(plan) => state.prefill(
                 mixed_qkv,
-                a,
-                b,
+                a.clone(),
+                b.clone(),
                 self.a_log.clone(),
                 self.dt_bias.clone(),
                 state_slots,
@@ -1059,8 +1078,8 @@ impl LinearAttention {
             )?,
             None => state.decode(
                 mixed_qkv,
-                a,
-                b,
+                a.clone(),
+                b.clone(),
                 self.a_log.clone(),
                 self.dt_bias.clone(),
                 state_slots,
@@ -1083,7 +1102,10 @@ impl LinearAttention {
         )?
         .reshape(&[rows, VALUE_SIZE])
         .map_err(|error| ModelError::Cuda(format!("reshape Qwen GDN output: {error:?}")))?;
-        self.output.enqueue(Arc::new(gated), rows, execution)
+        let output = self.output.enqueue(Arc::new(gated), rows, execution)?;
+        workspace.retire_shared_bf16(a, "GDN a projection")?;
+        workspace.retire_shared_bf16(b, "GDN b projection")?;
+        Ok(output)
     }
 }
 
@@ -1173,8 +1195,10 @@ impl Moe {
             HIDDEN_SIZE,
             "Qwen routed-expert logits",
             execution,
+            workspace,
         )?;
-        let routing = RoutingPlan::build(router_logits, logical_rows, execution, workspace)?;
+        let routing =
+            RoutingPlan::build(router_logits.clone(), logical_rows, execution, workspace)?;
         let dispatched = routing.dispatch(
             hidden.clone(),
             logical_rows,
@@ -1183,33 +1207,55 @@ impl Moe {
             workspace,
         )?;
         let dispatched_rows = routing.max_dispatched_rows;
-        let routed_gate = self.routed_gate.enqueue_device_plan(
+        let routed_gate_output = workspace.take_bf16(
+            &[dispatched_rows, self.routed_gate.output_size()],
+            execution,
+            "allocate routed gate output",
+        )?;
+        let routed_gate = self.routed_gate.enqueue_device_plan_into(
             dispatched.hidden.clone(),
             dispatched_rows,
             dispatched.expert_by_row_tile.clone(),
+            routed_gate_output,
             execution,
         )?;
-        let routed_up = self.routed_up.enqueue_device_plan(
+        let routed_up_output = workspace.take_bf16(
+            &[dispatched_rows, self.routed_up.output_size()],
+            execution,
+            "allocate routed up output",
+        )?;
+        let routed_up = self.routed_up.enqueue_device_plan_into(
             dispatched.hidden.clone(),
             dispatched_rows,
             dispatched.expert_by_row_tile.clone(),
+            routed_up_output,
             execution,
         )?;
+        let routed_gate = Arc::new(routed_gate);
+        let routed_up = Arc::new(routed_up);
         let routed_activated = silu_mul(
-            Arc::new(routed_gate),
-            Arc::new(routed_up),
+            routed_gate.clone(),
+            routed_up.clone(),
             dispatched_rows,
             self.routed_gate.output_size(),
             execution,
         )?;
-        let routed_down = self.routed_down.enqueue_device_plan(
-            Arc::new(routed_activated),
+        let routed_activated = Arc::new(routed_activated);
+        let routed_down_output = workspace.take_bf16(
+            &[dispatched_rows, self.routed_down.output_size()],
+            execution,
+            "allocate routed down output",
+        )?;
+        let routed_down = self.routed_down.enqueue_device_plan_into(
+            routed_activated.clone(),
             dispatched_rows,
             dispatched.expert_by_row_tile.clone(),
+            routed_down_output,
             execution,
         )?;
+        let routed_down = Arc::new(routed_down);
         let routed = routing.combine(
-            Arc::new(routed_down),
+            routed_down.clone(),
             logical_rows,
             rows,
             HIDDEN_SIZE,
@@ -1217,18 +1263,44 @@ impl Moe {
             workspace,
         )?;
 
-        let shared_gate = self.shared_gate.enqueue(hidden.clone(), rows, execution)?;
-        let shared_up = self.shared_up.enqueue(hidden.clone(), rows, execution)?;
+        let shared_gate_output = workspace.take_bf16(
+            &[rows, self.shared_gate.output_size()],
+            execution,
+            "allocate shared gate output",
+        )?;
+        let shared_gate =
+            self.shared_gate
+                .enqueue_into(hidden.clone(), rows, shared_gate_output, execution)?;
+        let shared_up_output = workspace.take_bf16(
+            &[rows, self.shared_up.output_size()],
+            execution,
+            "allocate shared up output",
+        )?;
+        let shared_up =
+            self.shared_up
+                .enqueue_into(hidden.clone(), rows, shared_up_output, execution)?;
+        let shared_gate = Arc::new(shared_gate);
+        let shared_up = Arc::new(shared_up);
         let shared_activated = silu_mul(
-            Arc::new(shared_gate),
-            Arc::new(shared_up),
+            shared_gate.clone(),
+            shared_up.clone(),
             rows,
             self.shared_gate.output_size(),
             execution,
         )?;
-        let shared = self
-            .shared_down
-            .enqueue(Arc::new(shared_activated), rows, execution)?;
+        let shared_activated = Arc::new(shared_activated);
+        let shared_output = workspace.take_bf16(
+            &[rows, self.shared_down.output_size()],
+            execution,
+            "allocate shared down output",
+        )?;
+        let shared = self.shared_down.enqueue_into(
+            shared_activated.clone(),
+            rows,
+            shared_output,
+            execution,
+        )?;
+        let shared = Arc::new(shared);
         let shared_logits = bf16_gemm(
             self.shared_router.clone(),
             hidden,
@@ -1237,16 +1309,27 @@ impl Moe {
             HIDDEN_SIZE,
             "Qwen shared-expert gate",
             execution,
+            workspace,
         )?;
         let routed = Arc::new(routed);
         let output = moe_backend::combine_shared(
             routed.clone(),
-            Arc::new(shared),
-            shared_logits,
+            shared.clone(),
+            shared_logits.clone(),
             rows,
             HIDDEN_SIZE,
             execution,
         )?;
+        workspace.retire_shared_bf16(routed_gate, "routed gate output")?;
+        workspace.retire_shared_bf16(routed_up, "routed up output")?;
+        workspace.retire_shared_bf16(routed_activated, "routed activation")?;
+        workspace.retire_shared_bf16(routed_down, "routed down output")?;
+        workspace.retire_shared_bf16(shared_gate, "shared gate output")?;
+        workspace.retire_shared_bf16(shared_up, "shared up output")?;
+        workspace.retire_shared_bf16(shared_activated, "shared activation")?;
+        workspace.retire_shared_bf16(shared, "shared down output")?;
+        workspace.retire_shared_bf16(router_logits, "router logits")?;
+        workspace.retire_shared_bf16(shared_logits, "shared router logits")?;
         workspace.retire_shared_bf16(routed, "combined routed experts")?;
         workspace.retire_shared_bf16(dispatched.hidden, "dispatched activations")?;
         workspace.retire_shared_i32(dispatched.expert_by_row_tile, "expert row map")?;
@@ -1264,9 +1347,11 @@ fn bf16_gemm(
     input_size: usize,
     operation_name: &'static str,
     execution: &mut StreamExecution<'_>,
+    workspace: &mut ExecutionWorkspace,
 ) -> Result<Bf16Tensor, ModelError> {
-    let output = execution.enqueue(
-        api::zeros::<bf16>(&[rows, output_size]),
+    let output = workspace.take_bf16(
+        &[rows, output_size],
+        execution,
         "allocate Qwen BF16 GEMM output",
     )?;
     let operation = cublas::gemm_bf16(weight, input, output, output_size, rows, input_size)

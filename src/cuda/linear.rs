@@ -364,10 +364,35 @@ impl Fp8W8A16Linear {
                 input.shape()
             )));
         }
-        let mut output = execution.enqueue(
+        let output = execution.enqueue(
             api::zeros::<bf16>(&[rows, self.output_size]),
             "allocate FP8 output",
         )?;
+        self.enqueue_into(input, rows, output, execution)
+    }
+
+    pub(crate) fn enqueue_into(
+        &self,
+        input: Arc<Tensor<bf16>>,
+        rows: usize,
+        mut output: Tensor<bf16>,
+        execution: &mut StreamExecution<'_>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        if rows == 0 || !rows.is_multiple_of(TILE_M) {
+            return Err(ModelError::Cuda(format!(
+                "FP8 W8A16 rows must be a positive multiple of {TILE_M}; got {rows}"
+            )));
+        }
+        let expected_shape = [rows as i32, self.input_size as i32];
+        if input.shape() != expected_shape
+            || output.shape() != [rows as i32, self.output_size as i32]
+        {
+            return Err(ModelError::Cuda(format!(
+                "invalid FP8 W8A16 input/output geometry: input={:?}, output={:?}",
+                input.shape(),
+                output.shape()
+            )));
+        }
         execution.enqueue(
             fp8_w8a16(
                 (&mut output).partition([TILE_M, TILE_N]),
@@ -564,10 +589,35 @@ impl Nvfp4W4A16Linear {
                 input.shape()
             )));
         }
-        let mut output = execution.enqueue(
+        let output = execution.enqueue(
             api::zeros::<bf16>(&[rows, self.output_size]),
             "allocate NVFP4 output",
         )?;
+        self.enqueue_into(input, rows, output, execution)
+    }
+
+    pub(crate) fn enqueue_into(
+        &self,
+        input: Arc<Tensor<bf16>>,
+        rows: usize,
+        mut output: Tensor<bf16>,
+        execution: &mut StreamExecution<'_>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        if rows == 0 || !rows.is_multiple_of(TILE_M) {
+            return Err(ModelError::Cuda(format!(
+                "NVFP4 W4A16 rows must be a positive multiple of {TILE_M}; got {rows}"
+            )));
+        }
+        let expected_shape = [rows as i32, self.input_size as i32];
+        if input.shape() != expected_shape
+            || output.shape() != [rows as i32, self.output_size as i32]
+        {
+            return Err(ModelError::Cuda(format!(
+                "invalid NVFP4 W4A16 input/output geometry: input={:?}, output={:?}",
+                input.shape(),
+                output.shape()
+            )));
+        }
         execution.enqueue(
             nvfp4_w4a16(
                 (&mut output).partition([TILE_M, TILE_N]),
@@ -841,10 +891,31 @@ impl GroupedNvfp4W4A16 {
                 "invalid device-resident grouped NVFP4 dispatch plan".into(),
             ));
         }
-        let mut output = execution.enqueue(
+        let output = execution.enqueue(
             api::zeros::<bf16>(&[rows, self.output_size]),
             "allocate grouped output",
         )?;
+        self.enqueue_device_plan_into(dispatched, rows, expert_by_row_tile, output, execution)
+    }
+
+    pub(crate) fn enqueue_device_plan_into(
+        &self,
+        dispatched: Arc<Tensor<bf16>>,
+        rows: usize,
+        expert_by_row_tile: Arc<Tensor<i32>>,
+        mut output: Tensor<bf16>,
+        execution: &mut StreamExecution<'_>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        if rows == 0
+            || !rows.is_multiple_of(TILE_M)
+            || dispatched.shape() != [rows as i32, self.input_size as i32]
+            || expert_by_row_tile.shape() != [(rows / TILE_M) as i32]
+            || output.shape() != [rows as i32, self.output_size as i32]
+        {
+            return Err(ModelError::Cuda(
+                "invalid device-resident grouped NVFP4 dispatch/output plan".into(),
+            ));
+        }
         let logical_tiles = (rows / TILE_M)
             .checked_mul(self.output_size / GROUPED_TILE_N)
             .ok_or_else(|| ModelError::Cuda("grouped output tile count overflowed".into()))?;
