@@ -216,6 +216,18 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 ```
 
 ```text
+I think that we should follow what the model's config says. maybe for this model thats small enough it's okay to expand BUT if it says fp8 storage, we should respect that and keep it fp8 storage.
+```
+
+```text
+isn't our dequand very bad compared to marlin kernels ?
+```
+
+```text
+you might want to systematically benchmark kernels one vs another.
+```
+
+```text
 did you read sglang's kernels ? (or tokenspeed's)
 ```
 

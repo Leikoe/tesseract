@@ -112,6 +112,49 @@ the next backend needs Marlin-style load-time weight repacking and a staged
 dequantize/MMA pipeline. The raw report is
 [`dense64-warm-8192.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/dense64-warm-8192.json).
 
+## Storage-expansion ceiling (not a production result)
+
+Revision `d629a1a` temporarily expanded manifest-declared FP8 weights to BF16
+on device and dispatched those projections through cuBLAS. This violates the
+production storage contract and is retained only as a diagnostic ceiling. With
+16-row grouped MoE tiles it measured 4.80493 seconds at 8K and 102.85752
+seconds at 131K. Revision `adefdd2` additionally used 64-row grouped-MoE tiles
+for large prefill and measured 2.47549 seconds at 8K and 65.28513 seconds at
+131K. None of these four measurements is eligible for production backend
+selection.
+
+The raw ceiling reports are
+[`expanded-fp8-warm-8192.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/expanded-fp8-warm-8192.json),
+[`expanded-fp8-half-window.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/expanded-fp8-half-window.json),
+[`group64-warm-8192.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/group64-warm-8192.json),
+and
+[`group64-half-window.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/group64-half-window.json).
+
+## Manifest-compliant packed FP8 follow-up
+
+Revision `301644e` restored FP8 device storage while retaining the large-prefill
+grouped tile. Revisions `ac5746a` and `1038456` then replaced a per-weight
+`exp2` FP8 decoder with exact BF16 bit construction. The permanent A100
+differential probe passes normals, subnormals, both signs, and the production
+MMA path. Warm 8K TTFT is 7.02123 seconds, or 1,167.96 input tokens/second.
+This is 1.87x faster than the earlier packed result, but still 2.84x slower
+than the non-production expanded/grouped-64 ceiling. Bit construction is
+therefore an incremental packed-kernel repair, not a substitute for Marlin's
+load-time repacking, staged copies, scale layout, and overlapped dequant/MMA.
+
+The exact 131,072-token prompt measured 137.89060 seconds TTFT and 950.54 input
+tokens/second. This is 1.73x faster than the earlier 237.88277-second packed
+path, but remains 8.63x slower than SGLang's 15.98190-second TTFT and 8.42x
+lower in input throughput. The remaining gap is therefore not explained by
+the removed scalar `exp2` operation.
+
+The raw compliant report is
+[`packed-bitdecode-group64-warm-8192.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/packed-bitdecode-group64-warm-8192.json).
+The exact-context report is
+[`packed-bitdecode-group64-half-window.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/packed-bitdecode-group64-half-window.json).
+The head-to-head kernel methodology is fixed in
+[`quantized-kernel-benchmark-plan.md`](../quantized-kernel-benchmark-plan.md).
+
 The built-in half-window command is:
 
 ```text
