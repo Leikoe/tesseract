@@ -16,10 +16,137 @@ const KEY_HEADS: usize = 16;
 const VALUE_HEADS: usize = 32;
 const HEAD_DIM: usize = 128;
 const VALUE_BLOCK: usize = 32;
+const CONV_FEATURES: usize = 8192;
+const CONV_WIDTH: usize = 4;
+const CONV_STATE_WIDTH: usize = CONV_WIDTH - 1;
+const CONV_BLOCK: usize = 256;
 
 #[cutile::module]
 mod kernels {
     use cutile::core::*;
+
+    #[cutile::entry()]
+    unsafe fn qwen_gdn_conv_decode(
+        input: &Tensor<bf16, { [-1, 8192] }>,
+        weight: &Tensor<bf16, { [8192, 4] }>,
+        state_slots: &Tensor<i32, { [-1] }>,
+        state_ptr: *mut bf16,
+        output: &mut Tensor<bf16, { [1, 256] }>,
+    ) {
+        let pid = get_tile_block_id();
+        let row = pid.0;
+        let feature_block = pid.1;
+        let slot = state_slots.partition(const_shape![1]).load([row]);
+        let slot: i32 = tile_to_scalar(slot.reshape(const_shape![]));
+
+        let lane: Tile<i32, { [256] }> = iota(const_shape![256]);
+        let feature_offset = feature_block * 256i32;
+        let feature_offset: Tile<i32, { [256] }> = feature_offset.broadcast(const_shape![256]);
+        let feature = lane + feature_offset;
+        let state_offset = (slot * 8192i32 * 3i32).broadcast(const_shape![256])
+            + feature * 3i32.broadcast(const_shape![256]);
+
+        let state_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(state_ptr);
+        let state_base: PointerTile<*mut bf16, { [1] }> = state_base.reshape(const_shape![1]);
+        let state_base: PointerTile<*mut bf16, { [256] }> = state_base.broadcast(const_shape![256]);
+        let state_0_pointer = state_base.offset_tile(state_offset);
+        let state_1_pointer =
+            state_base.offset_tile(state_offset + 1i32.broadcast(const_shape![256]));
+        let state_2_pointer =
+            state_base.offset_tile(state_offset + 2i32.broadcast(const_shape![256]));
+        let (state_0, state_0_token): (Tile<bf16, { [256] }>, Token) = load_ptr_tko(
+            state_0_pointer,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<0>,
+        );
+        let (state_1, state_1_token): (Tile<bf16, { [256] }>, Token) = load_ptr_tko(
+            state_1_pointer,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<0>,
+        );
+        let (state_2, state_2_token): (Tile<bf16, { [256] }>, Token) = load_ptr_tko(
+            state_2_pointer,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<0>,
+        );
+
+        let input: Tile<bf16, { [1, 256] }> = input
+            .partition(const_shape![1, 256])
+            .load([row, feature_block]);
+        let weight = weight.partition(const_shape![256, 1]);
+        let weight_0: Tile<bf16, { [1, 256] }> = weight
+            .load([feature_block, 0i32])
+            .reshape(const_shape![1, 256]);
+        let weight_1: Tile<bf16, { [1, 256] }> = weight
+            .load([feature_block, 1i32])
+            .reshape(const_shape![1, 256]);
+        let weight_2: Tile<bf16, { [1, 256] }> = weight
+            .load([feature_block, 2i32])
+            .reshape(const_shape![1, 256]);
+        let weight_3: Tile<bf16, { [1, 256] }> = weight
+            .load([feature_block, 3i32])
+            .reshape(const_shape![1, 256]);
+        let state_0: Tile<f32, { [1, 256] }> = convert_tile(state_0.reshape(const_shape![1, 256]));
+        let state_1: Tile<f32, { [1, 256] }> = convert_tile(state_1.reshape(const_shape![1, 256]));
+        let state_2: Tile<f32, { [1, 256] }> = convert_tile(state_2.reshape(const_shape![1, 256]));
+        let input_f32: Tile<f32, { [1, 256] }> = convert_tile(input);
+        let weight_0: Tile<f32, { [1, 256] }> = convert_tile(weight_0);
+        let weight_1: Tile<f32, { [1, 256] }> = convert_tile(weight_1);
+        let weight_2: Tile<f32, { [1, 256] }> = convert_tile(weight_2);
+        let weight_3: Tile<f32, { [1, 256] }> = convert_tile(weight_3);
+        let convolved =
+            state_0 * weight_0 + state_1 * weight_1 + state_2 * weight_2 + input_f32 * weight_3;
+        const ONE: f32 = 1.0;
+        const ZERO: f32 = 0.0;
+        let one: Tile<f32, { [1, 256] }> = constant(ONE, const_shape![1, 256]);
+        let zero: Tile<f32, { [1, 256] }> = constant(ZERO, const_shape![1, 256]);
+        let activated: Tile<bf16, { [1, 256] }> = ftof(
+            convolved * true_div(one, one + exp(zero - convolved)),
+            rounding::NearestEven,
+        );
+        output.store(activated);
+
+        let input_state: Tile<bf16, { [256] }> = input.reshape(const_shape![256]);
+        let _state_0_store = store_ptr_tko(
+            state_0_pointer,
+            ftof(state_1.reshape(const_shape![256]), rounding::NearestEven),
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            Some(state_0_token),
+            Latency::<0>,
+        );
+        let _state_1_store = store_ptr_tko(
+            state_1_pointer,
+            ftof(state_2.reshape(const_shape![256]), rounding::NearestEven),
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            Some(state_1_token),
+            Latency::<0>,
+        );
+        let _state_2_store = store_ptr_tko(
+            state_2_pointer,
+            input_state,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            Some(state_2_token),
+            Latency::<0>,
+        );
+    }
 
     #[cutile::entry()]
     unsafe fn qwen_gdn_decode(
@@ -174,19 +301,64 @@ mod kernels {
     }
 }
 
-use kernels::qwen_gdn_decode;
+use kernels::{qwen_gdn_conv_decode, qwen_gdn_decode};
 
 pub(crate) struct RecurrentState {
+    conv: Tensor<bf16>,
     tensor: Tensor<f32>,
     slots: usize,
 }
 
 impl RecurrentState {
     pub(crate) fn zeros(slots: usize, stream: &Arc<Stream>) -> Result<Self, ModelError> {
+        let conv = api::zeros::<bf16>(&[slots, CONV_FEATURES, CONV_STATE_WIDTH])
+            .sync_on(stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!("allocate GDN convolution state: {error:?}"))
+            })?;
         let tensor = api::zeros::<f32>(&[slots, VALUE_HEADS, HEAD_DIM, HEAD_DIM])
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("allocate GDN state: {error:?}")))?;
-        Ok(Self { tensor, slots })
+        Ok(Self {
+            conv,
+            tensor,
+            slots,
+        })
+    }
+
+    pub(crate) fn decode_conv(
+        &mut self,
+        input: Arc<Tensor<bf16>>,
+        weight: Arc<Tensor<bf16>>,
+        state_slots: Arc<Tensor<i32>>,
+        rows: usize,
+        stream: &Arc<Stream>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        if self.slots == 0
+            || input.shape() != [rows as i32, CONV_FEATURES as i32]
+            || weight.shape() != [CONV_FEATURES as i32, CONV_WIDTH as i32]
+            || state_slots.shape() != [rows as i32]
+        {
+            return Err(ModelError::Cuda("invalid GDN convolution geometry".into()));
+        }
+        let mut output = api::zeros::<bf16>(&[rows, CONV_FEATURES])
+            .sync_on(stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!("allocate GDN convolution output: {error:?}"))
+            })?;
+        let (_, _, _, _, output_partition) = unsafe {
+            qwen_gdn_conv_decode(
+                input,
+                weight,
+                state_slots,
+                self.conv.device_pointer(),
+                (&mut output).partition([1, CONV_BLOCK]),
+            )
+        }
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("execute GDN convolution decode: {error:?}")))?;
+        drop(output_partition);
+        Ok(output)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -247,6 +419,7 @@ pub(crate) struct GdnProbe {
 }
 
 pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
+    let conv_max_abs_error = probe_conv(stream)?;
     let rows = 2usize;
     let query_host = host_bf16(rows * KEY_HEADS * HEAD_DIM, 17, 8.0);
     let key_host = host_bf16(rows * KEY_HEADS * HEAD_DIM, 19, 9.0);
@@ -297,7 +470,7 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("download GDN probe: {error:?}")))?;
-    let mut max_abs_error = 0.0f32;
+    let mut max_abs_error = conv_max_abs_error;
     for row in 0..rows {
         for value_head in 0..VALUE_HEADS {
             let key_head = value_head / 2;
@@ -347,6 +520,53 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
         }
     }
     Ok(GdnProbe { max_abs_error })
+}
+
+fn probe_conv(stream: &Arc<Stream>) -> Result<f32, ModelError> {
+    let rows = 2usize;
+    let first_host = host_bf16(rows * CONV_FEATURES, 23, 17.0);
+    let second_host = host_bf16(rows * CONV_FEATURES, 29, 19.0);
+    let weight_host = host_bf16(CONV_FEATURES * CONV_WIDTH, 13, 23.0);
+    let state_slots = upload_i32(&[1i32, 0i32], stream)?;
+    let weight = upload_bf16(&weight_host, &[CONV_FEATURES, CONV_WIDTH], stream)?;
+    let mut state = RecurrentState::zeros(rows, stream)?;
+    let _first = state.decode_conv(
+        upload_bf16(&first_host, &[rows, CONV_FEATURES], stream)?,
+        weight.clone(),
+        state_slots.clone(),
+        rows,
+        stream,
+    )?;
+    let second = state.decode_conv(
+        upload_bf16(&second_host, &[rows, CONV_FEATURES], stream)?,
+        weight,
+        state_slots,
+        rows,
+        stream,
+    )?;
+    let actual: Vec<bf16> = second
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("download GDN convolution probe: {error:?}")))?;
+    let mut max_abs_error = 0.0f32;
+    for index in 0..actual.len() {
+        let feature = index % CONV_FEATURES;
+        let first = first_host[index].to_f32();
+        let second = second_host[index].to_f32();
+        let weight_2 = weight_host[feature * CONV_WIDTH + 2].to_f32();
+        let weight_3 = weight_host[feature * CONV_WIDTH + 3].to_f32();
+        let convolved = first * weight_2 + second * weight_3;
+        let expected = bf16::from_f32(convolved / (1.0 + (-convolved).exp())).to_f32();
+        let error = (actual[index].to_f32() - expected).abs();
+        max_abs_error = max_abs_error.max(error);
+        if error > 0.01 || !actual[index].to_f32().is_finite() {
+            return Err(ModelError::Cuda(format!(
+                "GDN convolution differential mismatch at {index}: {} != {expected}",
+                actual[index].to_f32()
+            )));
+        }
+    }
+    Ok(max_abs_error)
 }
 
 fn host_bf16(len: usize, modulus: usize, divisor: f32) -> Vec<bf16> {
