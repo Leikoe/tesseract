@@ -40,22 +40,19 @@ mod kernels {
         k_tiles: i32,
     ) {
         let pid = get_tile_block_id();
-        let input = input.partition(const_shape![16, 16]);
-        let packed_weight = packed_weight.partition(const_shape![16, 8]);
-        let weight_scale = weight_scale.partition(const_shape![16, 1]);
         let sixteen: Tile<u8, { [16, 8] }> = constant(16u8, const_shape![16, 8]);
         let mut accumulator = constant(0.0f32, const_shape![16, 16]);
 
         for k_tile in 0i32..k_tiles {
-            let activation = input.load([pid.0, k_tile]);
-            let packed = packed_weight.load([pid.1, k_tile]);
+            let activation = input.load_tile(const_shape![16, 16], [pid.0, k_tile]);
+            let packed = packed_weight.load_tile(const_shape![16, 8], [pid.1, k_tile]);
             let low = (packed % sixteen).reshape(const_shape![16, 8, 1]);
             let high = (packed / sixteen).reshape(const_shape![16, 8, 1]);
             let nibbles: Tile<u8, { [16, 8, 2] }> = cat(low, high, 2);
             let weight = decode_fp4(nibbles.reshape(const_shape![16, 16]));
             let scale: Tile<f32, { [16, 16] }> = ftof(
                 weight_scale
-                    .load([pid.1, k_tile])
+                    .load_tile(const_shape![16, 1], [pid.1, k_tile])
                     .broadcast(const_shape![16, 16]),
                 rounding::NearestEven,
             );
@@ -82,9 +79,6 @@ mod kernels {
         weight_global_scale: &Tensor<f32, { [-1] }>,
         k_tiles: i32,
     ) {
-        let dispatched = dispatched.partition(const_shape![16, 16]);
-        let packed_weight = packed_weight.partition(const_shape![1, 16, 8]);
-        let weight_scale = weight_scale.partition(const_shape![1, 16, 1]);
         let sixteen: Tile<u8, { [1, 16, 8] }> = constant(16u8, const_shape![1, 16, 8]);
 
         // `iter_indices` maps the full logical output grid onto a physical
@@ -101,15 +95,16 @@ mod kernels {
             let mut accumulator = constant(0.0f32, const_shape![16, 16]);
 
             for k_tile in 0i32..k_tiles {
-                let activation = dispatched.load([row_tile, k_tile]);
-                let packed = packed_weight.load([expert, column_tile, k_tile]);
+                let activation = dispatched.load_tile(const_shape![16, 16], [row_tile, k_tile]);
+                let packed =
+                    packed_weight.load_tile(const_shape![1, 16, 8], [expert, column_tile, k_tile]);
                 let low = (packed % sixteen).reshape(const_shape![16, 8, 1]);
                 let high = (packed / sixteen).reshape(const_shape![16, 8, 1]);
                 let nibbles: Tile<u8, { [16, 8, 2] }> = cat(low, high, 2);
                 let weight = decode_fp4(nibbles.reshape(const_shape![16, 16]));
                 let scale: Tile<f32, { [16, 16] }> = ftof(
                     weight_scale
-                        .load([expert, column_tile, k_tile])
+                        .load_tile(const_shape![1, 16, 1], [expert, column_tile, k_tile])
                         .reshape(const_shape![16, 1])
                         .broadcast(const_shape![16, 16]),
                     rounding::NearestEven,
