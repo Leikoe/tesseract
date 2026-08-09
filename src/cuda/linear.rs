@@ -26,6 +26,7 @@ use crate::{
 
 const TILE_M: usize = 16;
 const TILE_N: usize = 16;
+const DENSE_TILE_N: usize = 64;
 const GROUP_K: usize = 16;
 const GROUPED_TILE_N: usize = 64;
 const GROUPED_TILE_K: usize = GROUP_K;
@@ -37,66 +38,77 @@ mod kernels {
 
     #[cutile::entry()]
     fn fp8_w8a16<const K_TILES: i32>(
-        output: &mut Tensor<bf16, { [16, 16] }>,
+        mut output: MappedPartitionMut<bf16, { [16, 64] }, { [8, 1] }>,
         input: &Tensor<bf16, { [-1, -1] }>,
         weight: &Tensor<u8, { [-1, -1] }>,
         weight_scale: f32,
         subnormal_scale: f32,
     ) {
-        let pid = get_tile_block_id();
         let k_tiles = Dim::new(K_TILES);
-        let mut accumulator = constant(0.0f32, const_shape![16, 16]);
+        for out_idx in output.iter_indices() {
+            let (row_tile, column_tile) = out_idx.components();
+            const ZERO_F32: f32 = 0.0;
+            let mut accumulator = broadcast_scalar(ZERO_F32, const_shape![16, 64]);
 
-        for k_tile in k_tiles {
-            let activation = input.load_tile(const_shape![16, 16], [pid.0, k_tile]);
-            let encoded: Tile<i32, { [16, 16] }> =
-                exti(weight.load_tile(const_shape![16, 16], [pid.1, k_tile]));
-            let decoded = decode_fp8(encoded, subnormal_scale);
-            let scale = broadcast_scalar(weight_scale, const_shape![16, 16]);
-            let weight: Tile<bf16, { [16, 16] }> = ftof(decoded * scale, rounding::NearestEven);
-            accumulator = mma(activation, weight.transpose(), accumulator);
+            for k_tile in k_tiles {
+                let activation = input.load_tile(const_shape![16, 16], [row_tile, k_tile]);
+                let encoded: Tile<i32, { [64, 16] }> =
+                    exti(weight.load_tile(const_shape![64, 16], [column_tile, k_tile]));
+                let decoded = decode_fp8_wide(encoded, subnormal_scale);
+                let scale = broadcast_scalar(weight_scale, const_shape![64, 16]);
+                let weight: Tile<bf16, { [64, 16] }> = ftof(decoded * scale, rounding::NearestEven);
+                accumulator = mma(activation, weight.transpose(), accumulator);
+            }
+            let output_tile: Tile<bf16, { [16, 64] }> = ftof(accumulator, rounding::NearestEven);
+            output.store(output_tile, out_idx);
         }
-        let output_tile: Tile<bf16, { [16, 16] }> = ftof(accumulator, rounding::NearestEven);
-        output.store(output_tile);
     }
 
     #[cutile::entry()]
     fn nvfp4_w4a16<const K_TILES: i32>(
-        output: &mut Tensor<bf16, { [16, 16] }>,
+        mut output: MappedPartitionMut<bf16, { [16, 64] }, { [8, 1] }>,
         input: &Tensor<bf16, { [-1, -1] }>,
         packed_weight: &Tensor<u8, { [-1, -1] }>,
         weight_scale: &Tensor<bf16, { [-1, -1] }>,
         weight_global_scale: f32,
     ) {
-        let pid = get_tile_block_id();
         let k_tiles = Dim::new(K_TILES);
-        let low_mask: Tile<i32, { [16, 8] }> = constant(0x0fi32, const_shape![16, 8]);
-        let nibble_shift: Tile<i32, { [16, 8] }> = constant(4i32, const_shape![16, 8]);
-        let zero_i32: Tile<i32, { [16, 8] }> = constant(0i32, const_shape![16, 8]);
-        let byte_modulus: Tile<i32, { [16, 8] }> = constant(256i32, const_shape![16, 8]);
-        let mut accumulator = constant(0.0f32, const_shape![16, 16]);
+        const LOW_MASK: i32 = 0x0f;
+        let low_mask = broadcast_scalar(LOW_MASK, const_shape![64, 8]);
+        const NIBBLE_SHIFT: i32 = 4;
+        let nibble_shift = broadcast_scalar(NIBBLE_SHIFT, const_shape![64, 8]);
+        const ZERO_I32: i32 = 0;
+        let zero_i32 = broadcast_scalar(ZERO_I32, const_shape![64, 8]);
+        const BYTE_MODULUS: i32 = 256;
+        let byte_modulus = broadcast_scalar(BYTE_MODULUS, const_shape![64, 8]);
 
-        for k_tile in k_tiles {
-            let activation = input.load_tile(const_shape![16, 16], [pid.0, k_tile]);
-            let packed: Tile<i32, { [16, 8] }> =
-                exti(packed_weight.load_tile(const_shape![16, 8], [pid.1, k_tile]));
-            let packed = select(lt_tile(packed, zero_i32), packed + byte_modulus, packed);
-            let low = andi(packed, low_mask).reshape(const_shape![16, 8, 1]);
-            let high = shri(packed, nibble_shift).reshape(const_shape![16, 8, 1]);
-            let nibbles: Tile<i32, { [16, 8, 2] }> = cat(low, high, 2);
-            let weight = decode_fp4(nibbles.reshape(const_shape![16, 16]));
-            let scale: Tile<f32, { [16, 16] }> = convert_tile(
-                weight_scale
-                    .load_tile(const_shape![16, 1], [pid.1, k_tile])
-                    .broadcast(const_shape![16, 16]),
-            );
-            let global = broadcast_scalar(weight_global_scale, const_shape![16, 16]);
-            let weight: Tile<bf16, { [16, 16] }> =
-                ftof(weight * scale * global, rounding::NearestEven);
-            accumulator = mma(activation, weight.transpose(), accumulator);
+        for out_idx in output.iter_indices() {
+            let (row_tile, column_tile) = out_idx.components();
+            const ZERO_F32: f32 = 0.0;
+            let mut accumulator = broadcast_scalar(ZERO_F32, const_shape![16, 64]);
+
+            for k_tile in k_tiles {
+                let activation = input.load_tile(const_shape![16, 16], [row_tile, k_tile]);
+                let packed: Tile<i32, { [64, 8] }> =
+                    exti(packed_weight.load_tile(const_shape![64, 8], [column_tile, k_tile]));
+                let packed = select(lt_tile(packed, zero_i32), packed + byte_modulus, packed);
+                let low = andi(packed, low_mask).reshape(const_shape![64, 8, 1]);
+                let high = shri(packed, nibble_shift).reshape(const_shape![64, 8, 1]);
+                let nibbles: Tile<i32, { [64, 8, 2] }> = cat(low, high, 2);
+                let decoded = decode_fp4_grouped(nibbles.reshape(const_shape![64, 16]));
+                let scale: Tile<f32, { [64, 16] }> = convert_tile(
+                    weight_scale
+                        .load_tile(const_shape![64, 1], [column_tile, k_tile])
+                        .broadcast(const_shape![64, 16]),
+                );
+                let global = broadcast_scalar(weight_global_scale, const_shape![64, 16]);
+                let weight: Tile<bf16, { [64, 16] }> =
+                    ftof(decoded * scale * global, rounding::NearestEven);
+                accumulator = mma(activation, weight.transpose(), accumulator);
+            }
+            let output_tile: Tile<bf16, { [16, 64] }> = ftof(accumulator, rounding::NearestEven);
+            output.store(output_tile, out_idx);
         }
-        let output_tile: Tile<bf16, { [16, 16] }> = ftof(accumulator, rounding::NearestEven);
-        output.store(output_tile);
     }
 
     /// One launch processes all routed expert segments. Dispatch pads each
@@ -380,6 +392,44 @@ mod kernels {
         let one_i32: Tile<i32, { [16, 16] }> = constant(1i32, shape);
         select(eq_tile(sign, one_i32), negative, magnitude)
     }
+
+    fn decode_fp8_wide(
+        encoded: Tile<i32, { [64, 16] }>,
+        subnormal_scale: f32,
+    ) -> Tile<f32, { [64, 16] }> {
+        let shape = const_shape![64, 16];
+        const BYTE_MODULUS: i32 = 256;
+        let byte_modulus = broadcast_scalar(BYTE_MODULUS, shape);
+        const ZERO_I32: i32 = 0;
+        let zero_i32 = broadcast_scalar(ZERO_I32, shape);
+        let encoded = select(lt_tile(encoded, zero_i32), encoded + byte_modulus, encoded);
+        const SIGN_DIVISOR: i32 = 128;
+        let sign = encoded / broadcast_scalar(SIGN_DIVISOR, shape);
+        let magnitude = encoded % broadcast_scalar(SIGN_DIVISOR, shape);
+        const MANTISSA_DIVISOR: i32 = 8;
+        let divisor_i32 = broadcast_scalar(MANTISSA_DIVISOR, shape);
+        let exponent = magnitude / divisor_i32;
+        let mantissa = magnitude % divisor_i32;
+        let exponent_f: Tile<f32, { [64, 16] }> = convert_tile(exponent);
+        let mantissa_f: Tile<f32, { [64, 16] }> = convert_tile(mantissa);
+        const ONE_F32: f32 = 1.0;
+        let one_f = broadcast_scalar(ONE_F32, shape);
+        const EIGHT_F32: f32 = 8.0;
+        let eight_f = broadcast_scalar(EIGHT_F32, shape);
+        const EXPONENT_BIAS: f32 = 7.0;
+        let exponent_bias = broadcast_scalar(EXPONENT_BIAS, shape);
+        let subnormal_scale = broadcast_scalar(subnormal_scale, shape);
+        let normal = (one_f + true_div(mantissa_f, eight_f))
+            * exp2(exponent_f - exponent_bias, ftz::Disabled);
+        let subnormal = mantissa_f * subnormal_scale;
+        let magnitude = select(eq_tile(exponent, zero_i32), subnormal, normal);
+        const ZERO_F32: f32 = 0.0;
+        let zero_f = broadcast_scalar(ZERO_F32, shape);
+        let negative = zero_f - magnitude;
+        const ONE_I32: i32 = 1;
+        let one_i32 = broadcast_scalar(ONE_I32, shape);
+        select(eq_tile(sign, one_i32), negative, magnitude)
+    }
 }
 
 use kernels::{fp8_w8a16, grouped_nvfp4_w4a16, grouped_nvfp4_w4a16_silu_mul, nvfp4_w4a16};
@@ -415,7 +465,7 @@ impl Fp8W8A16Linear {
         if input_size == 0
             || output_size == 0
             || !input_size.is_multiple_of(TILE_N)
-            || !output_size.is_multiple_of(TILE_N)
+            || !output_size.is_multiple_of(DENSE_TILE_N)
             || weight.byte_len() != output_size.saturating_mul(input_size)
         {
             return invalid_tensor(&weight_name, "unrepresentable W8A16 storage geometry");
@@ -504,9 +554,18 @@ impl Fp8W8A16Linear {
                 output.shape()
             )));
         }
-        execution.enqueue(
+        let logical_tiles = (rows / TILE_M)
+            .checked_mul(self.output_size / DENSE_TILE_N)
+            .ok_or_else(|| ModelError::Cuda("FP8 output tile count overflowed".into()))?;
+        let workers = logical_tiles.min(device_sm_count(execution.stream())?);
+        let output_partition = (&mut output).partition([TILE_M, DENSE_TILE_N]).map(
+            [8, 1],
+            u32::try_from(workers)
+                .map_err(|_| ModelError::Cuda("persistent FP8 worker count overflowed".into()))?,
+        );
+        let (output_partition, ..) = execution.enqueue(
             fp8_w8a16(
-                (&mut output).partition([TILE_M, TILE_N]),
+                output_partition,
                 input,
                 self.weight.clone(),
                 self.weight_scale,
@@ -515,6 +574,7 @@ impl Fp8W8A16Linear {
             .generics(vec![(self.input_size / TILE_N).to_string()]),
             "execute FP8 W8A16",
         )?;
+        drop(output_partition);
         Ok(output)
     }
 }
@@ -558,7 +618,7 @@ fn parse_nvfp4_projection<'a>(
     if input_size == 0
         || output_size == 0
         || !input_size.is_multiple_of(GROUP_K)
-        || !output_size.is_multiple_of(TILE_N)
+        || !output_size.is_multiple_of(DENSE_TILE_N)
         || weight.byte_len() != output_size.saturating_mul(packed_input_size)
     {
         return invalid_tensor(&weight_name, "unrepresentable W4A16 storage geometry");
@@ -729,9 +789,18 @@ impl Nvfp4W4A16Linear {
                 output.shape()
             )));
         }
-        execution.enqueue(
+        let logical_tiles = (rows / TILE_M)
+            .checked_mul(self.output_size / DENSE_TILE_N)
+            .ok_or_else(|| ModelError::Cuda("NVFP4 output tile count overflowed".into()))?;
+        let workers = logical_tiles.min(device_sm_count(execution.stream())?);
+        let output_partition = (&mut output).partition([TILE_M, DENSE_TILE_N]).map(
+            [8, 1],
+            u32::try_from(workers)
+                .map_err(|_| ModelError::Cuda("persistent NVFP4 worker count overflowed".into()))?,
+        );
+        let (output_partition, ..) = execution.enqueue(
             nvfp4_w4a16(
-                (&mut output).partition([TILE_M, TILE_N]),
+                output_partition,
                 input,
                 self.packed_weight.clone(),
                 self.weight_scale.clone(),
@@ -740,6 +809,7 @@ impl Nvfp4W4A16Linear {
             .generics(vec![(self.input_size / GROUP_K).to_string()]),
             "execute NVFP4 W4A16",
         )?;
+        drop(output_partition);
         Ok(output)
     }
 }
@@ -1138,7 +1208,7 @@ pub(crate) fn probe_quantized_linears(
 
 fn probe_fp8_w8a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     let input_size = TILE_N;
-    let output_size = TILE_N;
+    let output_size = DENSE_TILE_N;
     let encoded = (0..output_size * input_size)
         .map(|index| {
             const VALUES: [u8; 12] = [
@@ -1208,7 +1278,7 @@ fn probe_fp8_w8a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
 /// scales, a non-unit global scale, and signed BF16 activations.
 fn probe_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<(f32, f32), ModelError> {
     let input_size = GROUP_K;
-    let output_size = TILE_N;
+    let output_size = DENSE_TILE_N;
     let packed = (0..output_size * input_size / 2)
         .map(|index| {
             let low = (index * 2 % 16) as u8;
