@@ -545,10 +545,11 @@ mod kernels {
         for solved_row in 2i32..16i32 {
             let selected_row = eq_tile(row, solved_row.broadcast(const_shape![16, 1]))
                 .broadcast(const_shape![16, 16]);
-            let mut next_row: Tile<f32, { [1, 16] }> = reduce_sum(
+            let next_row: Tile<f32, { [16] }> = reduce_sum(
                 select(selected_row, zero_matrix - system, zero_matrix),
                 0i32,
             );
+            let mut next_row: Tile<f32, { [1, 16] }> = next_row.reshape(const_shape![1, 16]);
             let before_row = lt_tile(causal_column, solved_row.broadcast(const_shape![1, 16]));
             let row_is_valid: Tile<bool, { [1, 16] }> = lt_tile(
                 solved_row.broadcast(const_shape![1, 16]),
@@ -559,10 +560,11 @@ mod kernels {
                 next_row,
                 broadcast_scalar(ZERO, const_shape![1, 16]),
             );
-            let correction: Tile<f32, { [1, 16] }> = reduce_sum(
+            let correction: Tile<f32, { [16] }> = reduce_sum(
                 next_row.transpose().broadcast(const_shape![16, 16]) * solved,
                 0i32,
             );
+            let correction: Tile<f32, { [1, 16] }> = correction.reshape(const_shape![1, 16]);
             next_row = next_row + correction;
             solved = select(
                 selected_row,
