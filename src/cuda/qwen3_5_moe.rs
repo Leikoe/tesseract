@@ -519,7 +519,10 @@ impl Program {
         let mut full_layer = 0usize;
         for layer_index in 0..self.checkpoint.layers.len() {
             let layer = &self.checkpoint.layers[layer_index];
-            let previous = pending.take();
+            let (residual, update) = match pending.take() {
+                Some((residual, update)) => (residual, Some(update)),
+                None => (hidden.clone(), None),
+            };
             let result = match &layer.attention {
                 Attention::Linear(_) => {
                     let state = self.recurrent[layer_index].as_mut().ok_or_else(|| {
@@ -529,11 +532,8 @@ impl Program {
                     })?;
                     state.reset_slots(&padded.reset_recurrent_slots, &mut execution)?;
                     layer.forward_linear(
-                        previous
-                            .as_ref()
-                            .map(|(residual, _)| residual.clone())
-                            .unwrap_or_else(|| hidden.clone()),
-                        previous.as_ref().map(|(_, update)| update.clone()),
+                        residual,
+                        update,
                         state,
                         recurrent_slots.clone(),
                         prefill.as_ref(),
@@ -546,11 +546,8 @@ impl Program {
                 }
                 Attention::Full(_) => {
                     let result = layer.forward_full(
-                        previous
-                            .as_ref()
-                            .map(|(residual, _)| residual.clone())
-                            .unwrap_or_else(|| hidden.clone()),
-                        previous.as_ref().map(|(_, update)| update.clone()),
+                        residual,
+                        update,
                         &self.attention,
                         full_layer,
                         positions.clone(),
@@ -584,6 +581,7 @@ impl Program {
             rows,
             self.config.rms_norm_eps,
             &mut execution,
+            &mut self.workspace,
         )?;
         Self::sample(
             &self.checkpoint,
@@ -874,6 +872,7 @@ impl Layer {
                 rows,
                 epsilon,
                 execution,
+                workspace,
             )?,
             None => (
                 gemma_rms_norm(
@@ -882,6 +881,7 @@ impl Layer {
                     rows,
                     epsilon,
                     execution,
+                    workspace,
                 )?,
                 residual,
             ),
@@ -908,6 +908,7 @@ impl Layer {
             rows,
             epsilon,
             execution,
+            workspace,
         )?;
         let moe_output = self
             .moe
@@ -941,6 +942,7 @@ impl Layer {
                 rows,
                 epsilon,
                 execution,
+                workspace,
             )?,
             None => (
                 gemma_rms_norm(
@@ -949,6 +951,7 @@ impl Layer {
                     rows,
                     epsilon,
                     execution,
+                    workspace,
                 )?,
                 residual,
             ),
@@ -970,6 +973,7 @@ impl Layer {
             rows,
             epsilon,
             execution,
+            workspace,
         )?;
         let (moe_input, residual) = gemma_add_rms_norm(
             residual,
@@ -1111,9 +1115,10 @@ impl LinearAttention {
         )?;
         let gate = self
             .input_z
-            .enqueue_into(hidden, rows, gate_output, execution)?
+            .enqueue_into(hidden.clone(), rows, gate_output, execution)?
             .reshape(&[rows, 32, 128])
             .map_err(|error| ModelError::Cuda(format!("reshape Qwen GDN z gate: {error:?}")))?;
+        workspace.retire_shared_bf16(hidden, "GDN attention input")?;
         let gate = Arc::new(gate);
         let gated = gdn_backend::output_gate(
             recurrent.clone(),
@@ -1342,7 +1347,7 @@ impl Moe {
         let shared = Arc::new(shared);
         let shared_logits = bf16_gemm(
             self.shared_router.clone(),
-            hidden,
+            hidden.clone(),
             1,
             rows,
             HIDDEN_SIZE,
@@ -1350,6 +1355,7 @@ impl Moe {
             execution,
             workspace,
         )?;
+        workspace.retire_shared_bf16(hidden, "MoE input")?;
         let routed = Arc::new(routed);
         let output = moe_backend::combine_shared(
             routed.clone(),
@@ -1435,6 +1441,7 @@ fn gemma_rms_norm(
     rows: usize,
     epsilon: f32,
     execution: &mut StreamExecution<'_>,
+    workspace: &mut ExecutionWorkspace,
 ) -> Result<Bf16Tensor, ModelError> {
     const HIDDEN_SIZE: usize = 2048;
     const BLOCK: usize = 256;
@@ -1445,8 +1452,9 @@ fn gemma_rms_norm(
             "invalid Qwen Gemma RMSNorm geometry".into(),
         ));
     }
-    let mut output = execution.enqueue(
-        api::zeros::<bf16>(&[rows, HIDDEN_SIZE]),
+    let mut output = workspace.take_bf16(
+        &[rows, HIDDEN_SIZE],
+        execution,
         "allocate Qwen normalized output",
     )?;
     let (_, _, output_partition, _) = execution.enqueue(
@@ -1472,6 +1480,7 @@ fn gemma_add_rms_norm(
     rows: usize,
     epsilon: f32,
     execution: &mut StreamExecution<'_>,
+    workspace: &mut ExecutionWorkspace,
 ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
     const HIDDEN_SIZE: usize = 2048;
     const BLOCK: usize = 256;
@@ -1483,19 +1492,21 @@ fn gemma_add_rms_norm(
             "invalid Qwen fused add Gemma RMSNorm geometry".into(),
         ));
     }
-    let mut normalized = execution.enqueue(
-        api::zeros::<bf16>(&[rows, HIDDEN_SIZE]),
+    let mut normalized = workspace.take_bf16(
+        &[rows, HIDDEN_SIZE],
+        execution,
         "allocate Qwen normalized output",
     )?;
-    let mut combined = execution.enqueue(
-        api::zeros::<bf16>(&[rows, HIDDEN_SIZE]),
+    let mut combined = workspace.take_bf16(
+        &[rows, HIDDEN_SIZE],
+        execution,
         "allocate Qwen residual output",
     )?;
     let (_, _, _, normalized_partition, combined_partition, _) = execution.enqueue(
         unsafe {
             kernels::gemma_add_rms_norm_bf16(
-                residual,
-                update,
+                residual.clone(),
+                update.clone(),
                 weight_delta,
                 (&mut normalized).partition([1, HIDDEN_SIZE]),
                 (&mut combined).partition([1, HIDDEN_SIZE]),
@@ -1507,6 +1518,9 @@ fn gemma_add_rms_norm(
     )?;
     drop(normalized_partition);
     drop(combined_partition);
+    workspace.retire_shared_bf16(residual, "RMSNorm residual input")?;
+    workspace.retire_shared_bf16(update, "RMSNorm update input")?;
+    workspace.reclaim(execution)?;
     Ok((Arc::new(normalized), Arc::new(combined)))
 }
 
