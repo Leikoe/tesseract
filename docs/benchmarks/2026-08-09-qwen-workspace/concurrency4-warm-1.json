@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "timestamp_utc": "2026-08-09T08:16:42.430807+00:00",
+  "hardware": "NVIDIA A100-SXM4-80GB, 8.0, 580.126.09, 81920 MiB",
+  "cuda": "Build cuda_13.3.r13.3/compiler.38244171_0",
+  "rust": "rustc 1.89.0 (29483883e 2025-08-04)",
+  "git_revision": "0e02078",
+  "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+  "model_revision": "local-checkpoint",
+  "model_config_sha256": "58aefa1c9eff7989f431d748f2ddec39446cb1fd2a69acc46e285c6a37b0cecc",
+  "server_args": "--max-running 8 --max-batch-tokens 512 --prefill-chunk-tokens 128 --kv-capacity-tokens 4096",
+  "workload": {
+    "concurrency": 4,
+    "requests": 8,
+    "max_tokens": 8,
+    "warmup_requests": 1,
+    "prompts": [
+      "What is the capital of France? Answer briefly.",
+      "Count from one to ten, one number per line.",
+      "In two sentences, explain why the sky appears blue.",
+      "Write a short Rust function that adds two i32 values.",
+      "Name three practical uses for a priority queue.",
+      "Summarize the difference between TCP and UDP in one paragraph.",
+      "Give four tips for debugging a production service.",
+      "What is 17 multiplied by 23? Show the result only."
+    ]
+  },
+  "summary": {
+    "requests": 8,
+    "completion_tokens": 64,
+    "wall_seconds": 2.597524993994739,
+    "completion_tokens_per_second": 24.638838951680025,
+    "request_latency_seconds": {
+      "mean": 1.2865408281249984,
+      "p50": 1.2975140814996848,
+      "p90": 1.2993506808008533,
+      "p99": 1.2994424440799048
+    },
+    "ttft_seconds": {
+      "mean": 0.5504123058763071,
+      "p50": 0.6379729079999379,
+      "p90": 0.6428582386033668,
+      "p99": 0.6432143347654345
+    },
+    "inter_token_seconds": {
+      "mean": 0.10515358049984311,
+      "p50": 0.09447761764282145,
+      "p90": 0.1388643562000652,
+      "p99": 0.13970445021965133
+    }
+  },
+  "results": [
+    {
+      "prompt": "What is the capital of France? Answer briefly.",
+      "latency_seconds": 1.2104127470011008,
+      "ttft_seconds": 0.24111833299684804,
+      "mean_inter_token_seconds": 0.13846431142883375,
+      "token_events": 8,
+      "prompt_tokens": 20,
+      "completion_tokens": 8,
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "Count from one to ten, one number per line.",
+      "latency_seconds": 1.2960969609994208,
+      "ttft_seconds": 0.6432539010056644,
+      "mean_inter_token_seconds": 0.09325353442857574,
+      "token_events": 8,
+      "prompt_tokens": 21,
+      "completion_tokens": 8,
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "In two sentences, explain why the sky appears blue.",
+      "latency_seconds": 1.2948962860027677,
+      "ttft_seconds": 0.6426886690023821,
+      "mean_inter_token_seconds": 0.09316614885652338,
+      "token_events": 8,
+      "prompt_tokens": 21,
+      "completion_tokens": 8,
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "Write a short Rust function that adds two i32 values.",
+      "latency_seconds": 1.2942955969992909,
+      "ttft_seconds": 0.6424927670013858,
+      "mean_inter_token_seconds": 0.09310811328551998,
+      "token_events": 8,
+      "prompt_tokens": 23,
+      "completion_tokens": 8,
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "Name three practical uses for a priority queue.",
+      "latency_seconds": 1.2989342079963535,
+      "ttft_seconds": 0.32030003600084456,
+      "mean_inter_token_seconds": 0.13979779399960535,
+      "token_events": 8,
+      "prompt_tokens": 19,
+      "completion_tokens": 8,
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "Summarize the difference between TCP and UDP in one paragraph.",
+      "latency_seconds": 1.2994526399997994,
+      "ttft_seconds": 0.6380494379991433,
+      "mean_inter_token_seconds": 0.09447626142874858,
+      "token_events": 8,
+      "prompt_tokens": 23,
+      "completion_tokens": 8,
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "Give four tips for debugging a production service.",
+      "latency_seconds": 1.299306984001305,
+      "ttft_seconds": 0.6378963780007325,
+      "mean_inter_token_seconds": 0.0944789738568943,
+      "token_events": 8,
+      "prompt_tokens": 19,
+      "completion_tokens": 8,
+      "finish_reason": "length"
+    },
+    {
+      "prompt": "What is 17 multiplied by 23? Show the result only.",
+      "latency_seconds": 1.2989312019999488,
+      "ttft_seconds": 0.637498925003456,
+      "mean_inter_token_seconds": 0.09448350671404374,
+      "token_events": 8,
+      "prompt_tokens": 26,
+      "completion_tokens": 8,
+      "finish_reason": "length"
+    }
+  ]
+}

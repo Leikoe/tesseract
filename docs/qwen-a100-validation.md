@@ -180,3 +180,28 @@ byte-for-byte identical between serial and packed execution. Before the fix,
 all four differed. The complete CUDA differential suite also passed at this
 revision: grouped NVFP4 reported zero maximum absolute error, GDN recurrent
 decode reported `0.0005493164`, and full attention reported zero.
+
+## Stream-safe execution workspace
+
+Commit `0e02078` introduces an executor-owned, shape-keyed workspace with an
+explicit three-state lifetime: available, checked out by the current forward,
+or retired while enqueued kernels may still reference the allocation. Retired
+storage cannot be reclaimed until `StreamExecution` reports a synchronized
+stream. A surviving host alias is an execution error rather than permission to
+reuse the underlying pointer.
+
+The first integration covers sampling and the allocation-heavy MoE routing
+pipeline: routing IDs and weights, expert prefix metadata, dispatch positions,
+zeroed dispatch padding, synchronization tickets, expert tile maps, and routed
+combine outputs. Reused tensors that require zero initialization are cleared by
+`cuMemsetD8Async` on the model stream, independent of tensor rank. The bounded
+LRU pool evicts old shapes instead of retaining memory for every batch geometry
+ever observed.
+
+The full-checkpoint serial-reuse/concurrency-four regression remained
+byte-for-byte identical for all four eight-token greedy continuations. Two
+consecutive fully warm concurrency-four measurements produced 24.639 and
+24.542 output tokens/s. The fully warm batch-one measurement produced 10.722
+output tokens/s. Earlier passes encountered new compiled shapes and are not
+reported as steady state. Raw reports are retained under
+[`docs/benchmarks/2026-08-09-qwen-workspace`](benchmarks/2026-08-09-qwen-workspace).
