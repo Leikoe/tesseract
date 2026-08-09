@@ -69,3 +69,8 @@ required-features = ["cuda"]
 name = "next-token-check"
 path = "src/bin/next-token-check.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "cuda-kernel-bench"
+path = "src/bin/cuda-kernel-bench.rs"
+required-features = ["cuda"]

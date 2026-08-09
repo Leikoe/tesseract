@@ -11,6 +11,10 @@ use cutile::{
 };
 use serde::Serialize;
 
+use crate::cuda::{
+    execution::StreamExecution,
+    linear::{Fp8W8A16Linear, Nvfp4W4A16Linear},
+};
 use crate::{model::ModelError, quantization::decode_e4m3fn};
 
 unsafe extern "C" {
@@ -367,6 +371,398 @@ fn status_result(status: i32, operation: &str) -> Result<(), ModelError> {
 pub struct MarlinProbe {
     pub fp8_max_abs_error: f32,
     pub nvfp4_max_abs_error: f32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KernelBenchmarkReport {
+    pub device_id: usize,
+    pub warmup_iterations: usize,
+    pub timed_iterations: usize,
+    pub cutile_fp8_max_abs_error: f32,
+    pub cutile_nvfp4_max_abs_error: f32,
+    pub marlin_fp8_max_abs_error: f32,
+    pub marlin_nvfp4_max_abs_error: f32,
+    pub samples: Vec<KernelBenchmarkSample>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KernelBenchmarkSample {
+    pub implementation: &'static str,
+    pub quantization: MarlinQuantization,
+    pub rows: usize,
+    pub output_size: usize,
+    pub input_size: usize,
+    pub raw_ms: Vec<f32>,
+    pub minimum_ms: f32,
+    pub median_ms: f32,
+    pub p90_ms: f32,
+    pub logical_tflops: f64,
+    pub packed_weight_gb_per_second: f64,
+}
+
+pub fn benchmark(
+    device_id: usize,
+    rows: &[usize],
+    warmup_iterations: usize,
+    timed_iterations: usize,
+) -> Result<KernelBenchmarkReport, ModelError> {
+    if rows.is_empty()
+        || rows
+            .iter()
+            .any(|rows| *rows == 0 || !rows.is_multiple_of(16))
+        || timed_iterations == 0
+    {
+        return Err(ModelError::Cuda(
+            "invalid Marlin benchmark arguments".into(),
+        ));
+    }
+    let device = cuda_core::Device::new(device_id)
+        .map_err(|error| ModelError::Cuda(format!("initialize benchmark device: {error:?}")))?;
+    let stream = device
+        .new_stream()
+        .map_err(|error| ModelError::Cuda(format!("create benchmark stream: {error:?}")))?;
+    let cutile_probe = super::linear::probe_quantized_linears(&stream)?;
+    let marlin_probe = probe(&stream)?;
+    let mut samples = Vec::new();
+    for &m in rows {
+        benchmark_fp8_case(
+            &stream,
+            m,
+            2048,
+            8192,
+            warmup_iterations,
+            timed_iterations,
+            &mut samples,
+        )?;
+        benchmark_nvfp4_case(
+            &stream,
+            m,
+            2048,
+            512,
+            warmup_iterations,
+            timed_iterations,
+            &mut samples,
+        )?;
+        benchmark_nvfp4_case(
+            &stream,
+            m,
+            512,
+            2048,
+            warmup_iterations,
+            timed_iterations,
+            &mut samples,
+        )?;
+    }
+    Ok(KernelBenchmarkReport {
+        device_id,
+        warmup_iterations,
+        timed_iterations,
+        cutile_fp8_max_abs_error: cutile_probe.fp8_max_abs_error,
+        cutile_nvfp4_max_abs_error: cutile_probe.max_abs_error,
+        marlin_fp8_max_abs_error: marlin_probe.fp8_max_abs_error,
+        marlin_nvfp4_max_abs_error: marlin_probe.nvfp4_max_abs_error,
+        samples,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_fp8_case(
+    stream: &Arc<Stream>,
+    rows: usize,
+    input_size: usize,
+    output_size: usize,
+    warmup: usize,
+    iterations: usize,
+    samples: &mut Vec<KernelBenchmarkSample>,
+) -> Result<(), ModelError> {
+    const SCALE: f32 = 0.25;
+    let encoded = (0..output_size * input_size)
+        .map(|index| [0x20, 0x38, 0x3c, 0x40, 0x60, 0xb8, 0xc0, 0xe0][index % 8])
+        .collect::<Vec<_>>();
+    let input = benchmark_input(rows, input_size, stream)?;
+    let cutile = Fp8W8A16Linear::from_host(&encoded, input_size, output_size, SCALE, stream)?;
+    let marlin = MarlinLinear::fp8(&encoded, input_size, output_size, SCALE, stream)?;
+    samples.push(time_cutile_fp8(
+        &cutile,
+        input.clone(),
+        rows,
+        input_size,
+        output_size,
+        warmup,
+        iterations,
+        stream,
+    )?);
+    samples.push(time_marlin(
+        &marlin,
+        input,
+        rows,
+        input_size,
+        output_size,
+        warmup,
+        iterations,
+        stream,
+    )?);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_nvfp4_case(
+    stream: &Arc<Stream>,
+    rows: usize,
+    input_size: usize,
+    output_size: usize,
+    warmup: usize,
+    iterations: usize,
+    samples: &mut Vec<KernelBenchmarkSample>,
+) -> Result<(), ModelError> {
+    const GLOBAL: f32 = 0.5;
+    let packed = (0..output_size * input_size / 2)
+        .map(|index| ((index * 2) % 16) as u8 | ((((index * 2 + 1) % 16) as u8) << 4))
+        .collect::<Vec<_>>();
+    let scales = (0..output_size * input_size / 16)
+        .map(|index| [0x30, 0x38, 0x40, 0x44][index % 4])
+        .collect::<Vec<_>>();
+    let input = benchmark_input(rows, input_size, stream)?;
+    let cutile =
+        Nvfp4W4A16Linear::from_host(input_size, output_size, &packed, &scales, GLOBAL, stream)?;
+    let marlin = MarlinLinear::nvfp4(&packed, &scales, input_size, output_size, GLOBAL, stream)?;
+    samples.push(time_cutile_nvfp4(
+        &cutile,
+        input.clone(),
+        rows,
+        input_size,
+        output_size,
+        warmup,
+        iterations,
+        stream,
+    )?);
+    samples.push(time_marlin(
+        &marlin,
+        input,
+        rows,
+        input_size,
+        output_size,
+        warmup,
+        iterations,
+        stream,
+    )?);
+    Ok(())
+}
+
+fn benchmark_input(
+    rows: usize,
+    input_size: usize,
+    stream: &Arc<Stream>,
+) -> Result<Arc<Tensor<bf16>>, ModelError> {
+    let values = (0..rows * input_size)
+        .map(|index| bf16::from_f32((index % 17) as f32 / 8.0 - 1.0))
+        .collect::<Vec<_>>();
+    upload(values, stream, "upload kernel benchmark input")?
+        .reshape(&[rows, input_size])
+        .map_err(|error| ModelError::Cuda(format!("reshape benchmark input: {error:?}")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn time_cutile_fp8(
+    linear: &Fp8W8A16Linear,
+    input: Arc<Tensor<bf16>>,
+    rows: usize,
+    input_size: usize,
+    output_size: usize,
+    warmup: usize,
+    iterations: usize,
+    stream: &Arc<Stream>,
+) -> Result<KernelBenchmarkSample, ModelError> {
+    let mut output = api::zeros::<bf16>(&[rows, output_size])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate benchmark output: {error:?}")))?;
+    for _ in 0..warmup {
+        let mut execution = StreamExecution::new(stream);
+        output = linear.enqueue_into(input.clone(), rows, output, &mut execution)?;
+        execution.synchronize("warm Marlin comparison FP8")?;
+    }
+    let mut raw_ms = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = TimingEvent::new(stream)?;
+        let end = TimingEvent::new(stream)?;
+        start.record(stream)?;
+        let mut execution = StreamExecution::new(stream);
+        output = linear.enqueue_into(input.clone(), rows, output, &mut execution)?;
+        end.record(stream)?;
+        raw_ms.push(start.elapsed_ms(&end, stream)?);
+        execution.mark_synchronized();
+    }
+    Ok(summarize(
+        "cutile_packed",
+        MarlinQuantization::Fp8,
+        rows,
+        output_size,
+        input_size,
+        raw_ms,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn time_cutile_nvfp4(
+    linear: &Nvfp4W4A16Linear,
+    input: Arc<Tensor<bf16>>,
+    rows: usize,
+    input_size: usize,
+    output_size: usize,
+    warmup: usize,
+    iterations: usize,
+    stream: &Arc<Stream>,
+) -> Result<KernelBenchmarkSample, ModelError> {
+    let mut output = api::zeros::<bf16>(&[rows, output_size])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate benchmark output: {error:?}")))?;
+    for _ in 0..warmup {
+        let mut execution = StreamExecution::new(stream);
+        output = linear.enqueue_into(input.clone(), rows, output, &mut execution)?;
+        execution.synchronize("warm Marlin comparison NVFP4")?;
+    }
+    let mut raw_ms = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = TimingEvent::new(stream)?;
+        let end = TimingEvent::new(stream)?;
+        start.record(stream)?;
+        let mut execution = StreamExecution::new(stream);
+        output = linear.enqueue_into(input.clone(), rows, output, &mut execution)?;
+        end.record(stream)?;
+        raw_ms.push(start.elapsed_ms(&end, stream)?);
+        execution.mark_synchronized();
+    }
+    Ok(summarize(
+        "cutile_packed",
+        MarlinQuantization::Nvfp4,
+        rows,
+        output_size,
+        input_size,
+        raw_ms,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn time_marlin(
+    linear: &MarlinLinear,
+    input: Arc<Tensor<bf16>>,
+    rows: usize,
+    input_size: usize,
+    output_size: usize,
+    warmup: usize,
+    iterations: usize,
+    stream: &Arc<Stream>,
+) -> Result<KernelBenchmarkSample, ModelError> {
+    let output = api::zeros::<bf16>(&[rows, output_size])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate Marlin output: {error:?}")))?;
+    let temporary = api::zeros::<f32>(&[rows, output_size])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate Marlin temporary: {error:?}")))?;
+    for _ in 0..warmup {
+        linear.execute(&input, &output, &temporary, rows, stream)?;
+    }
+    unsafe { stream.synchronize() }
+        .map_err(|error| ModelError::Cuda(format!("warm Marlin kernel: {error:?}")))?;
+    let mut raw_ms = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = TimingEvent::new(stream)?;
+        let end = TimingEvent::new(stream)?;
+        start.record(stream)?;
+        linear.execute(&input, &output, &temporary, rows, stream)?;
+        end.record(stream)?;
+        raw_ms.push(start.elapsed_ms(&end, stream)?);
+    }
+    Ok(summarize(
+        "marlin",
+        linear.quantization,
+        rows,
+        output_size,
+        input_size,
+        raw_ms,
+    ))
+}
+
+fn summarize(
+    implementation: &'static str,
+    quantization: MarlinQuantization,
+    rows: usize,
+    output_size: usize,
+    input_size: usize,
+    raw_ms: Vec<f32>,
+) -> KernelBenchmarkSample {
+    let mut sorted = raw_ms.clone();
+    sorted.sort_by(f32::total_cmp);
+    let minimum_ms = sorted[0];
+    let median_ms = sorted[sorted.len() / 2];
+    let p90_ms = sorted[((sorted.len() - 1) as f32 * 0.9).ceil() as usize];
+    let seconds = f64::from(median_ms) / 1000.0;
+    let logical_tflops =
+        2.0 * rows as f64 * output_size as f64 * input_size as f64 / seconds / 1.0e12;
+    let packed_bytes = output_size as f64 * input_size as f64 * quantization.bits() as f64 / 8.0;
+    KernelBenchmarkSample {
+        implementation,
+        quantization,
+        rows,
+        output_size,
+        input_size,
+        raw_ms,
+        minimum_ms,
+        median_ms,
+        p90_ms,
+        logical_tflops,
+        packed_weight_gb_per_second: packed_bytes / seconds / 1.0e9,
+    }
+}
+
+struct TimingEvent(sys::CUevent);
+
+impl TimingEvent {
+    fn new(stream: &Arc<Stream>) -> Result<Self, ModelError> {
+        stream
+            .device()
+            .bind_to_thread()
+            .map_err(|error| ModelError::Cuda(format!("bind timing device: {error:?}")))?;
+        let mut event = std::mem::MaybeUninit::uninit();
+        unsafe {
+            sys::cuEventCreate(
+                event.as_mut_ptr(),
+                sys::CUevent_flags_enum_CU_EVENT_DEFAULT as u32,
+            )
+            .result()
+            .map_err(|error| ModelError::Cuda(format!("create timing event: {error:?}")))?;
+            Ok(Self(event.assume_init()))
+        }
+    }
+
+    fn record(&self, stream: &Arc<Stream>) -> Result<(), ModelError> {
+        unsafe { sys::cuEventRecord(self.0, stream.cu_stream()) }
+            .result()
+            .map_err(|error| ModelError::Cuda(format!("record timing event: {error:?}")))
+    }
+
+    fn elapsed_ms(&self, end: &Self, stream: &Arc<Stream>) -> Result<f32, ModelError> {
+        stream
+            .device()
+            .bind_to_thread()
+            .map_err(|error| ModelError::Cuda(format!("bind timing device: {error:?}")))?;
+        unsafe { sys::cuEventSynchronize(end.0) }
+            .result()
+            .map_err(|error| ModelError::Cuda(format!("synchronize timing event: {error:?}")))?;
+        let mut milliseconds = 0.0f32;
+        unsafe { sys::cuEventElapsedTime_v2(&mut milliseconds, self.0, end.0) }
+            .result()
+            .map_err(|error| ModelError::Cuda(format!("read timing event: {error:?}")))?;
+        Ok(milliseconds)
+    }
+}
+
+impl Drop for TimingEvent {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = sys::cuEventDestroy_v2(self.0);
+        }
+    }
 }
 
 pub fn probe(stream: &Arc<Stream>) -> Result<MarlinProbe, ModelError> {

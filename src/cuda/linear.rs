@@ -532,7 +532,26 @@ impl Fp8W8A16Linear {
         if !weight_scale.is_finite() || weight_scale <= 0.0 {
             return invalid_tensor(&weight_scale_name, "scale must be finite and positive");
         }
-        let weight = api::copy_host_vec_to_device(&Arc::new(weight.bytes().to_vec()))
+        Self::from_host(
+            weight.bytes(),
+            input_size,
+            output_size,
+            weight_scale,
+            stream,
+        )
+    }
+
+    pub(super) fn from_host(
+        encoded: &[u8],
+        input_size: usize,
+        output_size: usize,
+        weight_scale: f32,
+        stream: &Arc<Stream>,
+    ) -> Result<Self, ModelError> {
+        if encoded.len() != input_size.saturating_mul(output_size) {
+            return invalid_tensor("fp8", "invalid W8A16 host artifact length");
+        }
+        let weight = api::copy_host_vec_to_device(&Arc::new(encoded.to_vec()))
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("upload FP8 weight: {error:?}")))?
             .reshape(&[output_size, input_size])
@@ -736,7 +755,7 @@ impl Nvfp4W4A16Linear {
         )
     }
 
-    fn from_host(
+    pub(super) fn from_host(
         input_size: usize,
         output_size: usize,
         packed_weight: &[u8],
