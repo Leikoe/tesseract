@@ -881,13 +881,14 @@ impl<B: ModelExecutor> EngineWorker<B> {
         if let Some(recurrent) = &mut self.recurrent {
             recurrent.release(id);
         }
-        let _ = state.output.try_send(GenerationEvent::Failed { message });
         self.metrics.request_failed();
         tracing::warn!(
             request_id = %id,
+            error = %message,
             latency_ms = state.started_at.elapsed().as_secs_f64() * 1_000.0,
             "request failed"
         );
+        let _ = state.output.try_send(GenerationEvent::Failed { message });
         self.update_gauges();
     }
 
