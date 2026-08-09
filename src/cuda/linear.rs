@@ -41,14 +41,15 @@ mod kernels {
     ) {
         let pid = get_tile_block_id();
         let k_tiles = Dim::new(K_TILES);
-        let sixteen: Tile<u8, { [16, 8] }> = constant(16u8, const_shape![16, 8]);
+        let low_mask: Tile<u8, { [16, 8] }> = constant(0x0fu8, const_shape![16, 8]);
+        let nibble_shift: Tile<u8, { [16, 8] }> = constant(4u8, const_shape![16, 8]);
         let mut accumulator = constant(0.0f32, const_shape![16, 16]);
 
         for k_tile in k_tiles {
             let activation = input.load_tile(const_shape![16, 16], [pid.0, k_tile]);
             let packed = packed_weight.load_tile(const_shape![16, 8], [pid.1, k_tile]);
-            let low = (packed % sixteen).reshape(const_shape![16, 8, 1]);
-            let high = (packed / sixteen).reshape(const_shape![16, 8, 1]);
+            let low = andi(packed, low_mask).reshape(const_shape![16, 8, 1]);
+            let high = shri(packed, nibble_shift).reshape(const_shape![16, 8, 1]);
             let nibbles: Tile<u8, { [16, 8, 2] }> = cat(low, high, 2);
             let weight = decode_fp4(nibbles.reshape(const_shape![16, 16]));
             let scale: Tile<f32, { [16, 16] }> = convert_tile(
@@ -78,7 +79,8 @@ mod kernels {
         weight_scale: &Tensor<bf16, { [-1, -1, -1] }>,
         weight_global_scale: &Tensor<f32, { [-1] }>,
     ) {
-        let sixteen: Tile<u8, { [1, 16, 8] }> = constant(16u8, const_shape![1, 16, 8]);
+        let low_mask: Tile<u8, { [1, 16, 8] }> = constant(0x0fu8, const_shape![1, 16, 8]);
+        let nibble_shift: Tile<u8, { [1, 16, 8] }> = constant(4u8, const_shape![1, 16, 8]);
         let k_tiles = Dim::new(K_TILES);
 
         // `iter_indices` maps the full logical output grid onto a physical
@@ -98,8 +100,8 @@ mod kernels {
                 let activation = dispatched.load_tile(const_shape![16, 16], [row_tile, k_tile]);
                 let packed =
                     packed_weight.load_tile(const_shape![1, 16, 8], [expert, column_tile, k_tile]);
-                let low = (packed % sixteen).reshape(const_shape![16, 8, 1]);
-                let high = (packed / sixteen).reshape(const_shape![16, 8, 1]);
+                let low = andi(packed, low_mask).reshape(const_shape![16, 8, 1]);
+                let high = shri(packed, nibble_shift).reshape(const_shape![16, 8, 1]);
                 let nibbles: Tile<u8, { [16, 8, 2] }> = cat(low, high, 2);
                 let weight = decode_fp4(nibbles.reshape(const_shape![16, 16]));
                 let scale: Tile<f32, { [16, 16] }> = convert_tile(
