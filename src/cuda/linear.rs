@@ -160,6 +160,84 @@ mod kernels {
 
 use kernels::{grouped_nvfp4_w4a16, nvfp4_w4a16};
 
+#[derive(Clone, Copy)]
+struct ParsedNvfp4Projection<'a> {
+    input_size: usize,
+    output_size: usize,
+    packed_weight: &'a [u8],
+    scale_bytes: &'a [u8],
+    weight_global_scale: f32,
+}
+
+/// Parses ModelOpt's four-tensor W4A16 representation. Geometry comes from
+/// the checkpoint; these checks only establish that the bytes can be safely
+/// interpreted by the kernel.
+fn parse_nvfp4_projection<'a>(
+    source: &'a dyn WeightSource,
+    prefix: &str,
+) -> Result<ParsedNvfp4Projection<'a>, ModelError> {
+    let weight_name = format!("{prefix}.weight");
+    let scale_name = format!("{prefix}.weight_scale");
+    let global_name = format!("{prefix}.weight_scale_2");
+    let input_scale_name = format!("{prefix}.input_scale");
+    let weight = source.tensor(&weight_name)?;
+    let scale = source.tensor(&scale_name)?;
+    let global = source.tensor(&global_name)?;
+    let input_scale = source.tensor(&input_scale_name)?;
+
+    if weight.dtype() != &WeightDtype::U8 || weight.shape().len() != 2 {
+        return invalid_tensor(&weight_name, "expected rank-2 packed U8 storage");
+    }
+    let output_size = weight.shape()[0];
+    let packed_input_size = weight.shape()[1];
+    let input_size = packed_input_size
+        .checked_mul(2)
+        .ok_or_else(|| ModelError::InvalidTensor {
+            name: weight_name.clone(),
+            message: "logical input width overflowed".into(),
+        })?;
+    if input_size == 0
+        || output_size == 0
+        || !input_size.is_multiple_of(GROUP_K)
+        || !output_size.is_multiple_of(TILE_N)
+        || weight.byte_len() != output_size.saturating_mul(packed_input_size)
+    {
+        return invalid_tensor(&weight_name, "unrepresentable W4A16 storage geometry");
+    }
+    let expected_scale_shape = [output_size, input_size / GROUP_K];
+    if scale.dtype() != &WeightDtype::F8E4M3
+        || scale.shape() != expected_scale_shape
+        || scale.byte_len() != output_size.saturating_mul(input_size / GROUP_K)
+    {
+        return invalid_tensor(
+            &scale_name,
+            "scale storage does not cover packed weight groups",
+        );
+    }
+    if global.dtype() != &WeightDtype::F32 || !global.shape().is_empty() {
+        return invalid_tensor(&global_name, "expected an F32 scalar");
+    }
+    if input_scale.dtype() != &WeightDtype::F32 || !input_scale.shape().is_empty() {
+        return invalid_tensor(&input_scale_name, "expected an F32 scalar");
+    }
+    let weight_global_scale = scalar_f32(global.bytes(), &global_name)?;
+    let input_scale = scalar_f32(input_scale.bytes(), &input_scale_name)?;
+    if !weight_global_scale.is_finite()
+        || weight_global_scale <= 0.0
+        || !input_scale.is_finite()
+        || input_scale <= 0.0
+    {
+        return invalid_tensor(prefix, "quantization scales must be finite and positive");
+    }
+    Ok(ParsedNvfp4Projection {
+        input_size,
+        output_size,
+        packed_weight: weight.bytes(),
+        scale_bytes: scale.bytes(),
+        weight_global_scale,
+    })
+}
+
 /// Packed ModelOpt W4A16 projection selected for SM80.
 pub(crate) struct Nvfp4W4A16Linear {
     input_size: usize,
@@ -176,62 +254,13 @@ impl Nvfp4W4A16Linear {
         prefix: &str,
         stream: &Arc<Stream>,
     ) -> Result<Self, ModelError> {
-        let weight_name = format!("{prefix}.weight");
-        let scale_name = format!("{prefix}.weight_scale");
-        let global_name = format!("{prefix}.weight_scale_2");
-        let input_scale_name = format!("{prefix}.input_scale");
-        let weight = source.tensor(&weight_name)?;
-        let scale = source.tensor(&scale_name)?;
-        let global = source.tensor(&global_name)?;
-        let input_scale = source.tensor(&input_scale_name)?;
-
-        if weight.dtype() != &WeightDtype::U8 || weight.shape().len() != 2 {
-            return invalid_tensor(&weight_name, "expected rank-2 packed U8 weight");
-        }
-        let output_size = weight.shape()[0];
-        let input_size =
-            weight.shape()[1]
-                .checked_mul(2)
-                .ok_or_else(|| ModelError::InvalidTensor {
-                    name: weight_name.clone(),
-                    message: "logical input width overflowed".into(),
-                })?;
-        if input_size == 0
-            || output_size == 0
-            || !input_size.is_multiple_of(GROUP_K)
-            || !output_size.is_multiple_of(TILE_N)
-        {
-            return invalid_tensor(&weight_name, "unsupported W4A16 projection geometry");
-        }
-        source.validate_tensor(
-            &scale_name,
-            &WeightDtype::F8E4M3,
-            &[output_size, input_size / GROUP_K],
-        )?;
-        source.validate_tensor(&global_name, &WeightDtype::F32, &[])?;
-        source.validate_tensor(&input_scale_name, &WeightDtype::F32, &[])?;
-
-        let weight_global_scale = scalar_f32(global.bytes(), &global_name)?;
-        // W4A16 deliberately does not quantize activations, but validating the
-        // exported placeholder catches corrupt or mismatched projection sets.
-        let input_scale = scalar_f32(input_scale.bytes(), &input_scale_name)?;
-        if !weight_global_scale.is_finite()
-            || weight_global_scale <= 0.0
-            || !input_scale.is_finite()
-            || input_scale <= 0.0
-        {
-            return invalid_tensor(
-                prefix,
-                "global quantization scales must be finite and positive",
-            );
-        }
-
+        let parsed = parse_nvfp4_projection(source, prefix)?;
         Self::from_host(
-            input_size,
-            output_size,
-            weight.bytes(),
-            scale.bytes(),
-            weight_global_scale,
+            parsed.input_size,
+            parsed.output_size,
+            parsed.packed_weight,
+            parsed.scale_bytes,
+            parsed.weight_global_scale,
             stream,
         )
     }
@@ -340,7 +369,87 @@ pub(crate) struct GroupedNvfp4W4A16 {
     device_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpertProjection {
+    Gate,
+    Up,
+    Down,
+}
+
+impl ExpertProjection {
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::Gate => "gate_proj",
+            Self::Up => "up_proj",
+            Self::Down => "down_proj",
+        }
+    }
+}
+
 impl GroupedNvfp4W4A16 {
+    /// Loads one projection from every individually named checkpoint expert
+    /// into a single packed device bank. The temporary host staging vectors
+    /// are exact-sized and released after upload; packed weights are never
+    /// expanded to BF16.
+    pub(crate) fn load(
+        source: &dyn WeightSource,
+        experts_prefix: &str,
+        projection: ExpertProjection,
+        num_experts: usize,
+        stream: &Arc<Stream>,
+    ) -> Result<Self, ModelError> {
+        if num_experts == 0 {
+            return invalid_tensor(experts_prefix, "expert bank is empty");
+        }
+        let first_prefix = format!("{experts_prefix}.0.{}", projection.suffix());
+        let first = parse_nvfp4_projection(source, &first_prefix)?;
+        let input_size = first.input_size;
+        let output_size = first.output_size;
+        let packed_len = num_experts
+            .checked_mul(output_size)
+            .and_then(|size| size.checked_mul(input_size / 2))
+            .ok_or_else(|| ModelError::InvalidTensor {
+                name: experts_prefix.into(),
+                message: "grouped packed-weight size overflowed".into(),
+            })?;
+        let scale_len = num_experts
+            .checked_mul(output_size)
+            .and_then(|size| size.checked_mul(input_size / GROUP_K))
+            .ok_or_else(|| ModelError::InvalidTensor {
+                name: experts_prefix.into(),
+                message: "grouped scale size overflowed".into(),
+            })?;
+        let mut packed_weight = Vec::with_capacity(packed_len);
+        let mut scale_bytes = Vec::with_capacity(scale_len);
+        let mut global_scales = Vec::with_capacity(num_experts);
+
+        for expert in 0..num_experts {
+            let prefix = format!("{experts_prefix}.{expert}.{}", projection.suffix());
+            let parsed = if expert == 0 {
+                first
+            } else {
+                parse_nvfp4_projection(source, &prefix)?
+            };
+            if parsed.input_size != input_size || parsed.output_size != output_size {
+                return invalid_tensor(&prefix, "expert projection geometry differs from expert 0");
+            }
+            packed_weight.extend_from_slice(parsed.packed_weight);
+            scale_bytes.extend_from_slice(parsed.scale_bytes);
+            global_scales.push(parsed.weight_global_scale);
+        }
+        debug_assert_eq!(packed_weight.len(), packed_len);
+        debug_assert_eq!(scale_bytes.len(), scale_len);
+        Self::from_host_owned(
+            num_experts,
+            input_size,
+            output_size,
+            packed_weight,
+            scale_bytes,
+            global_scales,
+            stream,
+        )
+    }
+
     fn from_host(
         num_experts: usize,
         input_size: usize,
@@ -371,7 +480,48 @@ impl GroupedNvfp4W4A16 {
             return invalid_tensor("grouped_nvfp4", "invalid grouped W4A16 artifact");
         }
 
-        let packed_weight = api::copy_host_vec_to_device(&Arc::new(packed_weight.to_vec()))
+        Self::from_host_owned(
+            num_experts,
+            input_size,
+            output_size,
+            packed_weight.to_vec(),
+            scale_bytes.to_vec(),
+            weight_global_scale.to_vec(),
+            stream,
+        )
+    }
+
+    fn from_host_owned(
+        num_experts: usize,
+        input_size: usize,
+        output_size: usize,
+        packed_weight: Vec<u8>,
+        scale_bytes: Vec<u8>,
+        weight_global_scale: Vec<f32>,
+        stream: &Arc<Stream>,
+    ) -> Result<Self, ModelError> {
+        let expected_weights = num_experts
+            .checked_mul(output_size)
+            .and_then(|size| size.checked_mul(input_size / 2));
+        let expected_scales = num_experts
+            .checked_mul(output_size)
+            .and_then(|size| size.checked_mul(input_size / GROUP_K));
+        if num_experts == 0
+            || input_size == 0
+            || output_size == 0
+            || !input_size.is_multiple_of(GROUP_K)
+            || !output_size.is_multiple_of(TILE_N)
+            || expected_weights != Some(packed_weight.len())
+            || expected_scales != Some(scale_bytes.len())
+            || weight_global_scale.len() != num_experts
+            || weight_global_scale
+                .iter()
+                .any(|scale| !scale.is_finite() || *scale <= 0.0)
+        {
+            return invalid_tensor("grouped_nvfp4", "invalid grouped W4A16 artifact");
+        }
+
+        let packed_weight = api::copy_host_vec_to_device(&Arc::new(packed_weight))
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("upload grouped NVFP4 weight: {error:?}")))?
             .reshape(&[num_experts, output_size, input_size / 2])
@@ -396,12 +546,11 @@ impl GroupedNvfp4W4A16 {
             .map_err(|error| {
                 ModelError::Cuda(format!("reshape grouped NVFP4 scales: {error:?}"))
             })?;
-        let weight_global_scale =
-            api::copy_host_vec_to_device(&Arc::new(weight_global_scale.to_vec()))
-                .sync_on(stream)
-                .map_err(|error| {
-                    ModelError::Cuda(format!("upload grouped NVFP4 global scales: {error:?}"))
-                })?;
+        let weight_global_scale = api::copy_host_vec_to_device(&Arc::new(weight_global_scale))
+            .sync_on(stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!("upload grouped NVFP4 global scales: {error:?}"))
+            })?;
         let device_bytes = packed_weight
             .num_bytes()
             .checked_add(weight_scale.num_bytes())
@@ -623,15 +772,19 @@ fn validate_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError>
         .map(|index| if index % 3 == 0 { 0x38 } else { 0x40 })
         .collect::<Vec<_>>();
     let global_scales = [0.5f32, 0.25f32];
-    let grouped = GroupedNvfp4W4A16::from_host(
-        EXPERTS,
+    let global_scale_bytes = global_scales.map(f32::to_le_bytes);
+    let input_scale_bytes = [1.0f32.to_le_bytes(); EXPERTS];
+    let source = GroupedNvfp4ValidationSource {
+        prefix: "experts",
         input_size,
         output_size,
-        &packed,
-        &scale_bytes,
-        &global_scales,
-        stream,
-    )?;
+        packed: &packed,
+        scales: &scale_bytes,
+        global_scales: &global_scale_bytes,
+        input_scales: &input_scale_bytes,
+    };
+    let grouped =
+        GroupedNvfp4W4A16::load(&source, "experts", ExpertProjection::Gate, EXPERTS, stream)?;
     let expected_device_bytes = packed
         .len()
         .checked_add(scale_bytes.len() * std::mem::size_of::<bf16>())
@@ -729,6 +882,67 @@ impl WeightSource for Nvfp4ValidationSource<'_> {
         ["weight", "weight_scale", "weight_scale_2", "input_scale"]
             .into_iter()
             .map(|suffix| format!("{}.{suffix}", self.prefix))
+            .collect()
+    }
+}
+
+struct GroupedNvfp4ValidationSource<'a> {
+    prefix: &'a str,
+    input_size: usize,
+    output_size: usize,
+    packed: &'a [u8],
+    scales: &'a [u8],
+    global_scales: &'a [[u8; 4]],
+    input_scales: &'a [[u8; 4]],
+}
+
+impl WeightSource for GroupedNvfp4ValidationSource<'_> {
+    fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, ModelError> {
+        let remainder = name
+            .strip_prefix(self.prefix)
+            .and_then(|name| name.strip_prefix('.'))
+            .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
+        let (expert, suffix) = remainder
+            .split_once('.')
+            .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
+        let expert = expert
+            .parse::<usize>()
+            .ok()
+            .filter(|expert| *expert < self.global_scales.len())
+            .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
+        let packed_stride = self.output_size * (self.input_size / 2);
+        let scale_stride = self.output_size * (self.input_size / GROUP_K);
+        match suffix {
+            "gate_proj.weight" => Ok(WeightTensor::new(
+                WeightDtype::U8,
+                vec![self.output_size, self.input_size / 2],
+                &self.packed[expert * packed_stride..(expert + 1) * packed_stride],
+            )),
+            "gate_proj.weight_scale" => Ok(WeightTensor::new(
+                WeightDtype::F8E4M3,
+                vec![self.output_size, self.input_size / GROUP_K],
+                &self.scales[expert * scale_stride..(expert + 1) * scale_stride],
+            )),
+            "gate_proj.weight_scale_2" => Ok(WeightTensor::new(
+                WeightDtype::F32,
+                vec![],
+                &self.global_scales[expert],
+            )),
+            "gate_proj.input_scale" => Ok(WeightTensor::new(
+                WeightDtype::F32,
+                vec![],
+                &self.input_scales[expert],
+            )),
+            _ => Err(ModelError::MissingTensor(name.into())),
+        }
+    }
+
+    fn names(&self) -> Vec<String> {
+        (0..self.global_scales.len())
+            .flat_map(|expert| {
+                ["weight", "weight_scale", "weight_scale_2", "input_scale"]
+                    .map(move |suffix| format!("{}.{expert}.gate_proj.{suffix}", self.prefix))
+            })
             .collect()
     }
 }

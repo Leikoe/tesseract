@@ -9,7 +9,7 @@ Environment:
 - NVIDIA A100-SXM4-80GB, `sm_80`;
 - CUDA 13.3;
 - cuTile revision `9fe5756f861bc40f098e6981ac2dff6cf5d3d0e4`; and
-- Tesseract revision `a38c248`.
+- Tesseract revision `68e44cd`.
 
 `cuda-check` runs two permanent numerical capability probes without inspecting
 the device name.
@@ -41,7 +41,27 @@ cutile_validation=ok
 ```
 
 This is positive execution evidence for keeping the SM80 W4A16 fallback in
-cuTile. It is not evidence that a full Qwen projection is implemented or fast:
-the production kernel still needs shape-generic M/N tiling, K-group
-accumulation, global scales, checkpoint layouts, randomized differential tests,
-and A100 benchmarks before backend selection can enable it.
+cuTile.
+
+The next permanent probes exercise the packed dense and persistent grouped
+W4A16 leaves with all FP4 codes, signed BF16 activations, non-unit E4M3 group
+scales, non-unit global scales, K-group accumulation, and reversed expert
+routing. Both match the BF16-rounded host oracle exactly:
+
+```text
+nvfp4_w4a16_linear=available
+nvfp4_w4a16_linear_max_abs_error=0
+nvfp4_grouped_w4a16=available
+nvfp4_grouped_w4a16_max_abs_error=0
+```
+
+This testing also exposed a cuTile-RS lowering detail on SM80: `Tensor<u8>`
+pointer lanes currently arrive as signed `i8`, and `exti` preserves that
+signedness. The kernel restores the unsigned byte in `i32` with `x < 0 ? x +
+256 : x` before extracting nibbles. Without that step, high-bit packed bytes
+silently decode incorrectly. The full A100 verifier, including strict CUDA
+Clippy and the permanent numerical probes, passed at `68e44cd`.
+
+These results prove arithmetic correctness for the current 16x16 leaves. They
+do not prove production Qwen throughput; target-shape tiling, fused MoE stages,
+routing, sanitizer runs, and end-to-end model benchmarks remain required.

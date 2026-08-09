@@ -7,6 +7,10 @@ ModelOpt-W4A16 MoE kernels. The references are local, immutable checkouts:
 - `references/TileGym` at `5902f99ee59b01ccc484554a3a6734f9e5607e59`
 - `references/cutile-rs` at `9fe5756f861bc40f098e6981ac2dff6cf5d3d0e4`
 
+The pinned cuTile-RS revision is also the upstream `main` revision as of
+2026-08-08. Tesseract may follow current cuTile-RS rather than preserving
+compatibility with an older API.
+
 ## Non-negotiable arithmetic contract
 
 The A100 path is W4A16, not W4A8. It loads BF16 activations and packed NVFP4
@@ -14,6 +18,14 @@ weights, decodes E2M1 nibbles and E4M3 group scales in the tile, casts the
 scaled weights to BF16 for tensor-core MMA, accumulates in FP32, and casts to
 BF16 only immediately before the final store. Packed weights must never be
 expanded into a persistent BF16 weight matrix.
+
+The target checkpoint parses to 40 layers, 256 routed experts, top-8 routing,
+hidden width 2048, and expert width 512. Thus each layer's logical gate/up
+banks are `[256, 512, 2048]` and its down bank is `[256, 2048, 512]`.
+Construction derives these dimensions from tensor metadata; it does not
+reconstruct and compare a hard-coded checkpoint manifest. Shape consistency
+and packing checks are representation preconditions, not a second model
+description.
 
 ## Routing and memory contract
 

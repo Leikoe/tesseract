@@ -148,6 +148,14 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 </codex_internal_context>
 ```
 
+## User
+
+you can use latest cutile-rs without worries I think
+
+## User
+
+why are we validating ? you should parse and not validate.
+
 ```text
 you will need good grouped gemm kernels (nfp4 weights loads + bf16 activations loads + bf16 tensor cores w fp32 acc + cast back to bf16 before store)
 ```
