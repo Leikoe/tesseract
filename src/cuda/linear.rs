@@ -31,6 +31,8 @@ const GROUP_K: usize = 16;
 mod kernels {
     use cutile::core::*;
 
+    const FP8_SUBNORMAL_SCALE: f32 = 1.0 / 512.0;
+
     #[cutile::entry()]
     fn fp8_w8a16<const K_TILES: i32>(
         output: &mut Tensor<bf16, { [16, 16] }>,
@@ -195,8 +197,7 @@ mod kernels {
         let one_f: Tile<f32, { [16, 16] }> = constant(1.0f32, shape);
         let eight_f: Tile<f32, { [16, 16] }> = constant(8.0f32, shape);
         let seven_f: Tile<f32, { [16, 16] }> = constant(7.0f32, shape);
-        const SUBNORMAL_SCALE: f32 = 1.0 / 512.0;
-        let subnormal_scale: Tile<f32, { [16, 16] }> = constant(SUBNORMAL_SCALE, shape);
+        let subnormal_scale: Tile<f32, { [16, 16] }> = constant(FP8_SUBNORMAL_SCALE, shape);
         let normal =
             (one_f + true_div(mantissa_f, eight_f)) * exp2(exponent_f - seven_f, ftz::Disabled);
         let subnormal = mantissa_f * subnormal_scale;
