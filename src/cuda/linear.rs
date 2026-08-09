@@ -190,7 +190,7 @@ mod kernels {
         const ONE_F: f32 = 1.0;
         let one_f: Tile<f32, { [64, 16] }> = broadcast_scalar(ONE_F, const_shape![64, 16]);
         const ONE_HALF_F: f32 = 1.5;
-        let one_half_f: Tile<f32, { [64, 32] }> =
+        let one_half_f: Tile<f32, { [64, 16] }> =
             broadcast_scalar(ONE_HALF_F, const_shape![64, 16]);
         const TWO_F: f32 = 2.0;
         let two_f: Tile<f32, { [64, 16] }> = broadcast_scalar(TWO_F, const_shape![64, 16]);
