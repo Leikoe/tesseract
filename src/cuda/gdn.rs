@@ -590,6 +590,188 @@ mod kernels {
         inverse.store(solved);
     }
 
+    /// Reuses the single solved KKT tile to form both WY factors with tensor
+    /// cores. K is normalized exactly once in this stage and partial rows are
+    /// clamped then explicitly masked.
+    #[cutile::entry()]
+    unsafe fn qwen_gdn_prefill_recompute_w_u(
+        mixed_qkv_ptr: *mut bf16,
+        log_decay_cumsum_ptr: *mut f32,
+        beta_ptr: *mut bf16,
+        inverse: &Tensor<bf16, { [-1, 32, 256] }>,
+        chunk_starts: &Tensor<i32, { [-1] }>,
+        chunk_lengths: &Tensor<i32, { [-1] }>,
+        u_ptr: *mut bf16,
+        w: &mut Tensor<bf16, { [1, 1, 2048] }>,
+    ) {
+        const EPSILON: f32 = 1.0e-6;
+        const ZERO: f32 = 0.0;
+
+        let pid = get_tile_block_id();
+        let chunk = pid.0;
+        let value_head = pid.1;
+        let key_head = value_head / 2i32;
+        let start: i32 = tile_to_scalar(
+            chunk_starts
+                .partition(const_shape![1])
+                .load([chunk])
+                .reshape(const_shape![]),
+        );
+        let len: i32 = tile_to_scalar(
+            chunk_lengths
+                .partition(const_shape![1])
+                .load([chunk])
+                .reshape(const_shape![]),
+        );
+        let row: Tile<i32, { [16] }> = iota(const_shape![16]);
+        let row: Tile<i32, { [16, 1] }> = row.reshape(const_shape![16, 1]);
+        let safe_row: Tile<i32, { [16, 1] }> =
+            min_tile(row, (len - 1i32).broadcast(const_shape![16, 1]));
+        let column: Tile<i32, { [128] }> = iota(const_shape![128]);
+        let column: Tile<i32, { [1, 128] }> = column.reshape(const_shape![1, 128]);
+        let row_shape = const_shape![16, 1];
+        let valid_row: Tile<bool, { [16, 1] }> = lt_tile(row, len.broadcast(const_shape![16, 1]));
+        let valid_matrix: Tile<bool, { [16, 128] }> = valid_row.broadcast(const_shape![16, 128]);
+
+        let mixed_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(mixed_qkv_ptr);
+        let mixed_base: PointerTile<*mut bf16, { [1, 1] }> = mixed_base.reshape(const_shape![1, 1]);
+        let mixed_base: PointerTile<*mut bf16, { [16, 128] }> =
+            mixed_base.broadcast(const_shape![16, 128]);
+        let packed_row = start.broadcast(row_shape) + safe_row;
+        let key_offset = (packed_row * 8192i32.broadcast(row_shape)
+            + ((key_head + 16i32) * 128i32).broadcast(row_shape))
+        .broadcast(const_shape![16, 128])
+            + column.broadcast(const_shape![16, 128]);
+        let key_pointer: PointerTile<*mut bf16, { [16, 128] }> = mixed_base.offset_tile(key_offset);
+        let (key, _): (Tile<bf16, { [16, 128] }>, Token) = load_ptr_tko(
+            key_pointer,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<0>,
+        );
+        let key: Tile<f32, { [16, 128] }> = convert_tile(key);
+        let key = select(
+            valid_matrix,
+            key,
+            broadcast_scalar(ZERO, const_shape![16, 128]),
+        );
+        let key_square_sum: Tile<f32, { [16] }> = reduce_sum(key * key, 1i32);
+        let key_square_sum: Tile<f32, { [16, 1] }> = key_square_sum.reshape(const_shape![16, 1]);
+        let epsilon: Tile<f32, { [16, 1] }> = broadcast_scalar(EPSILON, const_shape![16, 1]);
+        let key_inverse = rsqrt(key_square_sum + epsilon, ftz::Disabled);
+        let key: Tile<bf16, { [16, 128] }> = ftof(
+            key * key_inverse.broadcast(const_shape![16, 128]),
+            rounding::NearestEven,
+        );
+
+        let value_offset = (packed_row * 8192i32.broadcast(row_shape)
+            + (4096i32 + value_head * 128i32).broadcast(row_shape))
+        .broadcast(const_shape![16, 128])
+            + column.broadcast(const_shape![16, 128]);
+        let value_pointer: PointerTile<*mut bf16, { [16, 128] }> =
+            mixed_base.offset_tile(value_offset);
+        let (value, _): (Tile<bf16, { [16, 128] }>, Token) = load_ptr_tko(
+            value_pointer,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<0>,
+        );
+        let value: Tile<f32, { [16, 128] }> = convert_tile(value);
+        let value = select(
+            valid_matrix,
+            value,
+            broadcast_scalar(ZERO, const_shape![16, 128]),
+        );
+
+        let gate_offset = packed_row * 32i32.broadcast(row_shape) + value_head.broadcast(row_shape);
+        let log_base: PointerTile<*mut f32, { [] }> = pointer_to_tile(log_decay_cumsum_ptr);
+        let log_base: PointerTile<*mut f32, { [1, 1] }> = log_base.reshape(const_shape![1, 1]);
+        let log_base: PointerTile<*mut f32, { [16, 1] }> = log_base.broadcast(const_shape![16, 1]);
+        let log_pointer: PointerTile<*mut f32, { [16, 1] }> = log_base.offset_tile(gate_offset);
+        let (log_decay, _): (Tile<f32, { [16, 1] }>, Token) = load_ptr_tko(
+            log_pointer,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<0>,
+        );
+        let log_decay = select(
+            valid_row,
+            log_decay,
+            broadcast_scalar(ZERO, const_shape![16, 1]),
+        );
+        let beta_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(beta_ptr);
+        let beta_base: PointerTile<*mut bf16, { [1, 1] }> = beta_base.reshape(const_shape![1, 1]);
+        let beta_base: PointerTile<*mut bf16, { [16, 1] }> =
+            beta_base.broadcast(const_shape![16, 1]);
+        let beta_pointer: PointerTile<*mut bf16, { [16, 1] }> = beta_base.offset_tile(gate_offset);
+        let (beta, _): (Tile<bf16, { [16, 1] }>, Token) = load_ptr_tko(
+            beta_pointer,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<0>,
+        );
+        let beta: Tile<f32, { [16, 1] }> = convert_tile(beta);
+        let beta = select(valid_row, beta, broadcast_scalar(ZERO, const_shape![16, 1]));
+
+        let key_for_weight: Tile<f32, { [16, 128] }> = convert_tile(key);
+        let weighted_key: Tile<bf16, { [16, 128] }> = ftof(
+            key_for_weight
+                * beta.broadcast(const_shape![16, 128])
+                * exp(log_decay).broadcast(const_shape![16, 128]),
+            rounding::NearestEven,
+        );
+        let weighted_value: Tile<bf16, { [16, 128] }> = ftof(
+            value * beta.broadcast(const_shape![16, 128]),
+            rounding::NearestEven,
+        );
+        let inverse: Tile<bf16, { [16, 16] }> = inverse
+            .partition(const_shape![1, 1, 256])
+            .load([chunk, value_head, 0i32])
+            .reshape(const_shape![16, 16]);
+        let zero: Tile<f32, { [16, 128] }> = broadcast_scalar(ZERO, const_shape![16, 128]);
+        let w_tile: Tile<f32, { [16, 128] }> = mma(inverse, weighted_key, zero);
+        let u_tile: Tile<f32, { [16, 128] }> = mma(inverse, weighted_value, zero);
+        let w_tile: Tile<bf16, { [1, 1, 2048] }> = ftof(
+            w_tile.reshape(const_shape![1, 1, 2048]),
+            rounding::NearestEven,
+        );
+        w.store(w_tile);
+
+        let u_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(u_ptr);
+        let u_base: PointerTile<*mut bf16, { [1, 1] }> = u_base.reshape(const_shape![1, 1]);
+        let u_base: PointerTile<*mut bf16, { [16, 128] }> = u_base.broadcast(const_shape![16, 128]);
+        let output_row: Tile<i32, { [16] }> = iota(const_shape![16]);
+        let output_row: Tile<i32, { [16, 1] }> = output_row.reshape(const_shape![16, 1]);
+        let output_column: Tile<i32, { [128] }> = iota(const_shape![128]);
+        let output_column: Tile<i32, { [1, 128] }> = output_column.reshape(const_shape![1, 128]);
+        let u_offset = ((chunk * 32i32 + value_head) * 2048i32).broadcast(const_shape![16, 128])
+            + output_row.broadcast(const_shape![16, 128]) * 128i32.broadcast(const_shape![16, 128])
+            + output_column.broadcast(const_shape![16, 128]);
+        let u_pointer: PointerTile<*mut bf16, { [16, 128] }> = u_base.offset_tile(u_offset);
+        let u_tile: Tile<bf16, { [16, 128] }> = ftof(u_tile, rounding::NearestEven);
+        let _u_store = store_ptr_tko(
+            u_pointer,
+            u_tile,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            Latency::<0>,
+        );
+    }
+
     #[cutile::entry()]
     unsafe fn qwen_gdn_decode(
         mixed_qkv: &Tensor<bf16, { [-1, 8192] }>,
@@ -788,7 +970,7 @@ mod kernels {
 
 use kernels::{
     qwen_gdn_conv_decode, qwen_gdn_conv_prefill, qwen_gdn_decode, qwen_gdn_output_gate,
-    qwen_gdn_prefill_gates, qwen_gdn_prefill_kkt_solve,
+    qwen_gdn_prefill_gates, qwen_gdn_prefill_kkt_solve, qwen_gdn_prefill_recompute_w_u,
 };
 
 pub(crate) struct GdnPrefillPlan {
@@ -890,7 +1072,7 @@ fn solve_prefill_kkt(
     gates: &GdnPrefillGates,
     plan: &GdnPrefillPlan,
     stream: &Arc<Stream>,
-) -> Result<Tensor<bf16>, ModelError> {
+) -> Result<Arc<Tensor<bf16>>, ModelError> {
     if mixed_qkv.shape() != [plan.rows() as i32, CONV_FEATURES as i32] {
         return Err(ModelError::Cuda("invalid GDN prefill KKT geometry".into()));
     }
@@ -913,7 +1095,44 @@ fn solve_prefill_kkt(
     .sync_on(stream)
     .map_err(|error| ModelError::Cuda(format!("execute GDN prefill KKT solve: {error:?}")))?;
     drop(inverse_partition);
-    Ok(inverse)
+    Ok(Arc::new(inverse))
+}
+
+struct GdnPrefillWy {
+    w: Tensor<bf16>,
+    u: Tensor<bf16>,
+}
+
+fn recompute_prefill_w_u(
+    mixed_qkv: Arc<Tensor<bf16>>,
+    gates: &GdnPrefillGates,
+    inverse: Arc<Tensor<bf16>>,
+    plan: &GdnPrefillPlan,
+    stream: &Arc<Stream>,
+) -> Result<GdnPrefillWy, ModelError> {
+    let shape = [plan.chunks(), VALUE_HEADS, PREFILL_CHUNK * HEAD_DIM];
+    let mut w = api::zeros::<bf16>(&shape)
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate GDN prefill W: {error:?}")))?;
+    let u = api::zeros::<bf16>(&shape)
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate GDN prefill U: {error:?}")))?;
+    let (_, _, _, _, _, _, _, w_partition) = unsafe {
+        qwen_gdn_prefill_recompute_w_u(
+            mixed_qkv.device_pointer(),
+            gates.log_decay_cumsum.device_pointer(),
+            gates.beta.device_pointer(),
+            inverse,
+            plan.chunk_starts.clone(),
+            plan.chunk_lengths.clone(),
+            u.device_pointer(),
+            (&mut w).partition([1, 1, PREFILL_CHUNK * HEAD_DIM]),
+        )
+    }
+    .sync_on(stream)
+    .map_err(|error| ModelError::Cuda(format!("execute GDN prefill W/U: {error:?}")))?;
+    drop(w_partition);
+    Ok(GdnPrefillWy { w, u })
 }
 
 pub(crate) fn output_gate(
@@ -1249,7 +1468,8 @@ fn probe_prefill_kkt(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         &plan,
         stream,
     )?;
-    let inverse = solve_prefill_kkt(mixed_qkv, &gates, &plan, stream)?;
+    let inverse = solve_prefill_kkt(mixed_qkv.clone(), &gates, &plan, stream)?;
+    let wy = recompute_prefill_w_u(mixed_qkv, &gates, inverse.clone(), &plan, stream)?;
     let actual: Vec<bf16> = inverse
         .to_host_vec()
         .sync_on(stream)
@@ -1263,6 +1483,14 @@ fn probe_prefill_kkt(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         gates.beta.to_host_vec().sync_on(stream).map_err(|error| {
             ModelError::Cuda(format!("download GDN KKT update gates: {error:?}"))
         })?;
+    let actual_w: Vec<bf16> =
+        wy.w.to_host_vec()
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("download GDN prefill W: {error:?}")))?;
+    let actual_u: Vec<bf16> =
+        wy.u.to_host_vec()
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("download GDN prefill U: {error:?}")))?;
     let chunks = plan_packed_queries(&offsets, PREFILL_CHUNK as u32)
         .map_err(|error| ModelError::Cuda(format!("plan GDN KKT reference: {error}")))?;
 
@@ -1326,6 +1554,56 @@ fn probe_prefill_kkt(stream: &Arc<Stream>) -> Result<f32, ModelError> {
                         return Err(ModelError::Cuda(format!(
                             "GDN prefill inverse mismatch at {index}: {} != {expected}",
                             actual[index].to_f32()
+                        )));
+                    }
+                }
+            }
+            for row in 0..len {
+                for element in 0..HEAD_DIM {
+                    let mut expected_w = 0.0f32;
+                    let mut expected_u = 0.0f32;
+                    for inner in 0..len {
+                        let inverse_index =
+                            (((chunk_index * VALUE_HEADS + value_head) * PREFILL_CHUNK + row)
+                                * PREFILL_CHUNK)
+                                + inner;
+                        let packed_inner = chunk.start() as usize + inner;
+                        let gate_index = packed_inner * VALUE_HEADS + value_head;
+                        let weighted_key = bf16::from_f32(
+                            keys[inner][element]
+                                * beta[gate_index].to_f32()
+                                * log_decay[gate_index].exp(),
+                        )
+                        .to_f32();
+                        let value_index = packed_inner * CONV_FEATURES
+                            + 2 * KEY_HEADS * HEAD_DIM
+                            + value_head * HEAD_DIM
+                            + element;
+                        let weighted_value = bf16::from_f32(
+                            mixed_qkv_host[value_index].to_f32() * beta[gate_index].to_f32(),
+                        )
+                        .to_f32();
+                        let inverse_value = actual[inverse_index].to_f32();
+                        expected_w += inverse_value * weighted_key;
+                        expected_u += inverse_value * weighted_value;
+                    }
+                    let expected_w = bf16::from_f32(expected_w).to_f32();
+                    let expected_u = bf16::from_f32(expected_u).to_f32();
+                    let index = ((chunk_index * VALUE_HEADS + value_head) * PREFILL_CHUNK + row)
+                        * HEAD_DIM
+                        + element;
+                    let w_error = (actual_w[index].to_f32() - expected_w).abs();
+                    let u_error = (actual_u[index].to_f32() - expected_u).abs();
+                    max_abs_error = max_abs_error.max(w_error).max(u_error);
+                    if w_error > 0.02
+                        || u_error > 0.02
+                        || !actual_w[index].to_f32().is_finite()
+                        || !actual_u[index].to_f32().is_finite()
+                    {
+                        return Err(ModelError::Cuda(format!(
+                            "GDN prefill W/U mismatch at {index}: ({}, {}) != ({expected_w}, {expected_u})",
+                            actual_w[index].to_f32(),
+                            actual_u[index].to_f32(),
                         )));
                     }
                 }
