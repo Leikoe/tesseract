@@ -322,20 +322,25 @@ fn load_f32(
     stream: &Arc<Stream>,
 ) -> Result<F32Tensor, ModelError> {
     let tensor = source.tensor(name)?;
-    if tensor.dtype() != &WeightDtype::F32 {
-        return Err(ModelError::WrongDtype {
-            name: name.into(),
-            expected: WeightDtype::F32.to_string(),
-            actual: tensor.dtype().to_string(),
-        });
-    }
-    let host = Arc::new(
-        tensor
+    let host = Arc::new(match tensor.dtype() {
+        WeightDtype::F32 => tensor
             .bytes()
             .chunks_exact(4)
             .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             .collect::<Vec<_>>(),
-    );
+        WeightDtype::Bf16 => tensor
+            .bytes()
+            .chunks_exact(2)
+            .map(|bytes| bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32())
+            .collect::<Vec<_>>(),
+        actual => {
+            return Err(ModelError::WrongDtype {
+                name: name.into(),
+                expected: format!("{} or {}", WeightDtype::F32, WeightDtype::Bf16),
+                actual: actual.to_string(),
+            });
+        }
+    });
     let device = api::copy_host_vec_to_device(&host)
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("upload `{name}`: {error:?}")))?
