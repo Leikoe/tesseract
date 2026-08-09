@@ -119,9 +119,13 @@ mod kernels {
         output.store(activated);
 
         let input_state: Tile<bf16, { [256] }> = input.reshape(const_shape![256]);
+        let next_state_0: Tile<bf16, { [256] }> =
+            ftof(state_1.reshape(const_shape![256]), rounding::NearestEven);
+        let next_state_1: Tile<bf16, { [256] }> =
+            ftof(state_2.reshape(const_shape![256]), rounding::NearestEven);
         let _state_0_store = store_ptr_tko(
             state_0_pointer,
-            ftof(state_1.reshape(const_shape![256]), rounding::NearestEven),
+            next_state_0,
             ordering::Weak,
             None::<scope::TileBlock>,
             None,
@@ -130,7 +134,7 @@ mod kernels {
         );
         let _state_1_store = store_ptr_tko(
             state_1_pointer,
-            ftof(state_2.reshape(const_shape![256]), rounding::NearestEven),
+            next_state_1,
             ordering::Weak,
             None::<scope::TileBlock>,
             None,
