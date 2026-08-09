@@ -243,9 +243,8 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
     let rows = 3usize;
     let host = (0..rows * EXPERTS)
         .map(|index| {
-            let row = index / EXPERTS;
             let expert = index % EXPERTS;
-            bf16::from_f32((row * 13 + expert) as f32 / 32.0)
+            bf16::from_f32(expert as f32 / 256.0)
         })
         .collect::<Vec<_>>();
     let logits = api::copy_host_vec_to_device(&Arc::new(host))
