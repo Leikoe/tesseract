@@ -16,7 +16,7 @@ use crate::model::{
 
 use super::{
     cublas,
-    gdn::{self as gdn_backend, GdnState},
+    gdn::{self as gdn_backend, GdnPrefillPlan, GdnState},
     kernels,
     linear::{ExpertProjection, Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear},
     moe::{self as moe_backend, RoutingPlan},
@@ -255,12 +255,13 @@ impl Layer {
             + self.moe.device_bytes()
     }
 
-    fn forward_linear_decode(
+    fn forward_linear(
         &self,
         residual: Bf16Tensor,
         update: Option<Bf16Tensor>,
         state: &mut GdnState,
         state_slots: Arc<Tensor<i32>>,
+        prefill: Option<&GdnPrefillPlan>,
         rows: usize,
         epsilon: f32,
         stream: &Arc<Stream>,
@@ -290,8 +291,15 @@ impl Layer {
                 "linear decode called for a full-attention layer".into(),
             ));
         };
-        let attention_output =
-            attention.forward_decode(attention_input, state, state_slots, rows, epsilon, stream)?;
+        let attention_output = attention.forward(
+            attention_input,
+            state,
+            state_slots,
+            prefill,
+            rows,
+            epsilon,
+            stream,
+        )?;
         let (moe_input, residual) = gemma_add_rms_norm(
             residual,
             Arc::new(attention_output),
@@ -393,11 +401,13 @@ impl LinearAttention {
             + self.output.device_bytes()
     }
 
-    fn forward_decode(
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
         &self,
         hidden: Bf16Tensor,
         state: &mut GdnState,
         state_slots: Arc<Tensor<i32>>,
+        prefill: Option<&GdnPrefillPlan>,
         rows: usize,
         epsilon: f32,
         stream: &Arc<Stream>,
@@ -408,13 +418,24 @@ impl LinearAttention {
             return Err(ModelError::Cuda("invalid Qwen GDN input geometry".into()));
         }
         let mixed_qkv = Arc::new(self.input_qkv.enqueue(hidden.clone(), rows, stream)?);
-        let mixed_qkv = Arc::new(state.decode_conv(
-            mixed_qkv,
-            self.conv1d.clone(),
-            state_slots.clone(),
-            rows,
-            stream,
-        )?);
+        let mixed_qkv = Arc::new(match prefill {
+            Some(plan) => state.prefill_conv(
+                mixed_qkv,
+                self.conv1d.clone(),
+                plan.query_start_offsets(),
+                state_slots.clone(),
+                rows,
+                plan.requests(),
+                stream,
+            )?,
+            None => state.decode_conv(
+                mixed_qkv,
+                self.conv1d.clone(),
+                state_slots.clone(),
+                rows,
+                stream,
+            )?,
+        });
         let a = bf16_gemm(
             self.input_a.clone(),
             hidden.clone(),
@@ -433,16 +454,28 @@ impl LinearAttention {
             "Qwen GDN b projection",
             stream,
         )?;
-        let recurrent = Arc::new(state.decode(
-            mixed_qkv,
-            a,
-            b,
-            self.a_log.clone(),
-            self.dt_bias.clone(),
-            state_slots,
-            rows,
-            stream,
-        )?);
+        let recurrent = Arc::new(match prefill {
+            Some(plan) => state.prefill(
+                mixed_qkv,
+                a,
+                b,
+                self.a_log.clone(),
+                self.dt_bias.clone(),
+                state_slots,
+                plan,
+                stream,
+            )?,
+            None => state.decode(
+                mixed_qkv,
+                a,
+                b,
+                self.a_log.clone(),
+                self.dt_bias.clone(),
+                state_slots,
+                rows,
+                stream,
+            )?,
+        });
         let gate = self
             .input_z
             .enqueue(hidden, rows, stream)?

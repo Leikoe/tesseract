@@ -1254,6 +1254,7 @@ use kernels::{
 pub(crate) struct GdnPrefillPlan {
     chunk_starts: Arc<Tensor<i32>>,
     chunk_lengths: Arc<Tensor<i32>>,
+    query_start_offsets: Arc<Tensor<i32>>,
     request_chunk_offsets: Arc<Tensor<i32>>,
     chunks: usize,
     requests: usize,
@@ -1284,9 +1285,16 @@ impl GdnPrefillPlan {
             request_chunk_offsets[request + 1] += request_chunk_offsets[request];
         }
         let rows = offsets.last().copied().unwrap_or(0) as usize;
+        let query_start_offsets = offsets
+            .iter()
+            .copied()
+            .map(i32::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ModelError::Cuda("GDN query offset exceeds i32".into()))?;
         Ok(Self {
             chunk_starts: upload_i32(&starts, stream)?,
             chunk_lengths: upload_i32(&lengths, stream)?,
+            query_start_offsets: upload_i32(&query_start_offsets, stream)?,
             request_chunk_offsets: upload_i32(&request_chunk_offsets, stream)?,
             chunks: chunks.len(),
             requests,
@@ -1304,6 +1312,10 @@ impl GdnPrefillPlan {
 
     pub(crate) const fn requests(&self) -> usize {
         self.requests
+    }
+
+    pub(crate) fn query_start_offsets(&self) -> Arc<Tensor<i32>> {
+        self.query_start_offsets.clone()
     }
 }
 
