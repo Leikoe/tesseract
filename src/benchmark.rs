@@ -31,6 +31,8 @@ struct RequestResult {
     prompt: String,
     generated_prompt_tokens: Option<usize>,
     requested_output_tokens: usize,
+    client_queue_seconds: f64,
+    scheduled_e2e_seconds: f64,
     latency_seconds: f64,
     ttft_seconds: f64,
     mean_inter_token_seconds: f64,
@@ -63,6 +65,7 @@ struct RequestSpec<'a> {
     prompt: &'a str,
     generated_prompt_tokens: Option<usize>,
     output_len: usize,
+    client_queue_seconds: f64,
     seed: u64,
     index: usize,
 }
@@ -87,6 +90,8 @@ struct Summary {
     completion_tokens_per_second: f64,
     total_tokens_per_second: f64,
     peak_concurrency: usize,
+    client_queue_seconds: Distribution,
+    scheduled_e2e_seconds: Distribution,
     request_latency_seconds: Distribution,
     ttft_seconds: Distribution,
     time_per_output_token_seconds: Distribution,
@@ -180,6 +185,7 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
                     prompt: &prompt,
                     generated_prompt_tokens,
                     output_len,
+                    client_queue_seconds: 0.0,
                     seed,
                     index,
                 },
@@ -227,6 +233,7 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
                 }
             };
             let _in_flight = concurrency.enter();
+            let client_queue_seconds = due.elapsed().as_secs_f64();
             let outcome = match request_once(
                 &client,
                 RequestSpec {
@@ -236,6 +243,7 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
                     prompt: &prompt,
                     generated_prompt_tokens,
                     output_len,
+                    client_queue_seconds,
                     seed,
                     index,
                 },
@@ -291,6 +299,14 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
     );
     println!("Mean TTFT: {:.2} ms", summary.ttft_seconds.mean * 1000.0);
     println!("P99 TTFT: {:.2} ms", summary.ttft_seconds.p99 * 1000.0);
+    println!(
+        "P99 client queue: {:.2} ms",
+        summary.client_queue_seconds.p99 * 1000.0
+    );
+    println!(
+        "P99 scheduled E2E: {:.2} ms",
+        summary.scheduled_e2e_seconds.p99 * 1000.0
+    );
     println!(
         "Mean inter-token latency: {:.2} ms",
         summary.inter_token_seconds.mean * 1000.0
@@ -457,6 +473,8 @@ async fn request_once(client: &Client, request: RequestSpec<'_>) -> Result<Reque
         prompt: request.prompt.to_owned(),
         generated_prompt_tokens: request.generated_prompt_tokens,
         requested_output_tokens: request.output_len,
+        client_queue_seconds: request.client_queue_seconds,
+        scheduled_e2e_seconds: request.client_queue_seconds + latency_seconds,
         latency_seconds,
         ttft_seconds: token_times.first().copied().unwrap_or(latency_seconds),
         mean_inter_token_seconds: mean(&intervals),
@@ -570,6 +588,14 @@ fn summarize(results: &[RequestOutcome], wall_seconds: f64, peak_concurrency: us
         .iter()
         .map(|r| r.latency_seconds)
         .collect::<Vec<_>>();
+    let queue_delays = successful
+        .iter()
+        .map(|r| r.client_queue_seconds)
+        .collect::<Vec<_>>();
+    let scheduled_e2e = successful
+        .iter()
+        .map(|r| r.scheduled_e2e_seconds)
+        .collect::<Vec<_>>();
     let ttfts = successful
         .iter()
         .map(|r| r.ttft_seconds)
@@ -594,6 +620,8 @@ fn summarize(results: &[RequestOutcome], wall_seconds: f64, peak_concurrency: us
         completion_tokens_per_second: completion_tokens as f64 / wall_seconds,
         total_tokens_per_second: (prompt_tokens + completion_tokens) as f64 / wall_seconds,
         peak_concurrency,
+        client_queue_seconds: distribution(&queue_delays),
+        scheduled_e2e_seconds: distribution(&scheduled_e2e),
         request_latency_seconds: distribution(&latencies),
         ttft_seconds: distribution(&ttfts),
         time_per_output_token_seconds: distribution(&tpots),

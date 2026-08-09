@@ -1201,3 +1201,6 @@ you might want to look at how random dataset works in vllm bench
 ```text
 can we have serious benchmarks ?
 ```
+```text
+long context is more like 50%+ of the context of the model
+```
