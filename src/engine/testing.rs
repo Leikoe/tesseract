@@ -43,6 +43,11 @@ impl DeterministicExecutor {
         self
     }
 
+    pub fn with_hybrid_state(mut self, kv_capacity: usize, recurrent_capacity: usize) -> Self {
+        self.state_schema = StateSchema::try_hybrid(kv_capacity, recurrent_capacity).unwrap();
+        self
+    }
+
     pub fn failing_next_submission(mut self) -> Self {
         self.fail_next_submission = true;
         self

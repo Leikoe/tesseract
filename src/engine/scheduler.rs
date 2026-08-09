@@ -19,7 +19,7 @@ use crate::{config::EngineConfig, metrics::Metrics};
 use super::{
     ExecutionOutput, FinishReason, ForwardBatch, ForwardPhase, ForwardSequence, GenerateRequest,
     GeneratedTokens, GenerationEvent, GenerationParams, ModelExecutor, Position, RequestId,
-    SamplingInput, TokenId, Usage, kv::KvSlots,
+    SamplingInput, TokenId, Usage, kv::KvSlots, recurrent::RecurrentSlots,
 };
 
 #[derive(Debug, Error)]
@@ -348,6 +348,7 @@ struct EngineWorker<B> {
     config: EngineConfig,
     metrics: Arc<Metrics>,
     kv: KvSlots,
+    recurrent: Option<RecurrentSlots>,
     requests: HashMap<RequestId, RequestState>,
     waiting: VecDeque<RequestId>,
     running: VecDeque<RequestId>,
@@ -376,12 +377,23 @@ impl<B: ModelExecutor> EngineWorker<B> {
                 state_schema.arena_id()
             ));
         }
+        if let Some(physical_capacity) = state_schema.recurrent_capacity()
+            && config.max_running > physical_capacity
+        {
+            return Err(format!(
+                "engine requests {} recurrent-state slots but executor arena {} provides {physical_capacity}",
+                config.max_running,
+                state_schema.arena_id()
+            ));
+        }
         let model = executor.model();
         let kv = KvSlots::new(state_schema.arena_id(), config.kv_capacity_tokens);
+        let recurrent = state_schema.recurrent_capacity().map(RecurrentSlots::new);
         Ok(Self {
             executor,
             model,
             kv,
+            recurrent,
             config,
             metrics,
             requests: HashMap::new(),
@@ -602,9 +614,18 @@ impl<B: ModelExecutor> EngineWorker<B> {
             let Some(state) = self.requests.get(&id) else {
                 continue;
             };
-            if self.kv.reserve(id, state.reservation_tokens()) {
+            if !self.kv.reserve(id, state.reservation_tokens()) {
+                self.waiting.push_back(id);
+                continue;
+            }
+            let has_recurrent_slot = self
+                .recurrent
+                .as_mut()
+                .is_none_or(|slots| slots.allocate(id).is_some());
+            if has_recurrent_slot {
                 self.running.push_back(id);
             } else {
+                self.kv.release(id);
                 self.waiting.push_back(id);
             }
         }
@@ -664,22 +685,29 @@ impl<B: ModelExecutor> EngineWorker<B> {
                     )
                     .expect("validated generation parameters must form sampling input")
                 });
-                batch.push(
-                    ForwardSequence::try_new(
-                        *id,
-                        if is_decode {
-                            ForwardPhase::Decode
-                        } else {
-                            ForwardPhase::Prefill
-                        },
-                        Position::new(state.computed_tokens),
-                        token_ids,
-                        kv_slots,
-                        context_slots,
-                        sampling,
-                    )
-                    .expect("scheduler must construct a valid forward sequence"),
-                );
+                let sequence = ForwardSequence::try_new(
+                    *id,
+                    if is_decode {
+                        ForwardPhase::Decode
+                    } else {
+                        ForwardPhase::Prefill
+                    },
+                    Position::new(state.computed_tokens),
+                    token_ids,
+                    kv_slots,
+                    context_slots,
+                    sampling,
+                )
+                .expect("scheduler must construct a valid forward sequence");
+                let sequence = match self.recurrent.as_ref() {
+                    Some(slots) => sequence.with_recurrent_slot(
+                        slots
+                            .get(*id)
+                            .expect("running hybrid request must own recurrent state"),
+                    ),
+                    None => sequence,
+                };
+                batch.push(sequence);
                 budget -= num_tokens;
             }
         }
@@ -811,6 +839,9 @@ impl<B: ModelExecutor> EngineWorker<B> {
         self.waiting.retain(|candidate| *candidate != id);
         self.running.retain(|candidate| *candidate != id);
         self.kv.release(id);
+        if let Some(recurrent) = &mut self.recurrent {
+            recurrent.release(id);
+        }
         let elapsed = state.started_at.elapsed();
         self.metrics.observe_request_duration(elapsed);
 
@@ -847,6 +878,9 @@ impl<B: ModelExecutor> EngineWorker<B> {
         self.waiting.retain(|candidate| *candidate != id);
         self.running.retain(|candidate| *candidate != id);
         self.kv.release(id);
+        if let Some(recurrent) = &mut self.recurrent {
+            recurrent.release(id);
+        }
         let _ = state.output.try_send(GenerationEvent::Failed { message });
         self.metrics.request_failed();
         tracing::warn!(
@@ -965,6 +999,45 @@ mod tests {
             Err(EngineSpawnError::ExecutorInitialization(message))
                 if message.contains("provides 8")
         ));
+    }
+
+    #[test]
+    fn startup_rejects_insufficient_recurrent_state() {
+        let metrics = Arc::new(Metrics::default());
+        let result = EngineHandle::spawn(
+            "test-model",
+            DeterministicExecutor::new().with_hybrid_state(64, 1),
+            config(),
+            8,
+            metrics,
+        );
+        assert!(matches!(
+            result,
+            Err(EngineSpawnError::ExecutorInitialization(message))
+                if message.contains("recurrent-state slots") && message.contains("provides 1")
+        ));
+    }
+
+    #[test]
+    fn hybrid_requests_receive_exclusive_recurrent_slots() {
+        let metrics = Arc::new(Metrics::default());
+        let executor = DeterministicExecutor::new().with_hybrid_state(64, 2);
+        let mut worker = EngineWorker::new(executor, config(), metrics);
+        for _ in 0..2 {
+            let (output, _receiver) = mpsc::channel(8);
+            worker.add_request(request(1), output);
+        }
+        worker.admit_waiting();
+        let batch = worker.build_batch();
+        let slots = batch
+            .iter()
+            .map(|sequence| sequence.recurrent_slot().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(slots.len(), 2);
+
+        let released = batch[0].request_id();
+        worker.finish_request(released, FinishReason::Cancelled);
+        assert_eq!(worker.recurrent.as_ref().unwrap().get(released), None);
     }
 
     #[tokio::test]

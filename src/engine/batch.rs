@@ -50,6 +50,26 @@ impl KvSlot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct RecurrentSlot(u32);
+
+impl RecurrentSlot {
+    pub(crate) const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for RecurrentSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 impl std::fmt::Display for KvSlot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
@@ -159,6 +179,7 @@ pub struct ForwardSequence {
     token_ids: Vec<TokenId>,
     kv_slots: Vec<KvSlot>,
     context_slots: Vec<KvSlot>,
+    recurrent_slot: Option<RecurrentSlot>,
     sampling: Option<SamplingInput>,
 }
 
@@ -212,8 +233,14 @@ impl ForwardSequence {
             token_ids,
             kv_slots,
             context_slots,
+            recurrent_slot: None,
             sampling,
         })
+    }
+
+    pub(crate) fn with_recurrent_slot(mut self, slot: RecurrentSlot) -> Self {
+        self.recurrent_slot = Some(slot);
+        self
     }
 
     pub const fn request_id(&self) -> RequestId {
@@ -242,6 +269,10 @@ impl ForwardSequence {
 
     pub fn context_slots(&self) -> &[KvSlot] {
         &self.context_slots
+    }
+
+    pub const fn recurrent_slot(&self) -> Option<RecurrentSlot> {
+        self.recurrent_slot
     }
 
     pub const fn should_sample(&self) -> bool {
@@ -309,6 +340,10 @@ pub enum ForwardBatchError {
     DuplicateRequest { request_id: RequestId },
     #[error("physical KV slot {slot} is assigned more than once in one forward batch")]
     DuplicateKvSlot { slot: KvSlot },
+    #[error(
+        "recurrent-state slot {slot} is assigned to more than one request in one forward batch"
+    )]
+    DuplicateRecurrentSlot { slot: RecurrentSlot },
     #[error("forward token count overflowed")]
     TokenCountOverflow,
     #[error("scheduled range for request {request_id} overflowed")]
@@ -324,6 +359,7 @@ impl ForwardBatch {
     ) -> Result<Self, ForwardBatchError> {
         let mut request_ids = HashSet::with_capacity(sequences.len());
         let mut kv_slots = HashSet::new();
+        let mut recurrent_slots = HashSet::new();
 
         for sequence in &sequences {
             if !request_ids.insert(sequence.request_id) {
@@ -335,6 +371,11 @@ impl ForwardBatch {
                 if !kv_slots.insert(slot) {
                     return Err(ForwardBatchError::DuplicateKvSlot { slot });
                 }
+            }
+            if let Some(slot) = sequence.recurrent_slot
+                && !recurrent_slots.insert(slot)
+            {
+                return Err(ForwardBatchError::DuplicateRecurrentSlot { slot });
             }
         }
 
@@ -544,6 +585,18 @@ mod tests {
             .unwrap_err(),
             ForwardBatchError::DuplicateKvSlot {
                 slot: KvSlot::new(1),
+            }
+        );
+
+        let first_sequence = sequence(first, ForwardPhase::Prefill, 0, &[2])
+            .with_recurrent_slot(RecurrentSlot::new(7));
+        let second_sequence = sequence(second, ForwardPhase::Prefill, 0, &[3])
+            .with_recurrent_slot(RecurrentSlot::new(7));
+        assert_eq!(
+            ForwardBatch::try_from_sequences(arena_id, vec![first_sequence, second_sequence],)
+                .unwrap_err(),
+            ForwardBatchError::DuplicateRecurrentSlot {
+                slot: RecurrentSlot::new(7),
             }
         );
     }

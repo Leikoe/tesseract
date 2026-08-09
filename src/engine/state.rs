@@ -32,6 +32,7 @@ impl std::fmt::Display for StateArenaId {
 #[non_exhaustive]
 pub enum StateGroupKind {
     FlatKv,
+    Recurrent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,8 @@ pub struct StateSchema {
 pub enum StateSchemaError {
     #[error("flat-KV capacity must be in 1..={}", u32::MAX)]
     InvalidFlatKvCapacity,
+    #[error("recurrent-state capacity must be in 1..={}", u32::MAX)]
+    InvalidRecurrentCapacity,
     #[error("process-local state arena IDs are exhausted")]
     ArenaIdsExhausted,
 }
@@ -80,6 +83,31 @@ impl StateSchema {
         })
     }
 
+    pub fn try_hybrid(
+        flat_kv_capacity: usize,
+        recurrent_capacity: usize,
+    ) -> Result<Self, StateSchemaError> {
+        if flat_kv_capacity == 0 || flat_kv_capacity > u32::MAX as usize {
+            return Err(StateSchemaError::InvalidFlatKvCapacity);
+        }
+        if recurrent_capacity == 0 || recurrent_capacity > u32::MAX as usize {
+            return Err(StateSchemaError::InvalidRecurrentCapacity);
+        }
+        Ok(Self {
+            arena_id: StateArenaId::fresh()?,
+            groups: vec![
+                StateGroupSpec {
+                    kind: StateGroupKind::FlatKv,
+                    capacity: flat_kv_capacity,
+                },
+                StateGroupSpec {
+                    kind: StateGroupKind::Recurrent,
+                    capacity: recurrent_capacity,
+                },
+            ],
+        })
+    }
+
     pub const fn arena_id(&self) -> StateArenaId {
         self.arena_id
     }
@@ -92,6 +120,13 @@ impl StateSchema {
         self.groups
             .iter()
             .find(|group| group.kind == StateGroupKind::FlatKv)
+            .map(|group| group.capacity)
+    }
+
+    pub fn recurrent_capacity(&self) -> Option<usize> {
+        self.groups
+            .iter()
+            .find(|group| group.kind == StateGroupKind::Recurrent)
             .map(|group| group.capacity)
     }
 }
@@ -119,6 +154,19 @@ mod tests {
             prop_assert_eq!(schema.flat_kv_capacity(), Some(capacity));
             prop_assert_eq!(schema.groups().len(), 1);
             prop_assert_eq!(schema.groups()[0].kind(), StateGroupKind::FlatKv);
+        }
+
+
+        #[test]
+        fn hybrid_schema_preserves_both_capacities(
+            flat_kv_capacity in 1usize..1_000_000,
+            recurrent_capacity in 1usize..10_000,
+        ) {
+            let schema = StateSchema::try_hybrid(flat_kv_capacity, recurrent_capacity).unwrap();
+            prop_assert_eq!(schema.flat_kv_capacity(), Some(flat_kv_capacity));
+            prop_assert_eq!(schema.recurrent_capacity(), Some(recurrent_capacity));
+            prop_assert_eq!(schema.groups().len(), 2);
+            prop_assert_eq!(schema.groups()[1].kind(), StateGroupKind::Recurrent);
         }
     }
 }

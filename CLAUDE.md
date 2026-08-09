@@ -209,6 +209,8 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 </codex_internal_context>
 ```
 
+when u need scalar consts, create them the line above the constant() tile. `const X: f32 = 1.0/512.0;`
+
 ## User
 
 <codex_internal_context source="goal">

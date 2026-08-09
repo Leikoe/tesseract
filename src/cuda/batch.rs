@@ -14,6 +14,7 @@ pub(crate) struct CudaBatch {
     pub positions: Vec<u32>,
     pub current_slots: Vec<u32>,
     pub request_indices: Vec<u32>,
+    pub recurrent_slots: Vec<Option<u32>>,
     pub context_lengths: Vec<i32>,
     pub(super) context_storage: Vec<Vec<u32>>,
     pub(super) num_requests: usize,
@@ -29,6 +30,7 @@ impl CudaBatch {
         self.positions.clear();
         self.current_slots.clear();
         self.request_indices.clear();
+        self.recurrent_slots.clear();
         self.context_lengths.clear();
         self.sample_rows.clear();
         self.samples.clear();
@@ -36,6 +38,7 @@ impl CudaBatch {
         self.positions.reserve(batch.num_tokens());
         self.current_slots.reserve(batch.num_tokens());
         self.request_indices.reserve(batch.num_tokens());
+        self.recurrent_slots.reserve(batch.len());
         self.context_lengths.reserve(batch.num_tokens());
         self.context_storage.resize_with(batch.len(), Vec::new);
         for context in &mut self.context_storage[..batch.len()] {
@@ -54,6 +57,8 @@ impl CudaBatch {
                 .ok_or(BatchLoweringError::PositionOverflow(request_id))?;
             let request_index = SequenceIndex::try_from_usize(request_index)
                 .map_err(|_| BatchLoweringError::TooManySequences)?;
+            self.recurrent_slots
+                .push(sequence.recurrent_slot().map(|slot| slot.get()));
             let query_range = batch.query_range(request_index);
             self.request_indices
                 .extend(std::iter::repeat_n(request_index.get(), query_range.len()));
@@ -148,6 +153,7 @@ mod tests {
         assert_eq!(lowered.positions, [0, 1, 2]);
         assert_eq!(lowered.current_slots, [0, 1, 4]);
         assert_eq!(lowered.request_indices, [0, 0, 1]);
+        assert_eq!(lowered.recurrent_slots, [None, None]);
         assert_eq!(lowered.context_lengths, [1, 2, 3]);
         assert_eq!(lowered.contexts(), [vec![0, 1], vec![2, 3, 4]]);
         assert_eq!(lowered.sample_rows, [2]);
@@ -211,6 +217,7 @@ mod tests {
         assert_eq!(lowered.positions, [0]);
         assert_eq!(lowered.current_slots, [3]);
         assert_eq!(lowered.request_indices, [0]);
+        assert_eq!(lowered.recurrent_slots, [None]);
         assert_eq!(lowered.context_lengths, [1]);
         assert_eq!(lowered.contexts(), [vec![3]]);
         assert_eq!(lowered.sample_rows, [0]);

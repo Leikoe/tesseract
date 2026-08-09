@@ -1,6 +1,7 @@
 mod batch;
 mod executor;
 mod kv;
+mod recurrent;
 mod sampling;
 mod scheduler;
 mod state;
@@ -11,7 +12,7 @@ pub mod testing;
 
 pub use batch::{
     ForwardBatch, ForwardBatchError, ForwardKind, ForwardPhase, ForwardSequence, KvSlot, Position,
-    QueryRow, SamplingInput, SequenceIndex, TokenId,
+    QueryRow, RecurrentSlot, SamplingInput, SequenceIndex, TokenId,
 };
 #[cfg(any(test, feature = "cuda", feature = "test-backend"))]
 pub(crate) use executor::ImmediateCompletion;
