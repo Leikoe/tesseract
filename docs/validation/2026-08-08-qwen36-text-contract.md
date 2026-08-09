@@ -1,55 +1,44 @@
-# Qwen3.6 text checkpoint contract validation
+# Qwen3.6 text checkpoint parsing
 
-Tesseract now recognizes `Qwen3_5MoeForConditionalGeneration` with outer model
+Tesseract recognizes `Qwen3_5MoeForConditionalGeneration` with outer model
 type `qwen3_5_moe` as the text-only Qwen3.5/3.6 MoE architecture. Recognition
-uses `config.json`; it does not depend on the deployment model ID.
+comes from `config.json`, not the deployment model ID.
 
-The adapter validates before GPU allocation:
+The adapter parses the nested text configuration, including the 40-layer
+`linear, linear, linear, full` hybrid schedule, attention and recurrent-state
+geometry, MoE dimensions, tokenizer ids, and context limits. Semantic checks
+only reject configurations the current implementation cannot interpret
+safely.
 
-- the exact 40-layer `linear, linear, linear, full` hybrid schedule;
-- full-attention, gated-delta/linear-attention, partial-RoPE, recurrent-state,
-  MoE, special-token, and context geometry;
-- the complete ModelOpt FP8 and NVFP4 target sets, rejecting missing,
-  duplicated, or unexpected targets; and
-- all 124,116 text and LM-head tensor roles, including dtype, stored shape,
-  scalar scales, packed NVFP4 dimensions, and exact byte length.
+Quantization is discovered from the checkpoint's own
+`quantization_config`: `quant_method = modelopt` and `quant_algo =
+MIXED_PRECISION`. Its authoritative `quantized_layers` map parses to 291
+entries: 130 FP8 projections and 161 W4A16-NVFP4 projections with group size
+16. Tesseract does not reconstruct the producer's target list or a complete
+expected tensor manifest.
 
-The language manifest deliberately excludes 333 vision tensors and 19 MTP
-tensors from the pinned checkpoint. Their presence is accepted in the source,
-but they are not loaded into the text program. The CUDA construction methods
-currently return an explicit unsupported-execution error until the hybrid
-program and SM80 quantized kernels exist; architecture recognition alone is
-not presented as runnable model support.
+`SafeTensorSource` maps the index and parses each shard header once. It checks
+that index entries refer to real byte ranges, but model artifacts consume and
+interpret only the tensors they need. Vision and MTP tensors can coexist with
+the text program without appearing in a hand-maintained exclusion manifest.
 
-Tokenizer mechanics and incremental decoding now live in the shared private
-`model::tokenizer` module. Llama retains its own template and warmup text but no
-longer duplicates tokenizer loading or streaming reconstruction. The Llama
-adapter is 491 lines. Qwen is separated into a 481-line frontend/config adapter,
-a 303-line tensor contract module, and a 177-line test module.
-
-Host verification on 2026-08-08:
+On the A100 node, the actual checkpoint parses successfully:
 
 ```text
-cargo fmt --check
-cargo test --all-targets                 56 passed
-cargo clippy --all-targets -- -D warnings
+model_id=nvidia/Qwen3.6-35B-A3B-NVFP4
+architecture=Qwen3_5MoeForConditionalGeneration
+dtype=bfloat16
+layers=40
+hidden_size=2048
+attention_heads=16
+kv_heads=2
+vocab_size=248320
+tensors=124468
+model_load=ok
 ```
 
-The actual public `config.json` from the model repository passed config and
-quantization validation; a metadata-only `model-check` proceeded to opening the
-first absent weight shard, proving that architecture/config validation—not a
-fixture approximation—accepted the published config.
-
-The complete pinned 23.5 GB checkpoint was then downloaded to the A100 node.
-`model-check --model nvidia/Qwen3.6-35B-A3B-NVFP4` validated all three mapped
-shards and reported 124,468 source tensors, 40 layers, and `validation=ok` in
-6.38 seconds with 557,432 KiB peak resident memory. This is real checkpoint
-validation; CUDA execution remains explicitly unavailable until the hybrid and
-SM80 quantized programs land.
-
-The subsequent SM80 capability probe established that cuTile/CUDA 13.3 rejects
-the tutorial's typed `mmaf_scaled` path on A100 (`f8E4M3FN` is unsupported),
-while a byte-stored FP4/E4M3 decode followed by BF16 `mma` executes with zero
-error for one complete scale group. See
-`2026-08-08-sm80-nvfp4-capabilities.md`. This validates the fallback's primitive
-operations, not the pending full Qwen projection or forward pass.
+The SM80 cuTile probes separately establish exact host-oracle agreement for
+packed dense and persistent grouped W4A16 leaves. They do not yet establish a
+complete Qwen forward pass or production throughput. See
+`2026-08-08-sm80-nvfp4-capabilities.md` and
+`../sglang-quantized-loading.md`.

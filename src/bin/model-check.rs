@@ -10,7 +10,7 @@ use tesseract::{
 #[derive(Debug, Parser)]
 #[command(
     name = "tesseract-model-check",
-    about = "Validate a Tesseract model checkpoint without allocating GPU memory"
+    about = "Load and inspect a Tesseract model without allocating GPU memory"
 )]
 struct Args {
     #[arg(long, default_value = DEFAULT_MODEL_ID)]
@@ -21,8 +21,7 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let model = model::load(&args.model, &args.model_path)
-        .context("model validation and loading failed")?;
+    let model = model::load(&args.model, &args.model_path).context("model loading failed")?;
     let prompt = model
         .render_chat(&[ChatMessage {
             role: ChatRole::User,
@@ -42,6 +41,6 @@ fn main() -> anyhow::Result<()> {
     println!("vocab_size={}", summary.vocab_size);
     println!("tensors={}", summary.tensors);
     println!("tokenizer_probe_tokens={}", probe.len());
-    println!("validation=ok");
+    println!("model_load=ok");
     Ok(())
 }
