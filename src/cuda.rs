@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use cuda_async::device_operation::DeviceOp;
 use cuda_async::{cuda_graph::CudaGraph, error::DeviceError};
-use cuda_core::Device;
+use cuda_core::{Device, f4e2m1fnx2, f8e4m3fn};
 use cutile::{
     api,
     core::bf16,
@@ -40,6 +40,52 @@ mod smoke_kernels {
     }
 }
 
+#[cutile::module]
+mod nvfp4_probe_kernels {
+    use cutile::core::*;
+
+    /// Exercises cuTile's scaled FP4 matrix multiply exactly as an inference
+    /// kernel would. The host deliberately applies no architecture-name gate:
+    /// successful compilation and numerically correct execution are the
+    /// capability test, whether cuTile uses hardware instructions or a lower
+    /// level fallback for the target architecture.
+    #[cutile::entry()]
+    fn scaled_mma<
+        const BM: i32,
+        const BN: i32,
+        const BK: i32,
+        const BK_PACKED: i32,
+        const BK_SCALES: i32,
+    >(
+        out: &mut Tensor<f32, { [BM, BN] }>,
+        lhs: &Tensor<f4e2m1fnx2, { [-1, -1] }>,
+        rhs: &Tensor<f4e2m1fnx2, { [-1, -1] }>,
+        lhs_scales: &Tensor<f8e4m3fn, { [-1, -1] }>,
+        rhs_scales: &Tensor<f8e4m3fn, { [-1, -1] }>,
+    ) {
+        let pid = get_tile_block_id();
+        let k_tiles = Dim::new(lhs.shape()[1] / BK_PACKED);
+        let lhs = lhs.partition(const_shape![BM, BK_PACKED]);
+        let rhs = rhs.partition(const_shape![BN, BK_PACKED]);
+        let lhs_scales = lhs_scales.partition(const_shape![BM, BK_SCALES]);
+        let rhs_scales = rhs_scales.partition(const_shape![BN, BK_SCALES]);
+        let mut accumulator = constant(0.0f32, const_shape![BM, BN]);
+
+        for k_tile in k_tiles {
+            let lhs = lhs.load([pid.0, k_tile]).unpack(const_shape![BM, BK]);
+            let rhs = rhs
+                .load([pid.1, k_tile])
+                .unpack(const_shape![BN, BK])
+                .transpose();
+            let lhs_scales = lhs_scales.load([pid.0, k_tile]);
+            let rhs_scales = rhs_scales.load([pid.1, k_tile]).transpose();
+            accumulator = mmaf_scaled(lhs, rhs, accumulator, lhs_scales, rhs_scales);
+        }
+        out.store(accumulator);
+    }
+}
+
+use nvfp4_probe_kernels::scaled_mma;
 use smoke_kernels::add_bf16;
 
 const SMOKE_ELEMENTS: usize = 4096;
@@ -50,6 +96,18 @@ pub struct Bf16SmokeReport {
     pub device_id: usize,
     pub elements: usize,
     pub gemm_rows: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Nvfp4ScaledMmaStatus {
+    Available { max_abs_error: f32 },
+    Unavailable { detail: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Nvfp4ScaledMmaReport {
+    pub device_id: usize,
+    pub status: Nvfp4ScaledMmaStatus,
 }
 
 #[derive(Debug, Error)]
@@ -65,8 +123,107 @@ pub enum CudaError {
     },
     #[error("BF16 cuTile validation produced {actual} at element {index}; expected 2")]
     WrongValue { index: usize, actual: f32 },
+    #[error("cuTile scaled NVFP4 MMA produced {actual} at element {index}; expected {expected}")]
+    WrongNvfp4Value {
+        index: usize,
+        actual: f32,
+        expected: f32,
+    },
     #[error(transparent)]
     Cublas(#[from] cublas::CublasError),
+}
+
+/// Attempts cuTile's scaled NVFP4 MMA on the requested device and validates
+/// every output numerically. An unsupported compiler/runtime path is reported
+/// as a capability result rather than inferred from the GPU model name.
+pub fn probe_nvfp4_scaled_mma(device_id: usize) -> Result<Nvfp4ScaledMmaReport, CudaError> {
+    use cutile::tile_kernel::{PartitionOp, TileKernel};
+
+    const TILE: usize = 16;
+    const K: usize = 128;
+    const K_TILE: usize = 64;
+
+    enable_persistent_cubin_cache()?;
+    let device = Device::new(device_id).map_err(|error| CudaError::Device {
+        device_id,
+        message: format!("{error:?}"),
+    })?;
+    let stream = device.new_stream().map_err(|error| CudaError::Device {
+        device_id,
+        message: format!("failed to create stream: {error:?}"),
+    })?;
+
+    // 0x2 is FP4 +1.0 and 0x38 is E4M3 +1.0. Thus every result must be K.
+    let fp4_one = f4e2m1fnx2::from_nibbles(0x2, 0x2);
+    let scale_one = f8e4m3fn(0x38);
+    let lhs = api::copy_host_vec_to_device(&Arc::new(vec![fp4_one; TILE * K / 2]))
+        .reshape(&[TILE, K / 2])
+        .sync_on(&stream)
+        .map_err(|error| nvfp4_kernel_error("upload lhs", error))?
+        .into();
+    let rhs = api::copy_host_vec_to_device(&Arc::new(vec![fp4_one; TILE * K / 2]))
+        .reshape(&[TILE, K / 2])
+        .sync_on(&stream)
+        .map_err(|error| nvfp4_kernel_error("upload rhs", error))?
+        .into();
+    let lhs_scales = api::copy_host_vec_to_device(&Arc::new(vec![scale_one; TILE * K / 16]))
+        .reshape(&[TILE, K / 16])
+        .sync_on(&stream)
+        .map_err(|error| nvfp4_kernel_error("upload lhs scales", error))?
+        .into();
+    let rhs_scales = api::copy_host_vec_to_device(&Arc::new(vec![scale_one; TILE * K / 16]))
+        .reshape(&[TILE, K / 16])
+        .sync_on(&stream)
+        .map_err(|error| nvfp4_kernel_error("upload rhs scales", error))?
+        .into();
+    let out = api::zeros::<f32>(&[TILE, TILE])
+        .sync_on(&stream)
+        .map_err(|error| nvfp4_kernel_error("allocate output", error))?
+        .partition([TILE, TILE]);
+
+    let launch = scaled_mma(out, lhs, rhs, lhs_scales, rhs_scales)
+        .generics(vec![
+            TILE.to_string(),
+            TILE.to_string(),
+            K_TILE.to_string(),
+            (K_TILE / 2).to_string(),
+            (K_TILE / 16).to_string(),
+        ])
+        .sync_on(&stream);
+    let (out, ..) = match launch {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            return Ok(Nvfp4ScaledMmaReport {
+                device_id,
+                status: Nvfp4ScaledMmaStatus::Unavailable {
+                    detail: format!("{error:?}"),
+                },
+            });
+        }
+    };
+
+    let host: Vec<f32> = Arc::new(out.unpartition())
+        .to_host_vec()
+        .sync_on(&stream)
+        .map_err(|error| nvfp4_kernel_error("copy output to host", error))?;
+    let expected = K as f32;
+    let mut max_abs_error = 0.0f32;
+    for (index, actual) in host.into_iter().enumerate() {
+        let error = (actual - expected).abs();
+        max_abs_error = max_abs_error.max(error);
+        if !actual.is_finite() || error > 1.0e-3 {
+            return Err(CudaError::WrongNvfp4Value {
+                index,
+                actual,
+                expected,
+            });
+        }
+    }
+
+    Ok(Nvfp4ScaledMmaReport {
+        device_id,
+        status: Nvfp4ScaledMmaStatus::Available { max_abs_error },
+    })
 }
 
 /// Enables cuTile's process-wide persistent CUBIN cache.
@@ -355,5 +512,12 @@ fn kernel_error(operation: &'static str, error: impl std::fmt::Debug) -> CudaErr
     CudaError::Bf16Kernel {
         operation,
         message: format!("{error:?}"),
+    }
+}
+
+fn nvfp4_kernel_error(operation: &'static str, error: impl std::fmt::Debug) -> CudaError {
+    CudaError::Bf16Kernel {
+        operation,
+        message: format!("NVFP4 probe: {error:?}"),
     }
 }

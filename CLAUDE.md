@@ -149,6 +149,10 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 ```
 
 ```text
+you should verify what actually works and what does. cutile might just as well do emulation correctly on sm80
+```
+
+```text
 <codex_internal_context source="goal">
 Continue working toward the active thread goal.
 
