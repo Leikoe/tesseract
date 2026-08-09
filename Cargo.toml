@@ -37,6 +37,9 @@ http-body-util = "0.1"
 proptest = "1.11"
 tempfile = "3"
 
+[build-dependencies]
+cc = "1"
+
 [features]
 default = []
 cuda = [

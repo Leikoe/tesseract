@@ -228,6 +228,10 @@ you might want to systematically benchmark kernels one vs another.
 ```
 
 ```text
+You should extract and benchmark the marlin kernel yourself.
+```
+
+```text
 did you read sglang's kernels ? (or tokenspeed's)
 ```
 

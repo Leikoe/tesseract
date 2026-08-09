@@ -2257,6 +2257,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "cc",
  "clap",
  "cuda-async",
  "cuda-core",
