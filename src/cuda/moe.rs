@@ -11,7 +11,10 @@ use cutile::{
     tile_kernel::TileKernel,
 };
 
-use crate::{cuda::execution::StreamExecution, model::ModelError};
+use crate::{
+    cuda::{execution::StreamExecution, workspace::ExecutionWorkspace},
+    model::ModelError,
+};
 
 const TOP_K: usize = 8;
 const EXPERTS: usize = 256;
@@ -345,9 +348,10 @@ impl RoutingPlan {
         logits: Arc<Tensor<bf16>>,
         rows: usize,
         execution: &mut StreamExecution<'_>,
+        workspace: &mut ExecutionWorkspace,
     ) -> Result<Self, ModelError> {
         execution.mark_pending();
-        let stream = execution.stream();
+        let stream = execution.stream().clone();
         if rows == 0
             || logits.shape().len() != 2
             || logits.shape()[0] < rows as i32
@@ -366,12 +370,17 @@ impl RoutingPlan {
             .next_multiple_of(TILE_M);
         // SAFETY: all routing operations are ordered on the model-owned stream
         // and remain device-only until the layer boundary synchronization.
-        let counts = unsafe { api::zeros::<i32>(&[EXPERTS]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate expert counts: {error:?}")))?;
-        let mut expert_ids = unsafe { api::zeros::<i32>(&[rows, TOP_K]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate expert IDs: {error:?}")))?;
-        let mut weights = unsafe { api::zeros::<f32>(&[rows, TOP_K]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate routing weights: {error:?}")))?;
+        let counts = workspace.take_zeroed_i32(
+            &[EXPERTS],
+            execution,
+            "allocate expert counts",
+            "clear expert counts",
+        )?;
+        let counts = Arc::new(counts);
+        let mut expert_ids =
+            workspace.take_i32(&[rows, TOP_K], execution, "allocate expert IDs")?;
+        let mut weights =
+            workspace.take_f32(&[rows, TOP_K], execution, "allocate routing weights")?;
         let (_, expert_ids_partition, weights_partition, _) = unsafe {
             top8_router_256(
                 logits,
@@ -379,46 +388,55 @@ impl RoutingPlan {
                 (&mut weights).partition([1, TOP_K]),
                 counts.device_pointer(),
             )
-            .async_on(stream)
+            .async_on(&stream)
         }
         .map_err(|error| ModelError::Cuda(format!("execute top-8 routing: {error:?}")))?;
         drop(expert_ids_partition);
         drop(weights_partition);
         // SAFETY: this launch follows the router on the same stream.
         let (weights_partition,) =
-            unsafe { renormalize_top8((&mut weights).partition([1, TOP_K])).async_on(stream) }
+            unsafe { renormalize_top8((&mut weights).partition([1, TOP_K])).async_on(&stream) }
                 .map_err(|error| {
                     ModelError::Cuda(format!("renormalize top-8 routing: {error:?}"))
                 })?;
         drop(weights_partition);
         let expert_ids = Arc::new(expert_ids);
 
-        let mut starts = unsafe { api::zeros::<i32>(&[EXPERTS]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate expert starts: {error:?}")))?;
-        let mut cursors = unsafe { api::zeros::<i32>(&[EXPERTS]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate expert cursors: {error:?}")))?;
+        let mut starts = workspace.take_zeroed_i32(
+            &[EXPERTS],
+            execution,
+            "allocate expert starts",
+            "clear expert starts",
+        )?;
+        let mut cursors = workspace.take_zeroed_i32(
+            &[EXPERTS],
+            execution,
+            "allocate expert cursors",
+            "clear expert cursors",
+        )?;
         // SAFETY: count production and this scan are ordered on `stream`.
         let (_, starts_partition, cursors_partition) = unsafe {
             aligned_expert_prefix(
-                Arc::new(counts),
+                counts.clone(),
                 (&mut starts).partition([EXPERTS]),
                 (&mut cursors).partition([EXPERTS]),
             )
-            .async_on(stream)
+            .async_on(&stream)
         }
         .map_err(|error| ModelError::Cuda(format!("scan expert counts: {error:?}")))?;
         drop(starts_partition);
         drop(cursors_partition);
+        workspace.retire_shared_i32(counts, "expert counts")?;
         let starts = Arc::new(starts);
-        let mut positions = unsafe { api::zeros::<i32>(&[rows, TOP_K]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate dispatch positions: {error:?}")))?;
+        let mut positions =
+            workspace.take_i32(&[rows, TOP_K], execution, "allocate dispatch positions")?;
         let (_, positions_partition, _) = unsafe {
             assign_dispatch_rows(
                 expert_ids.clone(),
                 (&mut positions).partition([1, 1]),
                 cursors.device_pointer(),
             )
-            .async_on(stream)
+            .async_on(&stream)
         }
         .map_err(|error| ModelError::Cuda(format!("assign expert dispatch rows: {error:?}")))?;
         drop(positions_partition);
@@ -439,9 +457,10 @@ impl RoutingPlan {
         rows: usize,
         hidden_size: usize,
         execution: &mut StreamExecution<'_>,
+        workspace: &mut ExecutionWorkspace,
     ) -> Result<Dispatched, ModelError> {
         execution.mark_pending();
-        let stream = execution.stream();
+        let stream = execution.stream().clone();
         const BLOCK: usize = 256;
         if hidden_size == 0
             || !hidden_size.is_multiple_of(BLOCK)
@@ -454,12 +473,18 @@ impl RoutingPlan {
         }
         // SAFETY: routing metadata, allocation, and consumers are ordered on
         // the same stream and remain device-only through the MoE pipeline.
-        let dispatched = unsafe {
-            api::zeros::<bf16>(&[self.max_dispatched_rows, hidden_size]).async_on(stream)
-        }
-        .map_err(|error| ModelError::Cuda(format!("allocate dispatched rows: {error:?}")))?;
-        let mut tickets = unsafe { api::zeros::<i32>(&[rows, TOP_K]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate dispatch tickets: {error:?}")))?;
+        let dispatched = workspace.take_zeroed_bf16(
+            &[self.max_dispatched_rows, hidden_size],
+            execution,
+            "allocate dispatched rows",
+            "clear dispatched rows",
+        )?;
+        let mut tickets = workspace.take_zeroed_i32(
+            &[rows, TOP_K],
+            execution,
+            "allocate dispatch tickets",
+            "clear dispatch tickets",
+        )?;
         let (_, _, tickets_partition, _) = unsafe {
             dispatch_bf16(
                 hidden,
@@ -468,15 +493,15 @@ impl RoutingPlan {
                 dispatched.device_pointer(),
             )
             .generics(vec![hidden_size.to_string(), BLOCK.to_string()])
-            .async_on(stream)
+            .async_on(&stream)
         }
         .map_err(|error| ModelError::Cuda(format!("dispatch MoE activations: {error:?}")))?;
         drop(tickets_partition);
-        drop(tickets);
+        workspace.retire_i32(tickets);
 
         let row_tiles = self.max_dispatched_rows.div_ceil(TILE_M);
-        let mut expert_by_tile = unsafe { api::zeros::<i32>(&[row_tiles]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate expert row map: {error:?}")))?;
+        let mut expert_by_tile =
+            workspace.take_i32(&[row_tiles], execution, "allocate expert row map")?;
         // SAFETY: prefix metadata and this map construction share `stream`.
         let (_, _, expert_by_tile_partition) = unsafe {
             expert_by_row_tile(
@@ -484,7 +509,7 @@ impl RoutingPlan {
                 self.ends.clone(),
                 (&mut expert_by_tile).partition([1]),
             )
-            .async_on(stream)
+            .async_on(&stream)
         }
         .map_err(|error| ModelError::Cuda(format!("build expert row map: {error:?}")))?;
         drop(expert_by_tile_partition);
@@ -501,9 +526,10 @@ impl RoutingPlan {
         output_rows: usize,
         hidden_size: usize,
         execution: &mut StreamExecution<'_>,
+        workspace: &mut ExecutionWorkspace,
     ) -> Result<Tensor<bf16>, ModelError> {
         execution.mark_pending();
-        let stream = execution.stream();
+        let stream = execution.stream().clone();
         const BLOCK: usize = 256;
         if hidden_size == 0
             || !hidden_size.is_multiple_of(BLOCK)
@@ -514,12 +540,18 @@ impl RoutingPlan {
         }
         // SAFETY: the output remains device-only and is consumed on `stream`
         // before the final shared-expert combine synchronizes the layer.
-        let output = unsafe { api::zeros::<bf16>(&[output_rows, hidden_size]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate MoE output: {error:?}")))?;
-        let mut tickets =
-            unsafe { api::zeros::<i32>(&[rows, hidden_size / BLOCK]).async_on(stream) }.map_err(
-                |error| ModelError::Cuda(format!("allocate MoE combine tickets: {error:?}")),
-            )?;
+        let output = workspace.take_zeroed_bf16(
+            &[output_rows, hidden_size],
+            execution,
+            "allocate MoE output",
+            "clear MoE output",
+        )?;
+        let mut tickets = workspace.take_zeroed_i32(
+            &[rows, hidden_size / BLOCK],
+            execution,
+            "allocate MoE combine tickets",
+            "clear MoE combine tickets",
+        )?;
         let (_, _, _, tickets_partition, _) = unsafe {
             combine_top8_bf16(
                 expert_output,
@@ -529,12 +561,21 @@ impl RoutingPlan {
                 output.device_pointer(),
             )
             .generics(vec![hidden_size.to_string(), BLOCK.to_string()])
-            .async_on(stream)
+            .async_on(&stream)
         }
         .map_err(|error| ModelError::Cuda(format!("combine expert outputs: {error:?}")))?;
         drop(tickets_partition);
-        drop(tickets);
+        workspace.retire_i32(tickets);
         Ok(output)
+    }
+
+    pub(crate) fn retire(self, workspace: &mut ExecutionWorkspace) -> Result<(), ModelError> {
+        workspace.retire_shared_i32(self.expert_ids, "expert IDs")?;
+        workspace.retire_shared_f32(self.weights, "routing weights")?;
+        workspace.retire_shared_i32(self.starts, "expert starts")?;
+        workspace.retire_shared_i32(self.ends, "expert ends")?;
+        workspace.retire_shared_i32(self.positions, "dispatch positions")?;
+        Ok(())
     }
 }
 
@@ -545,6 +586,7 @@ pub(crate) struct RoutingProbe {
 
 pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
     let mut execution = StreamExecution::new(stream);
+    let mut workspace = ExecutionWorkspace::new(64 * 1024 * 1024);
     let rows = 3usize;
     let host = (0..rows * EXPERTS)
         .map(|index| {
@@ -557,7 +599,7 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
         .map_err(|error| ModelError::Cuda(format!("upload router probe: {error:?}")))?
         .reshape(&[rows, EXPERTS])
         .map_err(|error| ModelError::Cuda(format!("reshape router probe: {error:?}")))?;
-    let plan = RoutingPlan::build(Arc::new(logits), rows, &mut execution)?;
+    let plan = RoutingPlan::build(Arc::new(logits), rows, &mut execution, &mut workspace)?;
     let ids: Vec<i32> = download(&plan.expert_ids, stream, "router IDs")?;
     let weights: Vec<f32> = download(&plan.weights, stream, "router weights")?;
     let positions: Vec<i32> = download(&plan.positions, stream, "dispatch positions")?;
@@ -602,7 +644,13 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
         .map_err(|error| ModelError::Cuda(format!("upload dispatch probe: {error:?}")))?
         .reshape(&[rows, hidden_size])
         .map_err(|error| ModelError::Cuda(format!("reshape dispatch probe: {error:?}")))?;
-    let dispatched = plan.dispatch(Arc::new(hidden), rows, hidden_size, &mut execution)?;
+    let dispatched = plan.dispatch(
+        Arc::new(hidden),
+        rows,
+        hidden_size,
+        &mut execution,
+        &mut workspace,
+    )?;
     let dispatched_host: Vec<bf16> = download(&dispatched.hidden, stream, "dispatched rows")?;
     let expert_by_tile: Vec<i32> =
         download(&dispatched.expert_by_row_tile, stream, "expert row map")?;
@@ -617,8 +665,14 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
             )));
         }
     }
-    let combined =
-        Arc::new(plan.combine(dispatched.hidden, rows, rows, hidden_size, &mut execution)?);
+    let combined = Arc::new(plan.combine(
+        dispatched.hidden,
+        rows,
+        rows,
+        hidden_size,
+        &mut execution,
+        &mut workspace,
+    )?);
     let combined_host = download(&combined, stream, "combined rows")?;
     for (index, (actual, expected)) in combined_host.iter().zip(&hidden_host).enumerate() {
         if (actual.to_f32() - expected.to_f32()).abs() > 1.0e-2 {

@@ -169,6 +169,15 @@ impl ExecutionWorkspace {
         self.f32.take(shape, execution, name)
     }
 
+    pub(crate) fn take_i32(
+        &mut self,
+        shape: &[usize],
+        execution: &mut StreamExecution<'_>,
+        name: &'static str,
+    ) -> Result<Tensor<i32>, ModelError> {
+        self.i32.take(shape, execution, name)
+    }
+
     pub(crate) fn take_zeroed_i32(
         &mut self,
         shape: &[usize],
@@ -205,8 +214,24 @@ impl ExecutionWorkspace {
         self.f32.retire(tensor);
     }
 
+    pub(crate) fn retire_shared_f32(
+        &mut self,
+        tensor: Arc<Tensor<f32>>,
+        name: &'static str,
+    ) -> Result<(), ModelError> {
+        self.f32.retire_shared(tensor, name)
+    }
+
     pub(crate) fn retire_i32(&mut self, tensor: Tensor<i32>) {
         self.i32.retire(tensor);
+    }
+
+    pub(crate) fn retire_shared_i32(
+        &mut self,
+        tensor: Arc<Tensor<i32>>,
+        name: &'static str,
+    ) -> Result<(), ModelError> {
+        self.i32.retire_shared(tensor, name)
     }
 
     pub(crate) fn retire_u32(&mut self, tensor: Tensor<u32>) {

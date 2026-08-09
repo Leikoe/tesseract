@@ -541,6 +541,7 @@ impl Program {
                         logical_rows,
                         self.config.rms_norm_eps,
                         &mut execution,
+                        &mut self.workspace,
                     )?
                 }
                 Attention::Full(_) => {
@@ -561,6 +562,7 @@ impl Program {
                         logical_rows,
                         self.config.rms_norm_eps,
                         &mut execution,
+                        &mut self.workspace,
                     )?;
                     full_layer += 1;
                     result
@@ -847,6 +849,7 @@ impl Layer {
         logical_rows: usize,
         epsilon: f32,
         execution: &mut StreamExecution<'_>,
+        workspace: &mut ExecutionWorkspace,
     ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
         let (attention_input, residual) = match update {
             Some(update) => gemma_add_rms_norm(
@@ -890,7 +893,9 @@ impl Layer {
             epsilon,
             execution,
         )?;
-        let moe_output = self.moe.forward(moe_input, rows, logical_rows, execution)?;
+        let moe_output = self
+            .moe
+            .forward(moe_input, rows, logical_rows, execution, workspace)?;
         Ok((residual, Arc::new(moe_output)))
     }
 
@@ -910,6 +915,7 @@ impl Layer {
         logical_rows: usize,
         epsilon: f32,
         execution: &mut StreamExecution<'_>,
+        workspace: &mut ExecutionWorkspace,
     ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
         let (attention_input, residual) = match update {
             Some(update) => gemma_add_rms_norm(
@@ -957,7 +963,9 @@ impl Layer {
             epsilon,
             execution,
         )?;
-        let moe_output = self.moe.forward(moe_input, rows, logical_rows, execution)?;
+        let moe_output = self
+            .moe
+            .forward(moe_input, rows, logical_rows, execution, workspace)?;
         Ok((residual, Arc::new(moe_output)))
     }
 }
@@ -1146,6 +1154,7 @@ impl Moe {
         rows: usize,
         logical_rows: usize,
         execution: &mut StreamExecution<'_>,
+        workspace: &mut ExecutionWorkspace,
     ) -> Result<Tensor<bf16>, ModelError> {
         const HIDDEN_SIZE: usize = 2048;
         if logical_rows == 0
@@ -1165,8 +1174,14 @@ impl Moe {
             "Qwen routed-expert logits",
             execution,
         )?;
-        let routing = RoutingPlan::build(router_logits, logical_rows, execution)?;
-        let dispatched = routing.dispatch(hidden.clone(), logical_rows, HIDDEN_SIZE, execution)?;
+        let routing = RoutingPlan::build(router_logits, logical_rows, execution, workspace)?;
+        let dispatched = routing.dispatch(
+            hidden.clone(),
+            logical_rows,
+            HIDDEN_SIZE,
+            execution,
+            workspace,
+        )?;
         let dispatched_rows = routing.max_dispatched_rows;
         let routed_gate = self.routed_gate.enqueue_device_plan(
             dispatched.hidden.clone(),
@@ -1175,7 +1190,7 @@ impl Moe {
             execution,
         )?;
         let routed_up = self.routed_up.enqueue_device_plan(
-            dispatched.hidden,
+            dispatched.hidden.clone(),
             dispatched_rows,
             dispatched.expert_by_row_tile.clone(),
             execution,
@@ -1190,7 +1205,7 @@ impl Moe {
         let routed_down = self.routed_down.enqueue_device_plan(
             Arc::new(routed_activated),
             dispatched_rows,
-            dispatched.expert_by_row_tile,
+            dispatched.expert_by_row_tile.clone(),
             execution,
         )?;
         let routed = routing.combine(
@@ -1199,6 +1214,7 @@ impl Moe {
             rows,
             HIDDEN_SIZE,
             execution,
+            workspace,
         )?;
 
         let shared_gate = self.shared_gate.enqueue(hidden.clone(), rows, execution)?;
@@ -1222,14 +1238,21 @@ impl Moe {
             "Qwen shared-expert gate",
             execution,
         )?;
-        moe_backend::combine_shared(
-            Arc::new(routed),
+        let routed = Arc::new(routed);
+        let output = moe_backend::combine_shared(
+            routed.clone(),
             Arc::new(shared),
             shared_logits,
             rows,
             HIDDEN_SIZE,
             execution,
-        )
+        )?;
+        workspace.retire_shared_bf16(routed, "combined routed experts")?;
+        workspace.retire_shared_bf16(dispatched.hidden, "dispatched activations")?;
+        workspace.retire_shared_i32(dispatched.expert_by_row_tile, "expert row map")?;
+        routing.retire(workspace)?;
+        workspace.reclaim(execution)?;
+        Ok(output)
     }
 }
 
