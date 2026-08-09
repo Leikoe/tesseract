@@ -27,7 +27,7 @@ const TILE_M: usize = 16;
 const TILE_N: usize = 16;
 const GROUP_K: usize = 16;
 const GROUPED_TILE_N: usize = 64;
-const GROUPED_TILE_K: usize = 32;
+const GROUPED_TILE_K: usize = GROUP_K;
 const FP8_SUBNORMAL_SCALE: f32 = 1.0 / 512.0;
 
 #[cutile::module]
@@ -112,17 +112,17 @@ mod kernels {
         weight_global_scale: &Tensor<f32, { [-1] }>,
     ) {
         const LOW_MASK: i32 = 0x0f;
-        let low_mask: Tile<i32, { [1, 64, 16] }> =
-            broadcast_scalar(LOW_MASK, const_shape![1, 64, 16]);
+        let low_mask: Tile<i32, { [1, 64, 8] }> =
+            broadcast_scalar(LOW_MASK, const_shape![1, 64, 8]);
         const NIBBLE_SHIFT: i32 = 4;
-        let nibble_shift: Tile<i32, { [1, 64, 16] }> =
-            broadcast_scalar(NIBBLE_SHIFT, const_shape![1, 64, 16]);
+        let nibble_shift: Tile<i32, { [1, 64, 8] }> =
+            broadcast_scalar(NIBBLE_SHIFT, const_shape![1, 64, 8]);
         const ZERO_I32: i32 = 0;
-        let zero_i32: Tile<i32, { [1, 64, 16] }> =
-            broadcast_scalar(ZERO_I32, const_shape![1, 64, 16]);
+        let zero_i32: Tile<i32, { [1, 64, 8] }> =
+            broadcast_scalar(ZERO_I32, const_shape![1, 64, 8]);
         const BYTE_MODULUS: i32 = 256;
-        let byte_modulus: Tile<i32, { [1, 64, 16] }> =
-            broadcast_scalar(BYTE_MODULUS, const_shape![1, 64, 16]);
+        let byte_modulus: Tile<i32, { [1, 64, 8] }> =
+            broadcast_scalar(BYTE_MODULUS, const_shape![1, 64, 8]);
         let k_tiles = Dim::new(K_TILES);
 
         // `iter_indices` maps the full logical output grid onto a physical
@@ -135,28 +135,27 @@ mod kernels {
             let global = weight_global_scale
                 .load_tile(const_shape![1], [expert])
                 .reshape(const_shape![1, 1])
-                .broadcast(const_shape![64, 32]);
+                .broadcast(const_shape![64, 16]);
             const ZERO_F32: f32 = 0.0;
             let mut accumulator = broadcast_scalar(ZERO_F32, const_shape![16, 64]);
 
             for k_tile in k_tiles {
-                let activation = dispatched.load_tile(const_shape![16, 32], [row_tile, k_tile]);
-                let packed: Tile<i32, { [1, 64, 16] }> = exti(
-                    packed_weight.load_tile(const_shape![1, 64, 16], [expert, column_tile, k_tile]),
+                let activation = dispatched.load_tile(const_shape![16, 16], [row_tile, k_tile]);
+                let packed: Tile<i32, { [1, 64, 8] }> = exti(
+                    packed_weight.load_tile(const_shape![1, 64, 8], [expert, column_tile, k_tile]),
                 );
                 let packed = select(lt_tile(packed, zero_i32), packed + byte_modulus, packed);
-                let low = andi(packed, low_mask).reshape(const_shape![64, 16, 1]);
-                let high = shri(packed, nibble_shift).reshape(const_shape![64, 16, 1]);
-                let nibbles: Tile<i32, { [64, 16, 2] }> = cat(low, high, 2);
-                let weight = decode_fp4_grouped(nibbles.reshape(const_shape![64, 32]));
-                let scale: Tile<f32, { [64, 32] }> = convert_tile(
+                let low = andi(packed, low_mask).reshape(const_shape![64, 8, 1]);
+                let high = shri(packed, nibble_shift).reshape(const_shape![64, 8, 1]);
+                let nibbles: Tile<i32, { [64, 8, 2] }> = cat(low, high, 2);
+                let weight = decode_fp4_grouped(nibbles.reshape(const_shape![64, 16]));
+                let scale: Tile<f32, { [64, 16] }> = convert_tile(
                     weight_scale
-                        .load_tile(const_shape![1, 64, 2], [expert, column_tile, k_tile])
-                        .reshape(const_shape![64, 2, 1])
-                        .broadcast(const_shape![64, 2, 16])
-                        .reshape(const_shape![64, 32]),
+                        .load_tile(const_shape![1, 64, 1], [expert, column_tile, k_tile])
+                        .reshape(const_shape![64, 1])
+                        .broadcast(const_shape![64, 16]),
                 );
-                let weight: Tile<bf16, { [64, 32] }> =
+                let weight: Tile<bf16, { [64, 16] }> =
                     ftof(weight * scale * global, rounding::NearestEven);
                 accumulator = mma(activation, weight.transpose(), accumulator);
             }
@@ -165,42 +164,42 @@ mod kernels {
         }
     }
 
-    fn decode_fp4_grouped(nibbles: Tile<i32, { [64, 32] }>) -> Tile<f32, { [64, 32] }> {
+    fn decode_fp4_grouped(nibbles: Tile<i32, { [64, 16] }>) -> Tile<f32, { [64, 16] }> {
         const EIGHT: i32 = 8;
-        let eight: Tile<i32, { [64, 32] }> = broadcast_scalar(EIGHT, const_shape![64, 32]);
+        let eight: Tile<i32, { [64, 16] }> = broadcast_scalar(EIGHT, const_shape![64, 16]);
         let magnitude = nibbles % eight;
         let sign = nibbles / eight;
         const ONE: i32 = 1;
-        let one: Tile<i32, { [64, 32] }> = broadcast_scalar(ONE, const_shape![64, 32]);
+        let one: Tile<i32, { [64, 16] }> = broadcast_scalar(ONE, const_shape![64, 16]);
         const TWO: i32 = 2;
-        let two: Tile<i32, { [64, 32] }> = broadcast_scalar(TWO, const_shape![64, 32]);
+        let two: Tile<i32, { [64, 16] }> = broadcast_scalar(TWO, const_shape![64, 16]);
         const THREE: i32 = 3;
-        let three: Tile<i32, { [64, 32] }> = broadcast_scalar(THREE, const_shape![64, 32]);
+        let three: Tile<i32, { [64, 16] }> = broadcast_scalar(THREE, const_shape![64, 16]);
         const FOUR: i32 = 4;
-        let four: Tile<i32, { [64, 32] }> = broadcast_scalar(FOUR, const_shape![64, 32]);
+        let four: Tile<i32, { [64, 16] }> = broadcast_scalar(FOUR, const_shape![64, 16]);
         const FIVE: i32 = 5;
-        let five: Tile<i32, { [64, 32] }> = broadcast_scalar(FIVE, const_shape![64, 32]);
+        let five: Tile<i32, { [64, 16] }> = broadcast_scalar(FIVE, const_shape![64, 16]);
         const SIX: i32 = 6;
-        let six: Tile<i32, { [64, 32] }> = broadcast_scalar(SIX, const_shape![64, 32]);
+        let six: Tile<i32, { [64, 16] }> = broadcast_scalar(SIX, const_shape![64, 16]);
         const SEVEN: i32 = 7;
-        let seven: Tile<i32, { [64, 32] }> = broadcast_scalar(SEVEN, const_shape![64, 32]);
+        let seven: Tile<i32, { [64, 16] }> = broadcast_scalar(SEVEN, const_shape![64, 16]);
         const ZERO_F: f32 = 0.0;
-        let zero_f: Tile<f32, { [64, 32] }> = broadcast_scalar(ZERO_F, const_shape![64, 32]);
+        let zero_f: Tile<f32, { [64, 16] }> = broadcast_scalar(ZERO_F, const_shape![64, 16]);
         const HALF_F: f32 = 0.5;
-        let half_f: Tile<f32, { [64, 32] }> = broadcast_scalar(HALF_F, const_shape![64, 32]);
+        let half_f: Tile<f32, { [64, 16] }> = broadcast_scalar(HALF_F, const_shape![64, 16]);
         const ONE_F: f32 = 1.0;
-        let one_f: Tile<f32, { [64, 32] }> = broadcast_scalar(ONE_F, const_shape![64, 32]);
+        let one_f: Tile<f32, { [64, 16] }> = broadcast_scalar(ONE_F, const_shape![64, 16]);
         const ONE_HALF_F: f32 = 1.5;
         let one_half_f: Tile<f32, { [64, 32] }> =
-            broadcast_scalar(ONE_HALF_F, const_shape![64, 32]);
+            broadcast_scalar(ONE_HALF_F, const_shape![64, 16]);
         const TWO_F: f32 = 2.0;
-        let two_f: Tile<f32, { [64, 32] }> = broadcast_scalar(TWO_F, const_shape![64, 32]);
+        let two_f: Tile<f32, { [64, 16] }> = broadcast_scalar(TWO_F, const_shape![64, 16]);
         const THREE_F: f32 = 3.0;
-        let three_f: Tile<f32, { [64, 32] }> = broadcast_scalar(THREE_F, const_shape![64, 32]);
+        let three_f: Tile<f32, { [64, 16] }> = broadcast_scalar(THREE_F, const_shape![64, 16]);
         const FOUR_F: f32 = 4.0;
-        let four_f: Tile<f32, { [64, 32] }> = broadcast_scalar(FOUR_F, const_shape![64, 32]);
+        let four_f: Tile<f32, { [64, 16] }> = broadcast_scalar(FOUR_F, const_shape![64, 16]);
         const SIX_F: f32 = 6.0;
-        let six_f: Tile<f32, { [64, 32] }> = broadcast_scalar(SIX_F, const_shape![64, 32]);
+        let six_f: Tile<f32, { [64, 16] }> = broadcast_scalar(SIX_F, const_shape![64, 16]);
         let mut value = zero_f;
         value = select(eq_tile(magnitude, one), half_f, value);
         value = select(eq_tile(magnitude, two), one_f, value);
