@@ -193,8 +193,9 @@ pub enum CudaKernelCapability {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Nvfp4CapabilityReport {
+pub struct QuantizedLinearCapabilityReport {
     pub device_id: usize,
+    pub fp8_w8a16: CudaKernelCapability,
     pub scaled_mma: CudaKernelCapability,
     pub byte_decode_mma: CudaKernelCapability,
     pub w4a16_linear: CudaKernelCapability,
@@ -232,7 +233,9 @@ pub enum CudaError {
 /// Attempts both cuTile's scaled NVFP4 MMA and its byte-decoded BF16 fallback,
 /// validating every output numerically. Unsupported compiler/runtime paths are
 /// reported as capability results rather than inferred from the GPU name.
-pub fn probe_nvfp4(device_id: usize) -> Result<Nvfp4CapabilityReport, CudaError> {
+pub fn probe_quantized_linears(
+    device_id: usize,
+) -> Result<QuantizedLinearCapabilityReport, CudaError> {
     use cutile::tile_kernel::TileKernel;
 
     const TILE: usize = 16;
@@ -346,12 +349,15 @@ pub fn probe_nvfp4(device_id: usize) -> Result<Nvfp4CapabilityReport, CudaError>
     // mismatch is a hard validation failure rather than an unavailable optional
     // fast path.
     let linear =
-        linear::validate_nvfp4_w4a16(&stream).map_err(|error| CudaError::QuantizedLinear {
+        linear::probe_quantized_linears(&stream).map_err(|error| CudaError::QuantizedLinear {
             message: error.to_string(),
         })?;
 
-    Ok(Nvfp4CapabilityReport {
+    Ok(QuantizedLinearCapabilityReport {
         device_id,
+        fp8_w8a16: CudaKernelCapability::Available {
+            max_abs_error: linear.fp8_max_abs_error,
+        },
         scaled_mma,
         byte_decode_mma,
         w4a16_linear: CudaKernelCapability::Available {

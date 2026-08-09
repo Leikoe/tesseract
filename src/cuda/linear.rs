@@ -32,6 +32,30 @@ mod kernels {
     use cutile::core::*;
 
     #[cutile::entry()]
+    fn fp8_w8a16<const K_TILES: i32>(
+        output: &mut Tensor<bf16, { [16, 16] }>,
+        input: &Tensor<bf16, { [-1, -1] }>,
+        weight: &Tensor<u8, { [-1, -1] }>,
+        weight_scale: f32,
+    ) {
+        let pid = get_tile_block_id();
+        let k_tiles = Dim::new(K_TILES);
+        let mut accumulator = constant(0.0f32, const_shape![16, 16]);
+
+        for k_tile in k_tiles {
+            let activation = input.load_tile(const_shape![16, 16], [pid.0, k_tile]);
+            let encoded: Tile<i32, { [16, 16] }> =
+                exti(weight.load_tile(const_shape![16, 16], [pid.1, k_tile]));
+            let decoded = decode_fp8(encoded);
+            let scale = broadcast_scalar(weight_scale, const_shape![16, 16]);
+            let weight: Tile<bf16, { [16, 16] }> = ftof(decoded * scale, rounding::NearestEven);
+            accumulator = mma(activation, weight.transpose(), accumulator);
+        }
+        let output_tile: Tile<bf16, { [16, 16] }> = ftof(accumulator, rounding::NearestEven);
+        output.store(output_tile);
+    }
+
+    #[cutile::entry()]
     fn nvfp4_w4a16<const K_TILES: i32>(
         output: &mut Tensor<bf16, { [16, 16] }>,
         input: &Tensor<bf16, { [-1, -1] }>,
@@ -156,9 +180,140 @@ mod kernels {
         value = select(eq_tile(magnitude, seven), six_f, value);
         select(eq_tile(sign, one), zero_f - value, value)
     }
+
+    fn decode_fp8(encoded: Tile<i32, { [16, 16] }>) -> Tile<f32, { [16, 16] }> {
+        let shape = const_shape![16, 16];
+        let byte_modulus: Tile<i32, { [16, 16] }> = constant(256i32, shape);
+        let zero_i32: Tile<i32, { [16, 16] }> = constant(0i32, shape);
+        let encoded = select(lt_tile(encoded, zero_i32), encoded + byte_modulus, encoded);
+        let sign = encoded / constant(128i32, shape);
+        let magnitude = encoded % constant(128i32, shape);
+        let exponent = magnitude / constant(8i32, shape);
+        let mantissa = magnitude % constant(8i32, shape);
+        let exponent_f: Tile<f32, { [16, 16] }> = convert_tile(exponent);
+        let mantissa_f: Tile<f32, { [16, 16] }> = convert_tile(mantissa);
+        let one_f: Tile<f32, { [16, 16] }> = constant(1.0f32, shape);
+        let eight_f: Tile<f32, { [16, 16] }> = constant(8.0f32, shape);
+        let seven_f: Tile<f32, { [16, 16] }> = constant(7.0f32, shape);
+        let subnormal_scale: Tile<f32, { [16, 16] }> = constant(1.0f32 / 512.0f32, shape);
+        let normal =
+            (one_f + true_div(mantissa_f, eight_f)) * exp2(exponent_f - seven_f, ftz::Disabled);
+        let subnormal = mantissa_f * subnormal_scale;
+        let magnitude = select(eq_tile(exponent, zero_i32), subnormal, normal);
+        let zero_f: Tile<f32, { [16, 16] }> = constant(0.0f32, shape);
+        let negative = zero_f - magnitude;
+        select(eq_tile(sign, constant(1i32, shape)), negative, magnitude)
+    }
 }
 
-use kernels::{grouped_nvfp4_w4a16, nvfp4_w4a16};
+use kernels::{fp8_w8a16, grouped_nvfp4_w4a16, nvfp4_w4a16};
+
+/// Scalar-scaled ModelOpt FP8 projection executed as W8A16 on SM80. The
+/// checkpoint's E4M3 bytes stay packed on device; the kernel decodes one tile,
+/// casts it to BF16, and accumulates with BF16 activations in FP32.
+pub(crate) struct Fp8W8A16Linear {
+    input_size: usize,
+    output_size: usize,
+    weight: Arc<Tensor<u8>>,
+    weight_scale: f32,
+    device_bytes: usize,
+}
+
+impl Fp8W8A16Linear {
+    pub(crate) fn load(
+        source: &dyn WeightSource,
+        prefix: &str,
+        stream: &Arc<Stream>,
+    ) -> Result<Self, ModelError> {
+        let weight_name = format!("{prefix}.weight");
+        let weight_scale_name = format!("{prefix}.weight_scale");
+        let input_scale_name = format!("{prefix}.input_scale");
+        let weight = source.tensor(&weight_name)?;
+        let weight_scale = source.tensor(&weight_scale_name)?;
+        let input_scale = source.tensor(&input_scale_name)?;
+        if weight.dtype() != &WeightDtype::F8E4M3 || weight.shape().len() != 2 {
+            return invalid_tensor(&weight_name, "expected rank-2 E4M3 storage");
+        }
+        let output_size = weight.shape()[0];
+        let input_size = weight.shape()[1];
+        if input_size == 0
+            || output_size == 0
+            || !input_size.is_multiple_of(TILE_N)
+            || !output_size.is_multiple_of(TILE_N)
+            || weight.byte_len() != output_size.saturating_mul(input_size)
+        {
+            return invalid_tensor(&weight_name, "unrepresentable W8A16 storage geometry");
+        }
+        if weight_scale.dtype() != &WeightDtype::F32 || !weight_scale.shape().is_empty() {
+            return invalid_tensor(&weight_scale_name, "expected an F32 scalar");
+        }
+        if input_scale.dtype() != &WeightDtype::F32 || !input_scale.shape().is_empty() {
+            return invalid_tensor(&input_scale_name, "expected an F32 scalar");
+        }
+        let weight_scale = scalar_f32(weight_scale.bytes(), &weight_scale_name)?;
+        if !weight_scale.is_finite() || weight_scale <= 0.0 {
+            return invalid_tensor(&weight_scale_name, "scale must be finite and positive");
+        }
+        let weight = api::copy_host_vec_to_device(&Arc::new(weight.bytes().to_vec()))
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("upload FP8 weight: {error:?}")))?
+            .reshape(&[output_size, input_size])
+            .map_err(|error| ModelError::Cuda(format!("reshape FP8 weight: {error:?}")))?;
+        let device_bytes = weight.num_bytes();
+        Ok(Self {
+            input_size,
+            output_size,
+            weight: Arc::new(weight),
+            weight_scale,
+            device_bytes,
+        })
+    }
+
+    pub(crate) const fn input_size(&self) -> usize {
+        self.input_size
+    }
+
+    pub(crate) const fn output_size(&self) -> usize {
+        self.output_size
+    }
+
+    pub(crate) const fn device_bytes(&self) -> usize {
+        self.device_bytes
+    }
+
+    pub(crate) fn enqueue(
+        &self,
+        input: Arc<Tensor<bf16>>,
+        rows: usize,
+        stream: &Arc<Stream>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        if rows == 0 || !rows.is_multiple_of(TILE_M) {
+            return Err(ModelError::Cuda(format!(
+                "FP8 W8A16 rows must be a positive multiple of {TILE_M}; got {rows}"
+            )));
+        }
+        let expected_shape = [rows as i32, self.input_size as i32];
+        if input.shape() != expected_shape {
+            return Err(ModelError::Cuda(format!(
+                "FP8 W8A16 input shape {:?}; expected {expected_shape:?}",
+                input.shape()
+            )));
+        }
+        let mut output = api::zeros::<bf16>(&[rows, self.output_size])
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("allocate FP8 output: {error:?}")))?;
+        fp8_w8a16(
+            (&mut output).partition([TILE_M, TILE_N]),
+            input,
+            self.weight.clone(),
+            self.weight_scale,
+        )
+        .generics(vec![(self.input_size / TILE_N).to_string()])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("execute FP8 W8A16: {error:?}")))?;
+        Ok(output)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ParsedNvfp4Projection<'a> {
@@ -624,16 +779,93 @@ fn invalid_tensor<T>(name: &str, message: &str) -> Result<T, ModelError> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Nvfp4LinearValidation {
+pub(crate) struct QuantizedLinearProbe {
+    pub(crate) fp8_max_abs_error: f32,
     pub(crate) max_abs_error: f32,
     pub(crate) grouped_max_abs_error: f32,
 }
 
-/// Differentially validates the production W4A16 kernel with every FP4 code,
-/// non-unit E4M3 scales, a non-unit global scale, and signed BF16 activations.
-pub(crate) fn validate_nvfp4_w4a16(
+pub(crate) fn probe_quantized_linears(
     stream: &Arc<Stream>,
-) -> Result<Nvfp4LinearValidation, ModelError> {
+) -> Result<QuantizedLinearProbe, ModelError> {
+    let fp8_max_abs_error = probe_fp8_w8a16(stream)?;
+    let (max_abs_error, grouped_max_abs_error) = probe_nvfp4_w4a16(stream)?;
+    Ok(QuantizedLinearProbe {
+        fp8_max_abs_error,
+        max_abs_error,
+        grouped_max_abs_error,
+    })
+}
+
+fn probe_fp8_w8a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
+    let input_size = TILE_N;
+    let output_size = TILE_N;
+    let encoded = (0..output_size * input_size)
+        .map(|index| {
+            const VALUES: [u8; 12] = [
+                0x00, 0x01, 0x20, 0x38, 0x3c, 0x40, 0x60, 0x7e, 0x80, 0xb8, 0xc0, 0xfe,
+            ];
+            VALUES[index % VALUES.len()]
+        })
+        .collect::<Vec<_>>();
+    let weight_scale = 0.25f32;
+    let source = Fp8ProbeSource {
+        prefix: "probe",
+        input_size,
+        output_size,
+        encoded: &encoded,
+        weight_scale: weight_scale.to_le_bytes(),
+        input_scale: 1.0f32.to_le_bytes(),
+    };
+    let linear = Fp8W8A16Linear::load(&source, "probe", stream)?;
+    if linear.input_size() != input_size
+        || linear.output_size() != output_size
+        || linear.device_bytes() != encoded.len()
+    {
+        return Err(ModelError::Cuda(
+            "FP8 loader did not preserve geometry/device-byte accounting".into(),
+        ));
+    }
+    let input_host = (0..TILE_M * input_size)
+        .map(|index| bf16::from_f32((index % 7) as f32 - 3.0))
+        .collect::<Vec<_>>();
+    let input = api::copy_host_vec_to_device(&Arc::new(input_host.clone()))
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("upload FP8 probe input: {error:?}")))?
+        .reshape(&[TILE_M, input_size])
+        .map_err(|error| ModelError::Cuda(format!("reshape FP8 probe input: {error:?}")))?;
+    let output = linear.enqueue(Arc::new(input), TILE_M, stream)?;
+    let actual: Vec<bf16> = output
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("copy FP8 probe output: {error:?}")))?;
+    let mut max_abs_error = 0.0f32;
+    for row in 0..TILE_M {
+        for column in 0..output_size {
+            let mut expected = 0.0f32;
+            for k in 0..input_size {
+                let weight =
+                    bf16::from_f32(decode_e4m3fn(encoded[column * input_size + k]) * weight_scale)
+                        .to_f32();
+                expected += input_host[row * input_size + k].to_f32() * weight;
+            }
+            let expected = bf16::from_f32(expected).to_f32();
+            let actual = actual[row * output_size + column].to_f32();
+            let error = (actual - expected).abs();
+            max_abs_error = max_abs_error.max(error);
+            if !actual.is_finite() || error > 0.25 {
+                return Err(ModelError::Cuda(format!(
+                    "FP8 differential mismatch at ({row}, {column}): {actual} != {expected}"
+                )));
+            }
+        }
+    }
+    Ok(max_abs_error)
+}
+
+/// Probes the production W4A16 kernels with every FP4 code, non-unit E4M3
+/// scales, a non-unit global scale, and signed BF16 activations.
+fn probe_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<(f32, f32), ModelError> {
     let input_size = GROUP_K;
     let output_size = TILE_N;
     let packed = (0..output_size * input_size / 2)
@@ -708,14 +940,11 @@ pub(crate) fn validate_nvfp4_w4a16(
             }
         }
     }
-    let grouped_max_abs_error = validate_grouped_nvfp4_w4a16(stream)?;
-    Ok(Nvfp4LinearValidation {
-        max_abs_error,
-        grouped_max_abs_error,
-    })
+    let grouped_max_abs_error = probe_grouped_nvfp4_w4a16(stream)?;
+    Ok((max_abs_error, grouped_max_abs_error))
 }
 
-fn validate_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
+fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     const EXPERTS: usize = 2;
     let input_size = GROUP_K;
     let output_size = TILE_N;
@@ -803,6 +1032,48 @@ fn validate_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError>
         }
     }
     Ok(max_abs_error)
+}
+
+struct Fp8ProbeSource<'a> {
+    prefix: &'a str,
+    input_size: usize,
+    output_size: usize,
+    encoded: &'a [u8],
+    weight_scale: [u8; 4],
+    input_scale: [u8; 4],
+}
+
+impl WeightSource for Fp8ProbeSource<'_> {
+    fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, ModelError> {
+        let suffix = name
+            .strip_prefix(self.prefix)
+            .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
+        match suffix {
+            ".weight" => Ok(WeightTensor::new(
+                WeightDtype::F8E4M3,
+                vec![self.output_size, self.input_size],
+                self.encoded,
+            )),
+            ".weight_scale" => Ok(WeightTensor::new(
+                WeightDtype::F32,
+                vec![],
+                &self.weight_scale,
+            )),
+            ".input_scale" => Ok(WeightTensor::new(
+                WeightDtype::F32,
+                vec![],
+                &self.input_scale,
+            )),
+            _ => Err(ModelError::MissingTensor(name.into())),
+        }
+    }
+
+    fn names(&self) -> Vec<String> {
+        ["weight", "weight_scale", "input_scale"]
+            .into_iter()
+            .map(|suffix| format!("{}.{suffix}", self.prefix))
+            .collect()
+    }
 }
 
 struct Nvfp4ValidationSource<'a> {

@@ -10,15 +10,16 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let report = tesseract::cuda::probe_bf16_cutile(args.device)?;
-    let nvfp4 = tesseract::cuda::probe_nvfp4(args.device)?;
+    let quantized = tesseract::cuda::probe_quantized_linears(args.device)?;
     println!("device_id={}", report.device_id);
     println!("dtype=bfloat16");
     println!("elements={}", report.elements);
     println!("gemm_rows={}", report.gemm_rows);
-    print_capability("nvfp4_scaled_mma", nvfp4.scaled_mma);
-    print_capability("nvfp4_byte_decode_mma", nvfp4.byte_decode_mma);
-    print_capability("nvfp4_w4a16_linear", nvfp4.w4a16_linear);
-    print_capability("nvfp4_grouped_w4a16", nvfp4.grouped_w4a16);
+    print_capability("fp8_w8a16_linear", quantized.fp8_w8a16);
+    print_capability("nvfp4_scaled_mma", quantized.scaled_mma);
+    print_capability("nvfp4_byte_decode_mma", quantized.byte_decode_mma);
+    print_capability("nvfp4_w4a16_linear", quantized.w4a16_linear);
+    print_capability("nvfp4_grouped_w4a16", quantized.grouped_w4a16);
     println!("cutile_probe=ok");
     Ok(())
 }
