@@ -43,20 +43,13 @@ pub(super) fn cuda_model_report(
 
 #[cfg(feature = "cuda")]
 pub(super) fn cuda_forward_report(
-    _model_id: &str,
-    _model_dir: &Path,
-    _device_id: usize,
-    _prompt: &str,
+    model_id: &str,
+    model_dir: &Path,
+    device_id: usize,
+    prompt: &str,
 ) -> Result<CudaForwardReport, ModelError> {
-    Err(runtime_pending())
-}
-
-#[cfg(feature = "cuda")]
-fn runtime_pending() -> ModelError {
-    ModelError::UnsupportedExecution(
-        "Qwen3.5/3.6 MoE text checkpoint parsing is implemented, but its hybrid CUDA program is not yet implemented"
-            .into(),
-    )
+    let model = Arc::new(Qwen35MoeText::load(model_dir)?);
+    cuda_program::forward_report(model_id, model.cuda_artifact(), device_id, prompt)
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]

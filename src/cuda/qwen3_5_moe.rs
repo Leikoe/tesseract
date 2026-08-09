@@ -10,15 +10,15 @@ use cutile::{
 };
 
 use crate::{
-    engine::{ExecutionError, ModelExecutor, StateSchema, TokenId},
+    engine::{ExecutionError, ModelExecutor, RequestId, SamplingInput, StateSchema, TokenId},
     model::{
-        CudaModelReport, Model, ModelError,
+        CudaForwardReport, CudaModelReport, CudaTokenLogit, Model, ModelError,
         weights::{WeightDtype, WeightSource},
     },
 };
 
 use super::{
-    batch::CudaBatch,
+    batch::{CudaBatch, SampleTarget},
     cublas,
     executor::{CudaExecutor, ModelProgram, ProgramOutput},
     gdn::{self as gdn_backend, GdnPrefillPlan, GdnState},
@@ -688,6 +688,88 @@ pub(crate) fn load_executor(
         "Qwen hybrid CUDA executor loaded"
     );
     Ok(Box::new(CudaExecutor::new(program)))
+}
+
+pub(crate) fn forward_report(
+    model_id: &str,
+    artifact: Artifact,
+    device_id: usize,
+    prompt: &str,
+) -> Result<CudaForwardReport, ModelError> {
+    let token_ids = artifact.model.encode(prompt)?;
+    if token_ids.is_empty() {
+        return Err(ModelError::InvalidInput(
+            "prompt must encode to at least one token".into(),
+        ));
+    }
+    let rows = token_ids.len();
+    let capacity = rows
+        .checked_add(1)
+        .ok_or_else(|| ModelError::InvalidInput("prompt is too long".into()))?;
+    let slots = (0..rows)
+        .map(|slot| {
+            u32::try_from(slot).map_err(|_| ModelError::InvalidInput("prompt is too long".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let sampling = SamplingInput::try_new(1.0, 1.0, 0.0)
+        .map_err(|error| ModelError::InvalidInput(error.to_string()))?;
+    let batch = CudaBatch {
+        token_ids,
+        positions: (0..rows as u32).collect(),
+        current_slots: slots.clone(),
+        request_indices: vec![0; rows],
+        recurrent_slots: vec![Some(0)],
+        query_start_offsets: vec![0, rows as u32],
+        context_lengths: (1..=rows)
+            .map(|length| {
+                i32::try_from(length)
+                    .map_err(|_| ModelError::InvalidInput("prompt is too long".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        context_storage: vec![slots],
+        num_requests: 1,
+        sample_rows: vec![(rows - 1) as u32],
+        samples: vec![SampleTarget {
+            request_id: RequestId::now_v7(),
+            sampling,
+        }],
+        all_samples_greedy: false,
+        num_prefill_tokens: rows,
+    };
+    let mut program = Program::load(artifact, device_id, capacity, rows, 1)?;
+    let ProgramOutput::HostLogits { values, vocab_size } = program.forward(&batch)? else {
+        return Err(ModelError::Cuda(
+            "Qwen forward omitted requested logits".into(),
+        ));
+    };
+    let mut ranked = values
+        .into_iter()
+        .enumerate()
+        .map(|(token_id, logit)| CudaTokenLogit {
+            token_id: token_id as u32,
+            logit,
+        })
+        .collect::<Vec<_>>();
+    if ranked.len() != vocab_size {
+        return Err(ModelError::Cuda(format!(
+            "Qwen language-model head returned {} logits for vocabulary size {vocab_size}",
+            ranked.len()
+        )));
+    }
+    ranked.sort_unstable_by(|left, right| right.logit.total_cmp(&left.logit));
+    ranked.truncate(20);
+    let next_token_id = ranked
+        .first()
+        .map(|entry| entry.token_id)
+        .ok_or_else(|| ModelError::Cuda("Qwen language-model head returned no logits".into()))?;
+    let next_token_text = program.model.decoder().push(next_token_id)?;
+    Ok(CudaForwardReport {
+        model_id: model_id.into(),
+        prompt_tokens: rows,
+        next_token_id,
+        next_token_text,
+        top_logits: ranked,
+    })
 }
 
 impl Layer {
