@@ -96,57 +96,55 @@ mod nvfp4_probe_kernels {
         lhs_scale_bytes: &Tensor<u8, { [-1, -1] }>,
         rhs_scale_bytes: &Tensor<u8, { [-1, -1] }>,
     ) {
-        let lhs_packed = lhs_packed.load_tile(const_shape![16, 64], [0, 0]);
-        let rhs_packed = rhs_packed.load_tile(const_shape![16, 64], [0, 0]);
-        let sixteen = constant(16u8, const_shape![16, 64]);
+        let lhs_packed = lhs_packed.partition(const_shape![16, 8]);
+        let rhs_packed = rhs_packed.partition(const_shape![16, 8]);
+        let lhs_scale_bytes = lhs_scale_bytes.partition(const_shape![16, 1]);
+        let rhs_scale_bytes = rhs_scale_bytes.partition(const_shape![16, 1]);
+        let sixteen: Tile<u8, { [16, 8] }> = constant(16u8, const_shape![16, 8]);
+        let mut accumulator = constant(0.0f32, const_shape![16, 16]);
 
-        let lhs_low = (lhs_packed % sixteen).reshape(const_shape![16, 64, 1]);
-        let lhs_high = (lhs_packed / sixteen).reshape(const_shape![16, 64, 1]);
-        let lhs_nibbles: Tile<u8, { [16, 64, 2] }> = cat(lhs_low, lhs_high, 2);
-        let lhs_nibbles = lhs_nibbles.reshape(const_shape![16, 128]);
+        for k_tile in Dim::new(8) {
+            let lhs_packed = lhs_packed.load([0, k_tile]);
+            let rhs_packed = rhs_packed.load([0, k_tile]);
+            let lhs_low = (lhs_packed % sixteen).reshape(const_shape![16, 8, 1]);
+            let lhs_high = (lhs_packed / sixteen).reshape(const_shape![16, 8, 1]);
+            let lhs_nibbles: Tile<u8, { [16, 8, 2] }> = cat(lhs_low, lhs_high, 2);
+            let rhs_low = (rhs_packed % sixteen).reshape(const_shape![16, 8, 1]);
+            let rhs_high = (rhs_packed / sixteen).reshape(const_shape![16, 8, 1]);
+            let rhs_nibbles: Tile<u8, { [16, 8, 2] }> = cat(rhs_low, rhs_high, 2);
 
-        let rhs_low = (rhs_packed % sixteen).reshape(const_shape![16, 64, 1]);
-        let rhs_high = (rhs_packed / sixteen).reshape(const_shape![16, 64, 1]);
-        let rhs_nibbles: Tile<u8, { [16, 64, 2] }> = cat(rhs_low, rhs_high, 2);
-        let rhs_nibbles = rhs_nibbles.reshape(const_shape![16, 128]);
-
-        let lhs = decode_fp4(lhs_nibbles);
-        let rhs = decode_fp4(rhs_nibbles);
-        let lhs_scales = decode_e4m3(lhs_scale_bytes.load_tile(const_shape![16, 8], [0, 0]))
-            .reshape(const_shape![16, 8, 1])
-            .broadcast(const_shape![16, 8, 16])
-            .reshape(const_shape![16, 128]);
-        let rhs_scales = decode_e4m3(rhs_scale_bytes.load_tile(const_shape![16, 8], [0, 0]))
-            .reshape(const_shape![16, 8, 1])
-            .broadcast(const_shape![16, 8, 16])
-            .reshape(const_shape![16, 128]);
-
-        let lhs: Tile<bf16, { [16, 128] }> = ftof(lhs * lhs_scales, rounding::NearestEven);
-        let rhs: Tile<bf16, { [16, 128] }> = ftof(rhs * rhs_scales, rounding::NearestEven);
-        let rhs = rhs.transpose();
-        let accumulator = constant(0.0f32, const_shape![16, 16]);
-        out.store(mma(lhs, rhs, accumulator));
+            let lhs = decode_fp4(lhs_nibbles.reshape(const_shape![16, 16]));
+            let rhs = decode_fp4(rhs_nibbles.reshape(const_shape![16, 16]));
+            let lhs_scales =
+                decode_e4m3(lhs_scale_bytes.load([0, k_tile])).broadcast(const_shape![16, 16]);
+            let rhs_scales =
+                decode_e4m3(rhs_scale_bytes.load([0, k_tile])).broadcast(const_shape![16, 16]);
+            let lhs: Tile<bf16, { [16, 16] }> = ftof(lhs * lhs_scales, rounding::NearestEven);
+            let rhs: Tile<bf16, { [16, 16] }> = ftof(rhs * rhs_scales, rounding::NearestEven);
+            accumulator = mma(lhs, rhs.transpose(), accumulator);
+        }
+        out.store(accumulator);
     }
 
-    fn decode_fp4(nibbles: Tile<u8, { [16, 128] }>) -> Tile<f32, { [16, 128] }> {
-        let eight: Tile<u8, { [16, 128] }> = constant(8u8, const_shape![16, 128]);
+    fn decode_fp4(nibbles: Tile<u8, { [16, 16] }>) -> Tile<f32, { [16, 16] }> {
+        let eight: Tile<u8, { [16, 16] }> = constant(8u8, const_shape![16, 16]);
         let magnitude = nibbles % eight;
         let sign = nibbles / eight;
-        let one: Tile<u8, { [16, 128] }> = constant(1u8, const_shape![16, 128]);
-        let two: Tile<u8, { [16, 128] }> = constant(2u8, const_shape![16, 128]);
-        let three: Tile<u8, { [16, 128] }> = constant(3u8, const_shape![16, 128]);
-        let four: Tile<u8, { [16, 128] }> = constant(4u8, const_shape![16, 128]);
-        let five: Tile<u8, { [16, 128] }> = constant(5u8, const_shape![16, 128]);
-        let six: Tile<u8, { [16, 128] }> = constant(6u8, const_shape![16, 128]);
-        let seven: Tile<u8, { [16, 128] }> = constant(7u8, const_shape![16, 128]);
-        let zero_f: Tile<f32, { [16, 128] }> = constant(0.0f32, const_shape![16, 128]);
-        let half_f: Tile<f32, { [16, 128] }> = constant(0.5f32, const_shape![16, 128]);
-        let one_f: Tile<f32, { [16, 128] }> = constant(1.0f32, const_shape![16, 128]);
-        let one_half_f: Tile<f32, { [16, 128] }> = constant(1.5f32, const_shape![16, 128]);
-        let two_f: Tile<f32, { [16, 128] }> = constant(2.0f32, const_shape![16, 128]);
-        let three_f: Tile<f32, { [16, 128] }> = constant(3.0f32, const_shape![16, 128]);
-        let four_f: Tile<f32, { [16, 128] }> = constant(4.0f32, const_shape![16, 128]);
-        let six_f: Tile<f32, { [16, 128] }> = constant(6.0f32, const_shape![16, 128]);
+        let one: Tile<u8, { [16, 16] }> = constant(1u8, const_shape![16, 16]);
+        let two: Tile<u8, { [16, 16] }> = constant(2u8, const_shape![16, 16]);
+        let three: Tile<u8, { [16, 16] }> = constant(3u8, const_shape![16, 16]);
+        let four: Tile<u8, { [16, 16] }> = constant(4u8, const_shape![16, 16]);
+        let five: Tile<u8, { [16, 16] }> = constant(5u8, const_shape![16, 16]);
+        let six: Tile<u8, { [16, 16] }> = constant(6u8, const_shape![16, 16]);
+        let seven: Tile<u8, { [16, 16] }> = constant(7u8, const_shape![16, 16]);
+        let zero_f: Tile<f32, { [16, 16] }> = constant(0.0f32, const_shape![16, 16]);
+        let half_f: Tile<f32, { [16, 16] }> = constant(0.5f32, const_shape![16, 16]);
+        let one_f: Tile<f32, { [16, 16] }> = constant(1.0f32, const_shape![16, 16]);
+        let one_half_f: Tile<f32, { [16, 16] }> = constant(1.5f32, const_shape![16, 16]);
+        let two_f: Tile<f32, { [16, 16] }> = constant(2.0f32, const_shape![16, 16]);
+        let three_f: Tile<f32, { [16, 16] }> = constant(3.0f32, const_shape![16, 16]);
+        let four_f: Tile<f32, { [16, 16] }> = constant(4.0f32, const_shape![16, 16]);
+        let six_f: Tile<f32, { [16, 16] }> = constant(6.0f32, const_shape![16, 16]);
         let mut value = zero_f;
         value = select(eq_tile(magnitude, one), half_f, value);
         value = select(eq_tile(magnitude, two), one_f, value);
@@ -158,25 +156,25 @@ mod nvfp4_probe_kernels {
         select(eq_tile(sign, one), zero_f - value, value)
     }
 
-    fn decode_e4m3(bytes: Tile<u8, { [16, 8] }>) -> Tile<f32, { [16, 8] }> {
-        let eight: Tile<u8, { [16, 8] }> = constant(8u8, const_shape![16, 8]);
-        let sixteen: Tile<u8, { [16, 8] }> = constant(16u8, const_shape![16, 8]);
+    fn decode_e4m3(bytes: Tile<u8, { [16, 1] }>) -> Tile<f32, { [16, 1] }> {
+        let eight: Tile<u8, { [16, 1] }> = constant(8u8, const_shape![16, 1]);
+        let sixteen: Tile<u8, { [16, 1] }> = constant(16u8, const_shape![16, 1]);
         let exponent = (bytes / eight) % sixteen;
         let mantissa = bytes % eight;
-        let zero_u8: Tile<u8, { [16, 8] }> = constant(0u8, const_shape![16, 8]);
-        let one_u8: Tile<u8, { [16, 8] }> = constant(1u8, const_shape![16, 8]);
-        let exponent_f: Tile<f32, { [16, 8] }> = convert_tile(exponent);
-        let mantissa_f: Tile<f32, { [16, 8] }> = convert_tile(mantissa);
-        let zero_f: Tile<f32, { [16, 8] }> = constant(0.0f32, const_shape![16, 8]);
-        let one_f: Tile<f32, { [16, 8] }> = constant(1.0f32, const_shape![16, 8]);
-        let two_f: Tile<f32, { [16, 8] }> = constant(2.0f32, const_shape![16, 8]);
-        let seven_f: Tile<f32, { [16, 8] }> = constant(7.0f32, const_shape![16, 8]);
-        let eight_f: Tile<f32, { [16, 8] }> = constant(8.0f32, const_shape![16, 8]);
-        let five_twelve_f: Tile<f32, { [16, 8] }> = constant(512.0f32, const_shape![16, 8]);
+        let zero_u8: Tile<u8, { [16, 1] }> = constant(0u8, const_shape![16, 1]);
+        let one_u8: Tile<u8, { [16, 1] }> = constant(1u8, const_shape![16, 1]);
+        let exponent_f: Tile<f32, { [16, 1] }> = convert_tile(exponent);
+        let mantissa_f: Tile<f32, { [16, 1] }> = convert_tile(mantissa);
+        let zero_f: Tile<f32, { [16, 1] }> = constant(0.0f32, const_shape![16, 1]);
+        let one_f: Tile<f32, { [16, 1] }> = constant(1.0f32, const_shape![16, 1]);
+        let two_f: Tile<f32, { [16, 1] }> = constant(2.0f32, const_shape![16, 1]);
+        let seven_f: Tile<f32, { [16, 1] }> = constant(7.0f32, const_shape![16, 1]);
+        let eight_f: Tile<f32, { [16, 1] }> = constant(8.0f32, const_shape![16, 1]);
+        let five_twelve_f: Tile<f32, { [16, 1] }> = constant(512.0f32, const_shape![16, 1]);
         let normal = (one_f + mantissa_f / eight_f) * pow(two_f, exponent_f - seven_f);
         let subnormal = mantissa_f / five_twelve_f;
         let unsigned = select(eq_tile(exponent, zero_u8), subnormal, normal);
-        let one_twenty_eight: Tile<u8, { [16, 8] }> = constant(128u8, const_shape![16, 8]);
+        let one_twenty_eight: Tile<u8, { [16, 1] }> = constant(128u8, const_shape![16, 1]);
         let sign = bytes / one_twenty_eight;
         select(eq_tile(sign, one_u8), zero_f - unsigned, unsigned)
     }
