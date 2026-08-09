@@ -474,7 +474,8 @@ mod kernels {
             key_f32,
             broadcast_scalar(ZERO, const_shape![16, 128]),
         );
-        let key_square_sum: Tile<f32, { [16, 1] }> = reduce_sum(key_f32 * key_f32, 1i32);
+        let key_square_sum: Tile<f32, { [16] }> = reduce_sum(key_f32 * key_f32, 1i32);
+        let key_square_sum: Tile<f32, { [16, 1] }> = key_square_sum.reshape(const_shape![16, 1]);
         let epsilon: Tile<f32, { [16, 1] }> = broadcast_scalar(EPSILON, const_shape![16, 1]);
         let key_inverse = rsqrt(key_square_sum + epsilon, ftz::Disabled);
         let key: Tile<bf16, { [16, 128] }> = ftof(
