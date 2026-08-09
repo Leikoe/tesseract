@@ -1,0 +1,45 @@
+
+NOTICE: Existing SQLite export found: /tmp/tesseract-bm64-8k-profile.sqlite
+        It is assumed file was previously exported from: /tmp/tesseract-bm64-8k-profile.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/tmp/tesseract-bm64-8k-profile.sqlite] with [/opt/nvidia/nsight-systems/2026.1.3/target-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+62.2,16554178403,520,31834958.5,3516686.5,94944,132024251,39725167.4,fp8_w8a16_entry
+15.4,4106190336,160,25663689.6,25629500.0,976983,62105433,24663815.8,grouped_nvfp4_w4a16_entry
+11.6,3087642378,160,19297764.9,19270421.0,742425,46234406,18545113.9,grouped_nvfp4_w4a16_silu_mul_entry
+5.9,1566358051,482,3249705.5,6135556.5,27519,8023752,3181088.5,nvfp4_w4a16_entry
+1.2,314221602,120,2618513.4,2561030.5,73760,6288795,2551620.8,qwen_gdn_prefill_state_output_entry
+1.1,303838852,120,2531990.4,2517158.5,8703,5908063,2533869.7,qwen_gdn_conv_prefill_entry
+0.9,251734475,40,6293361.9,6339379.5,1225077,11252715,4995654.7,ragged_prefill_attention_bf16_entry
+0.6,153960020,40,3849000.5,3848891.0,14751,7685364,3881200.8,prepare_qkvgate_entry
+0.2,62620630,921,67992.0,5280.0,1344,1029461,116436.2,full_entry
+0.2,42706096,160,266913.1,266669.5,6976,621433,259787.6,combine_top8_bf16_entry
+0.1,36476815,318,114707.0,14943.5,11071,259229,102696.8,gemma_add_rms_norm_bf16_entry
+0.1,27711203,120,230926.7,230365.5,11200,550426,219142.4,qwen_gdn_prefill_kkt_solve_entry
+0.1,26516470,160,165727.9,160030.5,2912,333212,162973.5,dispatch_bf16_entry
+0.1,20229910,40,505747.8,505691.5,4159,1007191,507367.0,sigmoid_gate_attention_entry
+0.1,18402087,120,153350.7,152414.5,3200,368124,150532.9,qwen_gdn_output_gate_entry
+0.0,9440425,120,78670.2,78031.5,4864,160510,73524.0,qwen_gdn_prefill_recompute_w_u_entry
+0.0,7093527,120,59112.7,58959.5,7104,134047,50600.8,qwen_gdn_prefill_gates_entry
+0.0,6201414,160,38758.8,38607.5,2688,86048,35805.9,combine_shared_expert_bf16_entry
+0.0,5530921,160,34568.3,34863.5,8224,73119,25417.1,top8_router_256_entry
+0.0,4548339,80,56854.2,56672.0,56447,69343,1421.3,ampere_bf16_s16816gemm_bf16_128x256_ldg8_f2f_stages_64x3_tn
+0.0,4337746,160,27110.9,27119.5,2464,63648,24408.2,assign_dispatch_rows_entry
+0.0,3639329,120,30327.7,31007.5,24832,35487,4124.7,ampere_bf16_s16816gemm_bf16_64x128_ldg8_f2f_stages_64x4_tn
+0.0,2792032,80,34900.4,34831.5,34111,35744,413.2,ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_64x4_tn
+0.0,2446413,160,15290.1,15343.5,2688,33120,12237.7,silu_mul_bf16_entry
+0.0,868762,160,5429.8,5519.5,2047,10208,3145.6,renormalize_top8_entry
+0.0,730040,160,4562.8,4656.0,2495,7328,1768.0,expert_by_row_tile_entry
+0.0,666779,200,3333.9,3136.0,2848,3904,377.4,"void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat16, (bool)0, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, (bool)1, (bool)0, (bool)0, (bool)0>(cublasLt::cublasSplitKParams<T6>, const T4 *, const T10 *, T9 *, T5 *, const T6 *, const T6 *, const T11 *, const T4 *, T11 *, void *, long, T6 *, int *, T6 *, T6 *, const T6 *, const T6 *, const T6 *, const T6 *, const T6 *)"
+0.0,614972,120,5124.8,4768.0,4416,5888,538.5,ampere_s16816gemm_bf16_64x64_ldg8_stages_64x5_tn
+0.0,476956,80,5961.9,5936.0,5216,7104,601.0,ampere_s16816gemm_bf16_64x64_ldg8_stages_64x6_tn
+0.0,332415,160,2077.6,1952.0,1951,2464,207.2,aligned_expert_prefix_entry
+0.0,263198,80,3290.0,3264.0,2848,3712,363.6,"void dot_kernel<float, (int)128, (int)0, cublasDotParams<cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<float>>>(T4)"
+0.0,219230,80,2740.4,2736.0,2432,3072,299.4,"void reduce_1Block_kernel<float, (int)128, (int)7, cublasGemvTensorStridedBatched<float>, cublasGemvTensorStridedBatched<const __nv_bfloat16>, cublasGemvTensorStridedBatched<__nv_bfloat16>>(const T1 *, T1, T4, int, const T1 *, T1, T5, T6, cublasPointerMode_t, cublasLtEpilogue_t, cublasGemvTensorStridedBatched<const biasType<T6::value_type, T1>::type>)"
+0.0,194845,4,48711.3,44591.0,6752,98911,48652.9,gemma_rms_norm_bf16_entry
+0.0,159614,4,39903.5,36351.5,3168,83743,42664.8,embedding_bf16_entry
+0.0,44480,2,22240.0,22240.0,21920,22560,452.5,argmax_blocks_batch_bf16_entry
+0.0,6559,2,3279.5,3279.5,3199,3360,113.8,argmax_reduce_batch_bf16_entry
+0.0,4831,2,2415.5,2415.5,2367,2464,68.6,gather_rows_bf16_entry
+

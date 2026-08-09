@@ -80,11 +80,28 @@ and
 
 The exact half-window result is 14.88 times slower than SGLang's TTFT and
 14.52 times lower in input-token throughput. Sustained GPU utilization was
-99--100%, so the dominant failure mode is no longer host synchronization. The
-next comparison must measure GPU kernel time by family; full attention remains
-the leading structural suspect because its work grows quadratically with
-context and the cuTile kernel still lacks the mature warp-specialized pipeline
-and paged-KV access path used by production FlashAttention implementations.
+99--100%, so the dominant failure mode is no longer host synchronization.
+
+An Nsight Systems capture of one warmup and one measured 8K request ranks the
+GPU work as follows:
+
+| Kernel family | GPU time | Share |
+| --- | ---: | ---: |
+| FP8 W8A16 linear | 16.554 s | 62.2% |
+| Grouped NVFP4 W4A16 MoE down | 4.106 s | 15.4% |
+| Fused grouped NVFP4 gate/up/SILU | 3.088 s | 11.6% |
+| Dense NVFP4 W4A16 linear | 1.566 s | 5.9% |
+| GDN state output and convolution | 0.618 s | 2.3% |
+| Full prefill attention | 0.252 s | 0.9% |
+
+Quantized linear and MoE kernels therefore account for 95.1% of captured GPU
+time; full attention is not the next bottleneck at this prompt size. The next
+backend work should target A100 Marlin-class FP8 W8A16 and grouped NVFP4
+W4A16 kernels, keeping their selection behind the linear and MoE abstractions.
+The raw capture is
+[`8k-profile.nsys-rep`](../benchmarks/2026-08-09-qwen-serving/post-tiled/8k-profile.nsys-rep)
+and the extracted table is
+[`8k-kernel-summary.csv`](../benchmarks/2026-08-09-qwen-serving/post-tiled/8k-kernel-summary.csv).
 
 The built-in half-window command is:
 
