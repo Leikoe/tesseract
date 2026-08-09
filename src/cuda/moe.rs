@@ -38,8 +38,8 @@ mod kernels {
         let negative_infinity: Tile<f32, { [1, 256] }> =
             broadcast_scalar(NEGATIVE_INFINITY, const_shape![1, 256]);
         let invalid_expert: Tile<i32, { [1, 256] }> =
-            constant(INVALID_EXPERT, const_shape![1, 256]);
-        let one: Tile<i32, { [1] }> = constant(ONE_I32, const_shape![1]);
+            broadcast_scalar(INVALID_EXPERT, const_shape![1, 256]);
+        let one: Tile<i32, { [1] }> = broadcast_scalar(ONE_I32, const_shape![1]);
         let counts: PointerTile<*mut i32, { [] }> = pointer_to_tile(counts_ptr);
         let counts: PointerTile<*mut i32, { [1] }> = counts.reshape(const_shape![1]);
         let mut ids = unsafe { ids.partition_mut(const_shape![1, 1]) };
@@ -79,7 +79,6 @@ mod kernels {
 
     #[cutile::entry()]
     fn renormalize_top8(weights: &mut Tensor<f32, { [1, 8] }>) {
-        const ZERO: f32 = 0.0;
         let logits = load_tile_mut(weights);
         let maximum: Tile<f32, { [1] }> = reduce_max(logits, 1i32);
         let maximum = maximum
@@ -87,8 +86,7 @@ mod kernels {
             .broadcast(const_shape![1, 8]);
         let exponentials = exp(logits - maximum);
         let sum: Tile<f32, { [1] }> = reduce_sum(exponentials, 1i32);
-        let zero: Tile<f32, { [1] }> = constant(ZERO, const_shape![1]);
-        let denominator = max_tile(sum, zero)
+        let denominator = sum
             .reshape(const_shape![1, 1])
             .broadcast(const_shape![1, 8]);
         weights.store(true_div(exponentials, denominator));
@@ -105,8 +103,8 @@ mod kernels {
         const SCAN_IDENTITY: i32 = 0;
         let counts = counts.load_tile(const_shape![256], [0i32]);
         let alignment_minus_one: Tile<i32, { [256] }> =
-            constant(ALIGNMENT_MINUS_ONE, const_shape![256]);
-        let alignment: Tile<i32, { [256] }> = constant(ALIGNMENT, const_shape![256]);
+            broadcast_scalar(ALIGNMENT_MINUS_ONE, const_shape![256]);
+        let alignment: Tile<i32, { [256] }> = broadcast_scalar(ALIGNMENT, const_shape![256]);
         let padded = ((counts + alignment_minus_one) / alignment) * alignment;
         let inclusive = scan_sum(padded, 0i32, reverse::Forward, SCAN_IDENTITY);
         let exclusive = inclusive - padded;
@@ -125,7 +123,7 @@ mod kernels {
         let expert = ids.partition(const_shape![1, 1]).load([pid.0, pid.1]);
         let cursors: PointerTile<*mut i32, { [] }> = pointer_to_tile(cursors_ptr);
         let cursors: PointerTile<*mut i32, { [1, 1] }> = cursors.reshape(const_shape![1, 1]);
-        let one: Tile<i32, { [1, 1] }> = constant(ONE_I32, const_shape![1, 1]);
+        let one: Tile<i32, { [1, 1] }> = broadcast_scalar(ONE_I32, const_shape![1, 1]);
         let (position, _token): (Tile<i32, { [1, 1] }>, Token) = atomic_rmw_tko(
             cursors.offset_tile(expert),
             one,
