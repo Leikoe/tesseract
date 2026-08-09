@@ -36,7 +36,7 @@ mod kernels {
         let expert: Tile<i32, { [256] }> = iota(const_shape![256]);
         let expert: Tile<i32, { [1, 256] }> = expert.reshape(const_shape![1, 256]);
         let negative_infinity: Tile<f32, { [1, 256] }> =
-            constant(NEGATIVE_INFINITY, const_shape![1, 256]);
+            broadcast_scalar(NEGATIVE_INFINITY, const_shape![1, 256]);
         let invalid_expert: Tile<i32, { [1, 256] }> =
             constant(INVALID_EXPERT, const_shape![1, 256]);
         let one: Tile<i32, { [1] }> = constant(ONE_I32, const_shape![1]);
