@@ -1163,3 +1163,15 @@ fn verify(
     }
     Ok(max_error)
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device"]
+    fn native_grouped_marlin_matches_cpu_oracle() {
+        let device = cuda_core::Device::new(0).expect("initialize CUDA device");
+        let stream = device.new_stream().expect("create CUDA stream");
+        let max_error = super::probe_grouped_nvfp4(&stream).expect("run grouped Marlin probe");
+        assert!(max_error <= 0.5, "grouped Marlin max error {max_error}");
+    }
+}

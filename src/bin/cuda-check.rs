@@ -26,6 +26,10 @@ fn main() -> anyhow::Result<()> {
     print_capability("qwen_full_attention", quantized.qwen_full_attention);
     println!("marlin_fp8_max_abs_error={}", marlin.fp8_max_abs_error);
     println!("marlin_nvfp4_max_abs_error={}", marlin.nvfp4_max_abs_error);
+    println!(
+        "marlin_grouped_nvfp4_max_abs_error={}",
+        marlin.grouped_nvfp4_max_abs_error
+    );
     println!("cutile_probe=ok");
     Ok(())
 }
