@@ -103,6 +103,15 @@ The raw capture is
 and the extracted table is
 [`8k-kernel-summary.csv`](../benchmarks/2026-08-09-qwen-serving/post-tiled/8k-kernel-summary.csv).
 
+Revision `157c915` widened the dense FP8 and NVFP4 output tile from 16 to 64
+columns and placed it on the same bounded persistent-worker scheme as grouped
+MoE. Its isolated differential probe passed on the A100. Warm 8K TTFT improved
+from 13.26756 to 13.14342 seconds (0.94%), or 623.98 input tokens/second. This
+small result rules out output-tile width alone as the missing optimization:
+the next backend needs Marlin-style load-time weight repacking and a staged
+dequantize/MMA pipeline. The raw report is
+[`dense64-warm-8192.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/dense64-warm-8192.json).
+
 The built-in half-window command is:
 
 ```text
