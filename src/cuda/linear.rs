@@ -403,7 +403,7 @@ mod kernels {
 
     fn decode_fp8_wide(
         encoded: Tile<i32, { [64, 16] }>,
-        subnormal_scale: f32,
+        _subnormal_scale: f32,
     ) -> Tile<f32, { [64, 16] }> {
         let shape = const_shape![64, 16];
         const BYTE_MODULUS: i32 = 256;
@@ -418,25 +418,69 @@ mod kernels {
         let divisor_i32 = broadcast_scalar(MANTISSA_DIVISOR, shape);
         let exponent = magnitude / divisor_i32;
         let mantissa = magnitude % divisor_i32;
-        let exponent_f: Tile<f32, { [64, 16] }> = convert_tile(exponent);
-        let mantissa_f: Tile<f32, { [64, 16] }> = convert_tile(mantissa);
-        const ONE_F32: f32 = 1.0;
-        let one_f = broadcast_scalar(ONE_F32, shape);
-        const EIGHT_F32: f32 = 8.0;
-        let eight_f = broadcast_scalar(EIGHT_F32, shape);
-        const EXPONENT_BIAS: f32 = 7.0;
-        let exponent_bias = broadcast_scalar(EXPONENT_BIAS, shape);
-        let subnormal_scale = broadcast_scalar(subnormal_scale, shape);
-        let normal = (one_f + true_div(mantissa_f, eight_f))
-            * exp2(exponent_f - exponent_bias, ftz::Disabled);
-        let subnormal = mantissa_f * subnormal_scale;
-        let magnitude = select(eq_tile(exponent, zero_i32), subnormal, normal);
-        const ZERO_F32: f32 = 0.0;
-        let zero_f = broadcast_scalar(ZERO_F32, shape);
-        let negative = zero_f - magnitude;
-        const ONE_I32: i32 = 1;
-        let one_i32 = broadcast_scalar(ONE_I32, shape);
-        select(eq_tile(sign, one_i32), negative, magnitude)
+
+        // A normal E4M3 value has the same explicit mantissa bits as BF16.
+        // Rebias its exponent from 7 to 127 and shift the three mantissa bits
+        // into BF16's seven-bit mantissa field. This avoids an `exp2` per
+        // weight while preserving the exact BF16 value consumed by MMA.
+        const BF16_EXPONENT_REBIAS: i32 = 120;
+        const BF16_EXPONENT_SHIFT: i32 = 128;
+        const BF16_MANTISSA_SHIFT: i32 = 16;
+        let normal_bits = (exponent + broadcast_scalar(BF16_EXPONENT_REBIAS, shape))
+            * broadcast_scalar(BF16_EXPONENT_SHIFT, shape)
+            + mantissa * broadcast_scalar(BF16_MANTISSA_SHIFT, shape);
+
+        // E4M3 subnormals are m * 2^-9 for m in 0..=7. Their normalized BF16
+        // encodings are small enough to select directly and exactly.
+        const SUBNORMAL_1: i32 = 0x3b00;
+        const SUBNORMAL_2: i32 = 0x3b80;
+        const SUBNORMAL_3: i32 = 0x3bc0;
+        const SUBNORMAL_4: i32 = 0x3c00;
+        const SUBNORMAL_5: i32 = 0x3c20;
+        const SUBNORMAL_6: i32 = 0x3c40;
+        const SUBNORMAL_7: i32 = 0x3c60;
+        let mut subnormal_bits = zero_i32;
+        subnormal_bits = select(
+            eq_tile(mantissa, broadcast_scalar(1i32, shape)),
+            broadcast_scalar(SUBNORMAL_1, shape),
+            subnormal_bits,
+        );
+        subnormal_bits = select(
+            eq_tile(mantissa, broadcast_scalar(2i32, shape)),
+            broadcast_scalar(SUBNORMAL_2, shape),
+            subnormal_bits,
+        );
+        subnormal_bits = select(
+            eq_tile(mantissa, broadcast_scalar(3i32, shape)),
+            broadcast_scalar(SUBNORMAL_3, shape),
+            subnormal_bits,
+        );
+        subnormal_bits = select(
+            eq_tile(mantissa, broadcast_scalar(4i32, shape)),
+            broadcast_scalar(SUBNORMAL_4, shape),
+            subnormal_bits,
+        );
+        subnormal_bits = select(
+            eq_tile(mantissa, broadcast_scalar(5i32, shape)),
+            broadcast_scalar(SUBNORMAL_5, shape),
+            subnormal_bits,
+        );
+        subnormal_bits = select(
+            eq_tile(mantissa, broadcast_scalar(6i32, shape)),
+            broadcast_scalar(SUBNORMAL_6, shape),
+            subnormal_bits,
+        );
+        subnormal_bits = select(
+            eq_tile(mantissa, broadcast_scalar(7i32, shape)),
+            broadcast_scalar(SUBNORMAL_7, shape),
+            subnormal_bits,
+        );
+        let magnitude_bits = select(eq_tile(exponent, zero_i32), subnormal_bits, normal_bits);
+        const BF16_SIGN_BIT: i32 = 0x8000;
+        let bits = magnitude_bits + sign * broadcast_scalar(BF16_SIGN_BIT, shape);
+        let bits: Tile<u16, { [64, 16] }> = trunci(bits, overflow::None);
+        let decoded: Tile<bf16, { [64, 16] }> = bitcast(bits);
+        convert_tile(decoded)
     }
 }
 
@@ -1235,7 +1279,7 @@ impl GroupedNvfp4W4A16 {
 fn grouped_tile_rows(rows: usize, map_rows: usize) -> Result<usize, ModelError> {
     let tile_rows = rows
         .checked_div(map_rows)
-        .filter(|tile_rows| rows % map_rows == 0)
+        .filter(|_| rows % map_rows == 0)
         .ok_or_else(|| ModelError::Cuda("invalid grouped expert row-map geometry".into()))?;
     if matches!(tile_rows, GROUPED_SMALL_TILE_M | GROUPED_LARGE_TILE_M) {
         Ok(tile_rows)
