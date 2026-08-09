@@ -40,7 +40,9 @@ impl CudaBatch {
         self.request_indices.reserve(batch.num_tokens());
         self.recurrent_slots.reserve(batch.len());
         self.context_lengths.reserve(batch.num_tokens());
-        self.context_storage.resize_with(batch.len(), Vec::new);
+        if self.context_storage.len() < batch.len() {
+            self.context_storage.resize_with(batch.len(), Vec::new);
+        }
         for context in &mut self.context_storage[..batch.len()] {
             context.clear();
         }
