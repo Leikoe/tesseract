@@ -35,8 +35,9 @@ The warm source artifact is
 
 This is already conclusive: warm Tesseract takes 1.79 times SGLang's 131K
 TTFT while processing only one sixteenth as much input. The exact 131K
-Tesseract run was started separately and must be recorded below when it
-finishes or fails.
+Tesseract run started at this revision was cancelled because CUDA validation
+probes from a second process contaminated the measurement. It is not reported
+as a result.
 
 ## Structural causes established from local source
 
@@ -58,15 +59,40 @@ fused routed gate/up/activation; merged GDN projections; persistent async
 full-attention buffers; then graph capture. Graph capture cannot repair the
 current kernel geometry.
 
-## Exact Tesseract 131K result
+## Tiled-attention and fused-MoE result
 
-Pending. The built-in command is:
+Revisions `771f509` through `dff5143` add a request-aware `BM=64`, `BN=64`
+prefill-attention path, retain the `BM=1` path for pure decode, and fuse routed
+NVFP4 gate/up grouped GEMM with SiLU multiplication. Both new kernels passed
+isolated numerical differential tests on the A100 before benchmarking.
+
+With the server and benchmark client as the only GPU and request processes:
+
+| Prompt | TTFT | Input throughput | Previous TTFT | Improvement |
+| --- | ---: | ---: | ---: | ---: |
+| 8,202 tokens after templating | 13.26756 s | 618.14 tok/s | 28.680956 s | 2.16x |
+| 131,072 tokens after templating | 237.88277 s | 550.99 tok/s | incomplete | n/a |
+
+The raw reports are retained as
+[`warm-8192.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/warm-8192.json)
+and
+[`half-window.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/half-window.json).
+
+The exact half-window result is 14.88 times slower than SGLang's TTFT and
+14.52 times lower in input-token throughput. Sustained GPU utilization was
+99--100%, so the dominant failure mode is no longer host synchronization. The
+next comparison must measure GPU kernel time by family; full attention remains
+the leading structural suspect because its work grows quadratically with
+context and the cuTile kernel still lacks the mature warp-specialized pipeline
+and paged-KV access path used by production FlashAttention implementations.
+
+The built-in half-window command is:
 
 ```text
 tesseract bench --base-url http://127.0.0.1:18100 \
   --model nvidia/Qwen3.6-35B-A3B-NVFP4 \
   --tokenizer /home/ubuntu/models/Qwen3.6-35B-A3B-NVFP4/tokenizer.json \
-  --num-prompts 1 --warmup-requests 0 --input-len 131072 \
+  --num-prompts 1 --warmup-requests 0 --input-len 131062 \
   --output-len 1 --length-variation 0 --max-concurrency 1 \
   --timeout-seconds 1800
 ```
