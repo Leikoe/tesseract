@@ -11,7 +11,7 @@ use cutile::{
     tile_kernel::TileKernel,
 };
 
-use crate::model::ModelError;
+use crate::{cuda::execution::StreamExecution, model::ModelError};
 
 const TOP_K: usize = 8;
 const EXPERTS: usize = 256;
@@ -293,7 +293,7 @@ pub(crate) fn combine_shared(
     gate_logits: Arc<Tensor<bf16>>,
     rows: usize,
     hidden_size: usize,
-    stream: &Arc<Stream>,
+    execution: &mut StreamExecution<'_>,
 ) -> Result<Tensor<bf16>, ModelError> {
     const BLOCK: usize = 256;
     if rows == 0
@@ -307,20 +307,22 @@ pub(crate) fn combine_shared(
             "invalid shared-expert combine geometry".into(),
         ));
     }
-    // SAFETY: the allocation is immediately consumed on the same stream, and
-    // the following combine launch is the layer's synchronization boundary.
-    let mut output = unsafe { api::zeros::<bf16>(&[rows, hidden_size]).async_on(stream) }
-        .map_err(|error| ModelError::Cuda(format!("allocate shared-expert output: {error:?}")))?;
-    let (_, _, _, output_partition) = combine_shared_expert_bf16(
-        routed,
-        shared,
-        gate_logits,
-        (&mut output).partition([1, BLOCK]),
-    )
-    .generics(vec![hidden_size.to_string(), BLOCK.to_string()])
-    .sync_on(stream)
-    .map_err(|error| ModelError::Cuda(format!("combine shared expert: {error:?}")))?;
+    let mut output = execution.enqueue(
+        api::zeros::<bf16>(&[rows, hidden_size]),
+        "allocate shared-expert output",
+    )?;
+    let (_, _, _, output_partition) = execution.enqueue(
+        combine_shared_expert_bf16(
+            routed,
+            shared,
+            gate_logits,
+            (&mut output).partition([1, BLOCK]),
+        )
+        .generics(vec![hidden_size.to_string(), BLOCK.to_string()]),
+        "combine shared expert",
+    )?;
     drop(output_partition);
+    execution.synchronize("complete Qwen MoE layer")?;
     Ok(output)
 }
 
@@ -342,8 +344,10 @@ impl RoutingPlan {
     pub(crate) fn build(
         logits: Arc<Tensor<bf16>>,
         rows: usize,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<Self, ModelError> {
+        execution.mark_pending();
+        let stream = execution.stream();
         if rows == 0
             || logits.shape().len() != 2
             || logits.shape()[0] < rows as i32
@@ -434,8 +438,10 @@ impl RoutingPlan {
         hidden: Arc<Tensor<bf16>>,
         rows: usize,
         hidden_size: usize,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<Dispatched, ModelError> {
+        execution.mark_pending();
+        let stream = execution.stream();
         const BLOCK: usize = 256;
         if hidden_size == 0
             || !hidden_size.is_multiple_of(BLOCK)
@@ -494,8 +500,10 @@ impl RoutingPlan {
         rows: usize,
         output_rows: usize,
         hidden_size: usize,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<Tensor<bf16>, ModelError> {
+        execution.mark_pending();
+        let stream = execution.stream();
         const BLOCK: usize = 256;
         if hidden_size == 0
             || !hidden_size.is_multiple_of(BLOCK)
@@ -536,6 +544,7 @@ pub(crate) struct RoutingProbe {
 }
 
 pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
+    let mut execution = StreamExecution::new(stream);
     let rows = 3usize;
     let host = (0..rows * EXPERTS)
         .map(|index| {
@@ -548,7 +557,7 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
         .map_err(|error| ModelError::Cuda(format!("upload router probe: {error:?}")))?
         .reshape(&[rows, EXPERTS])
         .map_err(|error| ModelError::Cuda(format!("reshape router probe: {error:?}")))?;
-    let plan = RoutingPlan::build(Arc::new(logits), rows, stream)?;
+    let plan = RoutingPlan::build(Arc::new(logits), rows, &mut execution)?;
     let ids: Vec<i32> = download(&plan.expert_ids, stream, "router IDs")?;
     let weights: Vec<f32> = download(&plan.weights, stream, "router weights")?;
     let positions: Vec<i32> = download(&plan.positions, stream, "dispatch positions")?;
@@ -593,7 +602,7 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
         .map_err(|error| ModelError::Cuda(format!("upload dispatch probe: {error:?}")))?
         .reshape(&[rows, hidden_size])
         .map_err(|error| ModelError::Cuda(format!("reshape dispatch probe: {error:?}")))?;
-    let dispatched = plan.dispatch(Arc::new(hidden), rows, hidden_size, stream)?;
+    let dispatched = plan.dispatch(Arc::new(hidden), rows, hidden_size, &mut execution)?;
     let dispatched_host: Vec<bf16> = download(&dispatched.hidden, stream, "dispatched rows")?;
     let expert_by_tile: Vec<i32> =
         download(&dispatched.expert_by_row_tile, stream, "expert row map")?;
@@ -608,7 +617,8 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
             )));
         }
     }
-    let combined = Arc::new(plan.combine(dispatched.hidden, rows, rows, hidden_size, stream)?);
+    let combined =
+        Arc::new(plan.combine(dispatched.hidden, rows, rows, hidden_size, &mut execution)?);
     let combined_host = download(&combined, stream, "combined rows")?;
     for (index, (actual, expected)) in combined_host.iter().zip(&hidden_host).enumerate() {
         if (actual.to_f32() - expected.to_f32()).abs() > 1.0e-2 {
@@ -633,7 +643,7 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
         Arc::new(gate_logits),
         rows,
         hidden_size,
-        stream,
+        &mut execution,
     )?;
     let with_shared: Vec<bf16> = with_shared
         .to_host_vec()

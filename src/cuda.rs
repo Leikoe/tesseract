@@ -19,6 +19,7 @@ pub(crate) mod attention;
 pub(crate) mod batch;
 pub(crate) mod cublas;
 pub(crate) mod dense_decoder;
+pub(crate) mod execution;
 pub(crate) mod executor;
 pub(crate) mod gdn;
 pub(crate) mod kernel_plan;

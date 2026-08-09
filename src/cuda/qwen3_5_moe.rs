@@ -20,6 +20,7 @@ use crate::{
 use super::{
     batch::{CudaBatch, SampleTarget},
     cublas,
+    execution::StreamExecution,
     executor::{CudaExecutor, ModelProgram, ProgramOutput},
     gdn::{self as gdn_backend, GdnPrefillPlan, GdnState},
     kernels,
@@ -494,6 +495,7 @@ impl Program {
         } else {
             None
         };
+        let mut execution = StreamExecution::new(stream);
 
         let mut pending: Option<(Bf16Tensor, Bf16Tensor)> = None;
         let mut full_layer = 0usize;
@@ -519,7 +521,7 @@ impl Program {
                         rows,
                         logical_rows,
                         self.config.rms_norm_eps,
-                        stream,
+                        &mut execution,
                     )?
                 }
                 Attention::Full(_) => {
@@ -539,7 +541,7 @@ impl Program {
                         rows,
                         logical_rows,
                         self.config.rms_norm_eps,
-                        stream,
+                        &mut execution,
                     )?;
                     full_layer += 1;
                     result
@@ -549,6 +551,7 @@ impl Program {
         }
 
         if batch.samples.is_empty() {
+            execution.synchronize("complete Qwen forward")?;
             return Ok(ProgramOutput::None);
         }
         let (residual, update) =
@@ -561,13 +564,14 @@ impl Program {
             self.config.rms_norm_eps,
             stream,
         )?;
-        self.sample(final_hidden, batch)
+        self.sample(final_hidden, batch, &mut execution)
     }
 
     fn sample(
         &self,
         final_hidden: Bf16Tensor,
         batch: &CudaBatch,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<ProgramOutput, ModelError> {
         const ARGMAX_BLOCK: usize = 256;
         const ARGMAX_REDUCE_BLOCK: usize = 1024;
@@ -595,7 +599,7 @@ impl Program {
         let logits =
             self.checkpoint
                 .lm_head
-                .enqueue(Arc::new(sampled_hidden), sample_rows, &self.stream)?;
+                .enqueue(Arc::new(sampled_hidden), sample_rows, execution)?;
         if batch.all_samples_greedy {
             let blocks = self.config.vocab_size.div_ceil(ARGMAX_BLOCK);
             let mut block_max = api::zeros::<f32>(&[sample_rows, blocks])
@@ -639,6 +643,7 @@ impl Program {
                 .map_err(|error| {
                     ModelError::Cuda(format!("download Qwen sampled tokens: {error:?}"))
                 })?;
+            execution.mark_synchronized();
             sampled.truncate(samples);
             return Ok(ProgramOutput::Tokens(
                 sampled.into_iter().map(TokenId::new).collect(),
@@ -648,6 +653,7 @@ impl Program {
             .to_host_vec()
             .sync_on(&self.stream)
             .map_err(|error| ModelError::Cuda(format!("download Qwen logits: {error:?}")))?;
+        execution.mark_synchronized();
         let mut logits = logits.into_iter().map(bf16::to_f32).collect::<Vec<_>>();
         logits.truncate(samples * self.config.vocab_size);
         Ok(ProgramOutput::HostLogits {
@@ -795,8 +801,9 @@ impl Layer {
         rows: usize,
         logical_rows: usize,
         epsilon: f32,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
+        let stream = execution.stream().clone();
         let (attention_input, residual) = match update {
             Some(update) => gemma_add_rms_norm(
                 residual,
@@ -804,7 +811,7 @@ impl Layer {
                 self.input_norm.clone(),
                 rows,
                 epsilon,
-                stream,
+                &stream,
             )?,
             None => (
                 gemma_rms_norm(
@@ -812,7 +819,7 @@ impl Layer {
                     self.input_norm.clone(),
                     rows,
                     epsilon,
-                    stream,
+                    &stream,
                 )?,
                 residual,
             ),
@@ -829,7 +836,7 @@ impl Layer {
             prefill,
             rows,
             epsilon,
-            stream,
+            execution,
         )?;
         let (moe_input, residual) = gemma_add_rms_norm(
             residual,
@@ -837,9 +844,9 @@ impl Layer {
             self.post_attention_norm.clone(),
             rows,
             epsilon,
-            stream,
+            &stream,
         )?;
-        let moe_output = self.moe.forward(moe_input, rows, logical_rows, stream)?;
+        let moe_output = self.moe.forward(moe_input, rows, logical_rows, execution)?;
         Ok((residual, Arc::new(moe_output)))
     }
 
@@ -858,8 +865,9 @@ impl Layer {
         rows: usize,
         logical_rows: usize,
         epsilon: f32,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
+        let stream = execution.stream().clone();
         let (attention_input, residual) = match update {
             Some(update) => gemma_add_rms_norm(
                 residual,
@@ -867,7 +875,7 @@ impl Layer {
                 self.input_norm.clone(),
                 rows,
                 epsilon,
-                stream,
+                &stream,
             )?,
             None => (
                 gemma_rms_norm(
@@ -875,7 +883,7 @@ impl Layer {
                     self.input_norm.clone(),
                     rows,
                     epsilon,
-                    stream,
+                    &stream,
                 )?,
                 residual,
             ),
@@ -896,7 +904,7 @@ impl Layer {
             context_lengths,
             rows,
             epsilon,
-            stream,
+            execution,
         )?;
         let (moe_input, residual) = gemma_add_rms_norm(
             residual,
@@ -904,9 +912,9 @@ impl Layer {
             self.post_attention_norm.clone(),
             rows,
             epsilon,
-            stream,
+            &stream,
         )?;
-        let moe_output = self.moe.forward(moe_input, rows, logical_rows, stream)?;
+        let moe_output = self.moe.forward(moe_input, rows, logical_rows, execution)?;
         Ok((residual, Arc::new(moe_output)))
     }
 }
@@ -942,14 +950,15 @@ impl LinearAttention {
         prefill: Option<&GdnPrefillPlan>,
         rows: usize,
         epsilon: f32,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<Tensor<bf16>, ModelError> {
         const HIDDEN_SIZE: usize = 2048;
         const VALUE_SIZE: usize = 4096;
         if !rows.is_multiple_of(16) || hidden.shape() != [rows as i32, HIDDEN_SIZE as i32] {
             return Err(ModelError::Cuda("invalid Qwen GDN input geometry".into()));
         }
-        let mixed_qkv = Arc::new(self.input_qkv.enqueue(hidden.clone(), rows, stream)?);
+        let stream = execution.stream().clone();
+        let mixed_qkv = Arc::new(self.input_qkv.enqueue(hidden.clone(), rows, execution)?);
         let mixed_qkv = Arc::new(match prefill {
             Some(plan) => state.prefill_conv(
                 mixed_qkv,
@@ -958,14 +967,14 @@ impl LinearAttention {
                 state_slots.clone(),
                 rows,
                 plan.requests(),
-                stream,
+                &stream,
             )?,
             None => state.decode_conv(
                 mixed_qkv,
                 self.conv1d.clone(),
                 state_slots.clone(),
                 rows,
-                stream,
+                &stream,
             )?,
         });
         let a = bf16_gemm(
@@ -975,7 +984,7 @@ impl LinearAttention {
             rows,
             HIDDEN_SIZE,
             "Qwen GDN a projection",
-            stream,
+            &stream,
         )?;
         let b = bf16_gemm(
             self.input_b.clone(),
@@ -984,7 +993,7 @@ impl LinearAttention {
             rows,
             HIDDEN_SIZE,
             "Qwen GDN b projection",
-            stream,
+            &stream,
         )?;
         let recurrent = Arc::new(match prefill {
             Some(plan) => state.prefill(
@@ -995,7 +1004,7 @@ impl LinearAttention {
                 self.dt_bias.clone(),
                 state_slots,
                 plan,
-                stream,
+                &stream,
             )?,
             None => state.decode(
                 mixed_qkv,
@@ -1005,12 +1014,12 @@ impl LinearAttention {
                 self.dt_bias.clone(),
                 state_slots,
                 rows,
-                stream,
+                &stream,
             )?,
         });
         let gate = self
             .input_z
-            .enqueue(hidden, rows, stream)?
+            .enqueue(hidden, rows, execution)?
             .reshape(&[rows, 32, 128])
             .map_err(|error| ModelError::Cuda(format!("reshape Qwen GDN z gate: {error:?}")))?;
         let gated = gdn_backend::output_gate(
@@ -1019,11 +1028,11 @@ impl LinearAttention {
             self.norm.clone(),
             epsilon,
             rows,
-            stream,
+            &stream,
         )?
         .reshape(&[rows, VALUE_SIZE])
         .map_err(|error| ModelError::Cuda(format!("reshape Qwen GDN output: {error:?}")))?;
-        self.output.enqueue(Arc::new(gated), rows, stream)
+        self.output.enqueue(Arc::new(gated), rows, execution)
     }
 }
 
@@ -1050,11 +1059,12 @@ impl FullAttention {
         context_lengths: Arc<Tensor<i32>>,
         rows: usize,
         epsilon: f32,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<Tensor<bf16>, ModelError> {
-        let q_gate = Arc::new(self.query.enqueue(hidden.clone(), rows, stream)?);
-        let key = Arc::new(self.key.enqueue(hidden.clone(), rows, stream)?);
-        let value = Arc::new(self.value.enqueue(hidden, rows, stream)?);
+        let stream = execution.stream().clone();
+        let q_gate = Arc::new(self.query.enqueue(hidden.clone(), rows, execution)?);
+        let key = Arc::new(self.key.enqueue(hidden.clone(), rows, execution)?);
+        let value = Arc::new(self.value.enqueue(hidden, rows, execution)?);
         let attention = backend.enqueue(AttentionInput {
             layer,
             q_gate,
@@ -1069,9 +1079,9 @@ impl FullAttention {
             context_lengths,
             rows,
             epsilon,
-            stream,
+            stream: &stream,
         })?;
-        self.output.enqueue(Arc::new(attention), rows, stream)
+        self.output.enqueue(Arc::new(attention), rows, execution)
     }
 }
 
@@ -1092,7 +1102,7 @@ impl Moe {
         hidden: Bf16Tensor,
         rows: usize,
         logical_rows: usize,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<Tensor<bf16>, ModelError> {
         const HIDDEN_SIZE: usize = 2048;
         if logical_rows == 0
@@ -1103,6 +1113,7 @@ impl Moe {
             return Err(ModelError::Cuda("invalid Qwen MoE input geometry".into()));
         }
 
+        let stream = execution.stream().clone();
         let router_logits = bf16_gemm(
             self.router.clone(),
             hidden.clone(),
@@ -1110,56 +1121,56 @@ impl Moe {
             rows,
             HIDDEN_SIZE,
             "Qwen routed-expert logits",
-            stream,
+            &stream,
         )?;
-        let routing = RoutingPlan::build(router_logits, logical_rows, stream)?;
-        let dispatched = routing.dispatch(hidden.clone(), logical_rows, HIDDEN_SIZE, stream)?;
+        let routing = RoutingPlan::build(router_logits, logical_rows, execution)?;
+        let dispatched = routing.dispatch(hidden.clone(), logical_rows, HIDDEN_SIZE, execution)?;
         let dispatched_rows = routing.max_dispatched_rows;
         let routed_gate = self.routed_gate.enqueue_device_plan(
             dispatched.hidden.clone(),
             dispatched_rows,
             dispatched.expert_by_row_tile.clone(),
-            stream,
+            execution,
         )?;
         let routed_up = self.routed_up.enqueue_device_plan(
             dispatched.hidden,
             dispatched_rows,
             dispatched.expert_by_row_tile.clone(),
-            stream,
+            execution,
         )?;
         let routed_activated = silu_mul(
             Arc::new(routed_gate),
             Arc::new(routed_up),
             dispatched_rows,
             self.routed_gate.output_size(),
-            stream,
+            &stream,
         )?;
         let routed_down = self.routed_down.enqueue_device_plan(
             Arc::new(routed_activated),
             dispatched_rows,
             dispatched.expert_by_row_tile,
-            stream,
+            execution,
         )?;
         let routed = routing.combine(
             Arc::new(routed_down),
             logical_rows,
             rows,
             HIDDEN_SIZE,
-            stream,
+            execution,
         )?;
 
-        let shared_gate = self.shared_gate.enqueue(hidden.clone(), rows, stream)?;
-        let shared_up = self.shared_up.enqueue(hidden.clone(), rows, stream)?;
+        let shared_gate = self.shared_gate.enqueue(hidden.clone(), rows, execution)?;
+        let shared_up = self.shared_up.enqueue(hidden.clone(), rows, execution)?;
         let shared_activated = silu_mul(
             Arc::new(shared_gate),
             Arc::new(shared_up),
             rows,
             self.shared_gate.output_size(),
-            stream,
+            &stream,
         )?;
         let shared = self
             .shared_down
-            .enqueue(Arc::new(shared_activated), rows, stream)?;
+            .enqueue(Arc::new(shared_activated), rows, execution)?;
         let shared_logits = bf16_gemm(
             self.shared_router.clone(),
             hidden,
@@ -1167,7 +1178,7 @@ impl Moe {
             rows,
             HIDDEN_SIZE,
             "Qwen shared-expert gate",
-            stream,
+            &stream,
         )?;
         moe_backend::combine_shared(
             Arc::new(routed),
@@ -1175,7 +1186,7 @@ impl Moe {
             shared_logits,
             rows,
             HIDDEN_SIZE,
-            stream,
+            execution,
         )
     }
 }

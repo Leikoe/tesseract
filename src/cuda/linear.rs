@@ -16,6 +16,7 @@ use cutile::{
 };
 
 use crate::{
+    cuda::execution::StreamExecution,
     model::{
         ModelError,
         weights::{WeightDtype, WeightSource, WeightTensor},
@@ -349,7 +350,7 @@ impl Fp8W8A16Linear {
         &self,
         input: Arc<Tensor<bf16>>,
         rows: usize,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<Tensor<bf16>, ModelError> {
         if rows == 0 || !rows.is_multiple_of(TILE_M) {
             return Err(ModelError::Cuda(format!(
@@ -363,13 +364,11 @@ impl Fp8W8A16Linear {
                 input.shape()
             )));
         }
-        // SAFETY: the returned tensor remains device-only and every consumer is
-        // enqueued on this same model-owned stream before a layer boundary sync.
-        let mut output = unsafe { api::zeros::<bf16>(&[rows, self.output_size]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate FP8 output: {error:?}")))?;
-        // SAFETY: allocation, inputs, and this launch are ordered on `stream`;
-        // callers keep the result device-resident until the layer boundary.
-        unsafe {
+        let mut output = execution.enqueue(
+            api::zeros::<bf16>(&[rows, self.output_size]),
+            "allocate FP8 output",
+        )?;
+        execution.enqueue(
             fp8_w8a16(
                 (&mut output).partition([TILE_M, TILE_N]),
                 input,
@@ -377,10 +376,9 @@ impl Fp8W8A16Linear {
                 self.weight_scale,
                 FP8_SUBNORMAL_SCALE,
             )
-            .generics(vec![(self.input_size / TILE_N).to_string()])
-            .async_on(stream)
-        }
-        .map_err(|error| ModelError::Cuda(format!("execute FP8 W8A16: {error:?}")))?;
+            .generics(vec![(self.input_size / TILE_N).to_string()]),
+            "execute FP8 W8A16",
+        )?;
         Ok(output)
     }
 }
@@ -552,7 +550,7 @@ impl Nvfp4W4A16Linear {
         &self,
         input: Arc<Tensor<bf16>>,
         rows: usize,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<Tensor<bf16>, ModelError> {
         if rows == 0 || !rows.is_multiple_of(TILE_M) {
             return Err(ModelError::Cuda(format!(
@@ -566,12 +564,11 @@ impl Nvfp4W4A16Linear {
                 input.shape()
             )));
         }
-        // SAFETY: the output stays on the same ordered stream until the layer
-        // boundary synchronizes it.
-        let mut output = unsafe { api::zeros::<bf16>(&[rows, self.output_size]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate NVFP4 output: {error:?}")))?;
-        // SAFETY: all dependencies and the result use the same ordered stream.
-        unsafe {
+        let mut output = execution.enqueue(
+            api::zeros::<bf16>(&[rows, self.output_size]),
+            "allocate NVFP4 output",
+        )?;
+        execution.enqueue(
             nvfp4_w4a16(
                 (&mut output).partition([TILE_M, TILE_N]),
                 input,
@@ -579,10 +576,9 @@ impl Nvfp4W4A16Linear {
                 self.weight_scale.clone(),
                 self.weight_global_scale,
             )
-            .generics(vec![(self.input_size / GROUP_K).to_string()])
-            .async_on(stream)
-        }
-        .map_err(|error| ModelError::Cuda(format!("execute NVFP4 W4A16: {error:?}")))?;
+            .generics(vec![(self.input_size / GROUP_K).to_string()]),
+            "execute NVFP4 W4A16",
+        )?;
         Ok(output)
     }
 }
@@ -774,7 +770,7 @@ impl GroupedNvfp4W4A16 {
         dispatched: Arc<Tensor<bf16>>,
         rows: usize,
         expert_by_row_tile: &[i32],
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<Tensor<bf16>, ModelError> {
         if rows == 0
             || !rows.is_multiple_of(TILE_M)
@@ -796,27 +792,25 @@ impl GroupedNvfp4W4A16 {
         }
         let expert_by_row_tile =
             api::copy_host_vec_to_device(&Arc::new(expert_by_row_tile.to_vec()))
-                .sync_on(stream)
+                .sync_on(execution.stream())
                 .map_err(|error| {
                     ModelError::Cuda(format!("upload grouped expert map: {error:?}"))
                 })?;
-        // SAFETY: upload, allocation, launch, and downstream consumers are
-        // ordered on the same stream; the layer boundary performs the sync.
-        let mut output = unsafe { api::zeros::<bf16>(&[rows, self.output_size]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate grouped output: {error:?}")))?;
+        let mut output = execution.enqueue(
+            api::zeros::<bf16>(&[rows, self.output_size]),
+            "allocate grouped output",
+        )?;
         let logical_tiles = (rows / TILE_M)
             .checked_mul(self.output_size / GROUPED_TILE_N)
             .ok_or_else(|| ModelError::Cuda("grouped output tile count overflowed".into()))?;
-        let workers = logical_tiles.min(device_sm_count(stream)?);
+        let workers = logical_tiles.min(device_sm_count(execution.stream())?);
         let output_partition = (&mut output).partition([TILE_M, GROUPED_TILE_N]).map(
             [8, 1],
             u32::try_from(workers).map_err(|_| {
                 ModelError::Cuda("persistent grouped worker count overflowed u32".into())
             })?,
         );
-        // SAFETY: every input and output is stream-ordered and remains on the
-        // device until the enclosing MoE layer synchronizes.
-        unsafe {
+        execution.enqueue(
             grouped_nvfp4_w4a16(
                 output_partition,
                 dispatched,
@@ -825,10 +819,9 @@ impl GroupedNvfp4W4A16 {
                 self.weight_scale.clone(),
                 self.weight_global_scale.clone(),
             )
-            .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()])
-            .async_on(stream)
-        }
-        .map_err(|error| ModelError::Cuda(format!("execute grouped NVFP4 W4A16: {error:?}")))?;
+            .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()]),
+            "execute grouped NVFP4 W4A16",
+        )?;
         Ok(output)
     }
 
@@ -837,7 +830,7 @@ impl GroupedNvfp4W4A16 {
         dispatched: Arc<Tensor<bf16>>,
         rows: usize,
         expert_by_row_tile: Arc<Tensor<i32>>,
-        stream: &Arc<Stream>,
+        execution: &mut StreamExecution<'_>,
     ) -> Result<Tensor<bf16>, ModelError> {
         if rows == 0
             || !rows.is_multiple_of(TILE_M)
@@ -848,23 +841,21 @@ impl GroupedNvfp4W4A16 {
                 "invalid device-resident grouped NVFP4 dispatch plan".into(),
             ));
         }
-        // SAFETY: the result is consumed only by later operations on `stream`
-        // before the enclosing MoE layer synchronizes.
-        let mut output = unsafe { api::zeros::<bf16>(&[rows, self.output_size]).async_on(stream) }
-            .map_err(|error| ModelError::Cuda(format!("allocate grouped output: {error:?}")))?;
+        let mut output = execution.enqueue(
+            api::zeros::<bf16>(&[rows, self.output_size]),
+            "allocate grouped output",
+        )?;
         let logical_tiles = (rows / TILE_M)
             .checked_mul(self.output_size / GROUPED_TILE_N)
             .ok_or_else(|| ModelError::Cuda("grouped output tile count overflowed".into()))?;
-        let workers = logical_tiles.min(device_sm_count(stream)?);
+        let workers = logical_tiles.min(device_sm_count(execution.stream())?);
         let output_partition = (&mut output).partition([TILE_M, GROUPED_TILE_N]).map(
             [8, 1],
             u32::try_from(workers).map_err(|_| {
                 ModelError::Cuda("persistent grouped worker count overflowed u32".into())
             })?,
         );
-        // SAFETY: all dependencies share `stream`, and the returned tensor is
-        // not observed on the host before the layer boundary synchronization.
-        let (output_partition, ..) = unsafe {
+        let (output_partition, ..) = execution.enqueue(
             grouped_nvfp4_w4a16(
                 output_partition,
                 dispatched,
@@ -873,10 +864,9 @@ impl GroupedNvfp4W4A16 {
                 self.weight_scale.clone(),
                 self.weight_global_scale.clone(),
             )
-            .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()])
-            .async_on(stream)
-        }
-        .map_err(|error| ModelError::Cuda(format!("execute grouped NVFP4 W4A16: {error:?}")))?;
+            .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()]),
+            "execute grouped NVFP4 W4A16",
+        )?;
         drop(output_partition);
         Ok(output)
     }
@@ -954,6 +944,7 @@ fn probe_fp8_w8a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         input_scale: 1.0f32.to_le_bytes(),
     };
     let linear = Fp8W8A16Linear::load(&source, "probe", stream)?;
+    let mut execution = StreamExecution::new(stream);
     if linear.input_size() != input_size
         || linear.output_size() != output_size
         || linear.device_bytes() != encoded.len()
@@ -970,11 +961,12 @@ fn probe_fp8_w8a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         .map_err(|error| ModelError::Cuda(format!("upload FP8 probe input: {error:?}")))?
         .reshape(&[TILE_M, input_size])
         .map_err(|error| ModelError::Cuda(format!("reshape FP8 probe input: {error:?}")))?;
-    let output = linear.enqueue(Arc::new(input), TILE_M, stream)?;
+    let output = linear.enqueue(Arc::new(input), TILE_M, &mut execution)?;
     let actual: Vec<bf16> = output
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("copy FP8 probe output: {error:?}")))?;
+    execution.mark_synchronized();
     let mut max_abs_error = 0.0f32;
     for row in 0..TILE_M {
         for column in 0..output_size {
@@ -1025,6 +1017,7 @@ fn probe_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<(f32, f32), ModelError> {
         input_scale: 1.0f32.to_le_bytes(),
     };
     let linear = Nvfp4W4A16Linear::load(&source, "probe", stream)?;
+    let mut execution = StreamExecution::new(stream);
     let expected_device_bytes = packed
         .len()
         .checked_add(scale_bytes.len() * std::mem::size_of::<bf16>())
@@ -1045,11 +1038,12 @@ fn probe_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<(f32, f32), ModelError> {
         .map_err(|error| ModelError::Cuda(format!("upload NVFP4 test input: {error:?}")))?
         .reshape(&[TILE_M, input_size])
         .map_err(|error| ModelError::Cuda(format!("reshape NVFP4 test input: {error:?}")))?;
-    let output = Arc::new(linear.enqueue(Arc::new(input), TILE_M, stream)?);
+    let output = Arc::new(linear.enqueue(Arc::new(input), TILE_M, &mut execution)?);
     let actual_values: Vec<bf16> = output
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("copy NVFP4 test output: {error:?}")))?;
+    execution.mark_synchronized();
 
     let mut max_abs_error = 0.0f32;
     for row in 0..TILE_M {
@@ -1109,6 +1103,7 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     };
     let grouped =
         GroupedNvfp4W4A16::load(&source, "experts", ExpertProjection::Gate, EXPERTS, stream)?;
+    let mut execution = StreamExecution::new(stream);
     for projection in [ExpertProjection::Up, ExpertProjection::Down] {
         let parsed = GroupedNvfp4W4A16::load(&source, "experts", projection, EXPERTS, stream)?;
         if parsed.device_bytes() != grouped.device_bytes() {
@@ -1137,11 +1132,13 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         .reshape(&[rows, input_size])
         .map_err(|error| ModelError::Cuda(format!("reshape grouped test input: {error:?}")))?;
     let expert_by_row_tile = [1i32, 0i32];
-    let output = Arc::new(grouped.enqueue(Arc::new(input), rows, &expert_by_row_tile, stream)?);
+    let output =
+        Arc::new(grouped.enqueue(Arc::new(input), rows, &expert_by_row_tile, &mut execution)?);
     let actual: Vec<bf16> = output
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("copy grouped test output: {error:?}")))?;
+    execution.mark_synchronized();
 
     let mut max_abs_error = 0.0f32;
     for row in 0..rows {
