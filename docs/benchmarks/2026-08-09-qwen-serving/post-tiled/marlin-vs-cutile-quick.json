@@ -1,0 +1,113 @@
+{
+  "device_id": 0,
+  "warmup_iterations": 1,
+  "timed_iterations": 3,
+  "cutile_fp8_max_abs_error": 0.0,
+  "cutile_nvfp4_max_abs_error": 0.0,
+  "marlin_fp8_max_abs_error": 0.0,
+  "marlin_nvfp4_max_abs_error": 0.0,
+  "samples": [
+    {
+      "implementation": "cutile_packed",
+      "quantization": "fp8",
+      "rows": 16,
+      "output_size": 8192,
+      "input_size": 2048,
+      "raw_ms": [
+        0.26624,
+        0.257024,
+        0.247808
+      ],
+      "minimum_ms": 0.247808,
+      "median_ms": 0.257024,
+      "p90_ms": 0.26624,
+      "logical_tflops": 2.0887968927638583,
+      "packed_weight_gb_per_second": 65.27490289887056
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "fp8",
+      "rows": 16,
+      "output_size": 8192,
+      "input_size": 2048,
+      "raw_ms": [
+        0.023552,
+        0.023552,
+        0.023552
+      ],
+      "minimum_ms": 0.023552,
+      "median_ms": 0.023552,
+      "p90_ms": 0.023552,
+      "logical_tflops": 22.79512992896386,
+      "packed_weight_gb_per_second": 712.3478102801206
+    },
+    {
+      "implementation": "cutile_packed",
+      "quantization": "nvfp4",
+      "rows": 16,
+      "output_size": 512,
+      "input_size": 2048,
+      "raw_ms": [
+        0.124928,
+        0.10752,
+        0.104448
+      ],
+      "minimum_ms": 0.104448,
+      "median_ms": 0.10752,
+      "p90_ms": 0.124928,
+      "logical_tflops": 0.3120761929535812,
+      "packed_weight_gb_per_second": 4.876190514899706
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "nvfp4",
+      "rows": 16,
+      "output_size": 512,
+      "input_size": 2048,
+      "raw_ms": [
+        0.021504,
+        0.026624,
+        0.022528
+      ],
+      "minimum_ms": 0.021504,
+      "median_ms": 0.022528,
+      "p90_ms": 0.026624,
+      "logical_tflops": 1.4894545338212952,
+      "packed_weight_gb_per_second": 23.272727090957737
+    },
+    {
+      "implementation": "cutile_packed",
+      "quantization": "nvfp4",
+      "rows": 16,
+      "output_size": 2048,
+      "input_size": 512,
+      "raw_ms": [
+        0.080896,
+        0.062464,
+        0.062464
+      ],
+      "minimum_ms": 0.062464,
+      "median_ms": 0.062464,
+      "p90_ms": 0.080896,
+      "logical_tflops": 0.5371803382354796,
+      "packed_weight_gb_per_second": 8.39344278492937
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "nvfp4",
+      "rows": 16,
+      "output_size": 2048,
+      "input_size": 512,
+      "raw_ms": [
+        0.013312,
+        0.013312,
+        0.013312
+      ],
+      "minimum_ms": 0.013312,
+      "median_ms": 0.013312,
+      "p90_ms": 0.013312,
+      "logical_tflops": 2.520615413022465,
+      "packed_weight_gb_per_second": 39.384615828476015
+    }
+  ]
+}

@@ -162,6 +162,8 @@ The exact-context report is
 [`packed-bitdecode-group64-half-window.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/packed-bitdecode-group64-half-window.json).
 The head-to-head kernel methodology is fixed in
 [`quantized-kernel-benchmark-plan.md`](../quantized-kernel-benchmark-plan.md).
+The first native dense comparison is retained in
+[`2026-08-09-native-marlin-kernel-benchmark.md`](2026-08-09-native-marlin-kernel-benchmark.md).
 
 The built-in half-window command is:
 

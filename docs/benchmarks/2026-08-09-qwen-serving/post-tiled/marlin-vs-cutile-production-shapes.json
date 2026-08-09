@@ -1,0 +1,389 @@
+{
+  "device_id": 0,
+  "warmup_iterations": 2,
+  "timed_iterations": 7,
+  "cutile_fp8_max_abs_error": 0.0,
+  "cutile_nvfp4_max_abs_error": 0.0,
+  "marlin_fp8_max_abs_error": 0.0,
+  "marlin_nvfp4_max_abs_error": 0.0,
+  "samples": [
+    {
+      "implementation": "cutile_packed",
+      "quantization": "fp8",
+      "rows": 16,
+      "output_size": 8192,
+      "input_size": 2048,
+      "raw_ms": [
+        0.251904,
+        0.249856,
+        0.249856,
+        0.246784,
+        0.246784,
+        0.247808,
+        0.248832
+      ],
+      "minimum_ms": 0.246784,
+      "median_ms": 0.248832,
+      "p90_ms": 0.251904,
+      "logical_tflops": 2.157563766220308,
+      "packed_weight_gb_per_second": 67.42386769438464
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "fp8",
+      "rows": 16,
+      "output_size": 8192,
+      "input_size": 2048,
+      "raw_ms": [
+        0.024576,
+        0.022528,
+        0.023552,
+        0.023552,
+        0.023552,
+        0.022528,
+        0.022528
+      ],
+      "minimum_ms": 0.022528,
+      "median_ms": 0.023552,
+      "p90_ms": 0.024576,
+      "logical_tflops": 22.79512992896386,
+      "packed_weight_gb_per_second": 712.3478102801206
+    },
+    {
+      "implementation": "cutile_packed",
+      "quantization": "nvfp4",
+      "rows": 16,
+      "output_size": 512,
+      "input_size": 2048,
+      "raw_ms": [
+        0.109568,
+        0.10752,
+        0.109568,
+        0.10752,
+        0.108544,
+        0.106496,
+        0.105472
+      ],
+      "minimum_ms": 0.105472,
+      "median_ms": 0.10752,
+      "p90_ms": 0.109568,
+      "logical_tflops": 0.3120761929535812,
+      "packed_weight_gb_per_second": 4.876190514899706
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "nvfp4",
+      "rows": 16,
+      "output_size": 512,
+      "input_size": 2048,
+      "raw_ms": [
+        0.023552,
+        0.021504,
+        0.022528,
+        0.022528,
+        0.022528,
+        0.023552,
+        0.022528
+      ],
+      "minimum_ms": 0.021504,
+      "median_ms": 0.022528,
+      "p90_ms": 0.023552,
+      "logical_tflops": 1.4894545338212952,
+      "packed_weight_gb_per_second": 23.272727090957737
+    },
+    {
+      "implementation": "cutile_packed",
+      "quantization": "nvfp4",
+      "rows": 16,
+      "output_size": 2048,
+      "input_size": 512,
+      "raw_ms": [
+        0.064512,
+        0.060416,
+        0.059392,
+        0.059392,
+        0.059392,
+        0.058368,
+        0.059392
+      ],
+      "minimum_ms": 0.058368,
+      "median_ms": 0.059392,
+      "p90_ms": 0.064512,
+      "logical_tflops": 0.5649655031641942,
+      "packed_weight_gb_per_second": 8.827585986940534
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "nvfp4",
+      "rows": 16,
+      "output_size": 2048,
+      "input_size": 512,
+      "raw_ms": [
+        0.013312,
+        0.013312,
+        0.013312,
+        0.013312,
+        0.013312,
+        0.013312,
+        0.013312
+      ],
+      "minimum_ms": 0.013312,
+      "median_ms": 0.013312,
+      "p90_ms": 0.013312,
+      "logical_tflops": 2.520615413022465,
+      "packed_weight_gb_per_second": 39.384615828476015
+    },
+    {
+      "implementation": "cutile_packed",
+      "quantization": "fp8",
+      "rows": 512,
+      "output_size": 8192,
+      "input_size": 2048,
+      "raw_ms": [
+        4.712448,
+        4.711424,
+        4.713472,
+        4.708352,
+        4.708352,
+        4.716544,
+        4.716544
+      ],
+      "minimum_ms": 4.708352,
+      "median_ms": 4.712448,
+      "p90_ms": 4.716544,
+      "logical_tflops": 3.6456357175923197,
+      "packed_weight_gb_per_second": 3.56019113046125
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "fp8",
+      "rows": 512,
+      "output_size": 8192,
+      "input_size": 2048,
+      "raw_ms": [
+        0.146432,
+        0.145408,
+        0.14336,
+        0.145408,
+        0.14336,
+        0.144384,
+        0.149504
+      ],
+      "minimum_ms": 0.14336,
+      "median_ms": 0.145408,
+      "p90_ms": 0.149504,
+      "logical_tflops": 118.1494047761482,
+      "packed_weight_gb_per_second": 115.38027810170723
+    },
+    {
+      "implementation": "cutile_packed",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 512,
+      "input_size": 2048,
+      "raw_ms": [
+        0.279552,
+        0.282624,
+        0.2816,
+        0.279552,
+        0.280576,
+        0.2816,
+        0.278528
+      ],
+      "minimum_ms": 0.278528,
+      "median_ms": 0.280576,
+      "p90_ms": 0.282624,
+      "logical_tflops": 3.82691983519201,
+      "packed_weight_gb_per_second": 1.8686132007773486
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 512,
+      "input_size": 2048,
+      "raw_ms": [
+        0.031744,
+        0.032768,
+        0.03072,
+        0.031744,
+        0.031744,
+        0.031744,
+        0.031744
+      ],
+      "minimum_ms": 0.03072,
+      "median_ms": 0.031744,
+      "p90_ms": 0.032768,
+      "logical_tflops": 33.8250327156059,
+      "packed_weight_gb_per_second": 16.516129255666943
+    },
+    {
+      "implementation": "cutile_packed",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 2048,
+      "input_size": 512,
+      "raw_ms": [
+        0.493568,
+        0.489472,
+        0.499712,
+        0.489472,
+        0.492544,
+        0.488448,
+        0.492544
+      ],
+      "minimum_ms": 0.488448,
+      "median_ms": 0.492544,
+      "p90_ms": 0.499712,
+      "logical_tflops": 2.1799917044379513,
+      "packed_weight_gb_per_second": 1.0644490744325934
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "nvfp4",
+      "rows": 512,
+      "output_size": 2048,
+      "input_size": 512,
+      "raw_ms": [
+        0.03072,
+        0.029696,
+        0.029696,
+        0.029696,
+        0.03072,
+        0.03072,
+        0.029696
+      ],
+      "minimum_ms": 0.029696,
+      "median_ms": 0.029696,
+      "p90_ms": 0.03072,
+      "logical_tflops": 36.15779220250843,
+      "packed_weight_gb_per_second": 17.655171973881068
+    },
+    {
+      "implementation": "cutile_packed",
+      "quantization": "fp8",
+      "rows": 8192,
+      "output_size": 8192,
+      "input_size": 2048,
+      "raw_ms": [
+        60.745728,
+        60.717056,
+        60.726273,
+        60.722176,
+        60.727295,
+        60.729343,
+        60.721153
+      ],
+      "minimum_ms": 60.717056,
+      "median_ms": 60.726273,
+      "p90_ms": 60.745728,
+      "logical_tflops": 4.526507148421872,
+      "packed_weight_gb_per_second": 0.2762760710706709
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "fp8",
+      "rows": 8192,
+      "output_size": 8192,
+      "input_size": 2048,
+      "raw_ms": [
+        1.644544,
+        1.641472,
+        1.640448,
+        1.642496,
+        1.64352,
+        1.64352,
+        1.644544
+      ],
+      "minimum_ms": 1.640448,
+      "median_ms": 1.64352,
+      "p90_ms": 1.644544,
+      "logical_tflops": 167.249505540513,
+      "packed_weight_gb_per_second": 10.208099703400451
+    },
+    {
+      "implementation": "cutile_packed",
+      "quantization": "nvfp4",
+      "rows": 8192,
+      "output_size": 512,
+      "input_size": 2048,
+      "raw_ms": [
+        2.678784,
+        2.675712,
+        2.675712,
+        2.674688,
+        2.674688,
+        2.674688,
+        2.676736
+      ],
+      "minimum_ms": 2.674688,
+      "median_ms": 2.675712,
+      "p90_ms": 2.678784,
+      "logical_tflops": 6.42067176386607,
+      "packed_weight_gb_per_second": 0.19594335216876435
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "nvfp4",
+      "rows": 8192,
+      "output_size": 512,
+      "input_size": 2048,
+      "raw_ms": [
+        0.119808,
+        0.119808,
+        0.119808,
+        0.121856,
+        0.119808,
+        0.120832,
+        0.120832
+      ],
+      "minimum_ms": 0.119808,
+      "median_ms": 0.119808,
+      "p90_ms": 0.121856,
+      "logical_tflops": 143.3950045896798,
+      "packed_weight_gb_per_second": 4.376068255300286
+    },
+    {
+      "implementation": "cutile_packed",
+      "quantization": "nvfp4",
+      "rows": 8192,
+      "output_size": 2048,
+      "input_size": 512,
+      "raw_ms": [
+        5.814272,
+        5.8112,
+        5.808128,
+        5.813248,
+        5.80608,
+        5.809152,
+        5.808128
+      ],
+      "minimum_ms": 5.80608,
+      "median_ms": 5.809152,
+      "p90_ms": 5.814272,
+      "logical_tflops": 2.9573798052532774,
+      "packed_weight_gb_per_second": 0.09025206925211418
+    },
+    {
+      "implementation": "marlin",
+      "quantization": "nvfp4",
+      "rows": 8192,
+      "output_size": 2048,
+      "input_size": 512,
+      "raw_ms": [
+        0.144384,
+        0.14336,
+        0.144384,
+        0.142336,
+        0.14336,
+        0.14336,
+        0.14336
+      ],
+      "minimum_ms": 0.142336,
+      "median_ms": 0.14336,
+      "p90_ms": 0.144384,
+      "logical_tflops": 119.8372539421238,
+      "packed_weight_gb_per_second": 3.6571427594642274
+    }
+  ]
+}
