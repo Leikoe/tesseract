@@ -662,10 +662,6 @@ impl ExpertProjection {
 }
 
 impl GroupedNvfp4W4A16 {
-    pub(crate) const fn input_size(&self) -> usize {
-        self.input_size
-    }
-
     pub(crate) const fn output_size(&self) -> usize {
         self.output_size
     }
@@ -873,29 +869,6 @@ impl GroupedNvfp4W4A16 {
             "execute grouped NVFP4 W4A16",
         )?;
         Ok(output)
-    }
-
-    pub(crate) fn enqueue_device_plan(
-        &self,
-        dispatched: Arc<Tensor<bf16>>,
-        rows: usize,
-        expert_by_row_tile: Arc<Tensor<i32>>,
-        execution: &mut StreamExecution<'_>,
-    ) -> Result<Tensor<bf16>, ModelError> {
-        if rows == 0
-            || !rows.is_multiple_of(TILE_M)
-            || dispatched.shape() != [rows as i32, self.input_size as i32]
-            || expert_by_row_tile.shape() != [(rows / TILE_M) as i32]
-        {
-            return Err(ModelError::Cuda(
-                "invalid device-resident grouped NVFP4 dispatch plan".into(),
-            ));
-        }
-        let output = execution.enqueue(
-            api::zeros::<bf16>(&[rows, self.output_size]),
-            "allocate grouped output",
-        )?;
-        self.enqueue_device_plan_into(dispatched, rows, expert_by_row_tile, output, execution)
     }
 
     pub(crate) fn enqueue_device_plan_into(

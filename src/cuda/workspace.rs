@@ -207,10 +207,6 @@ impl ExecutionWorkspace {
         self.u32.take(shape, execution, name)
     }
 
-    pub(crate) fn retire_bf16(&mut self, tensor: Tensor<bf16>) {
-        self.bf16.retire(tensor);
-    }
-
     pub(crate) fn retire_shared_bf16(
         &mut self,
         tensor: Arc<Tensor<bf16>>,

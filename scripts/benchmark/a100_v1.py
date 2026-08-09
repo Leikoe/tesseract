@@ -168,13 +168,18 @@ def main() -> None:
     parser.add_argument("--requests", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--warmup-requests", type=int, default=2)
+    parser.add_argument(
+        "--fixed-prompt",
+        help="use one prompt for every warmup and measured request",
+    )
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     if args.concurrency <= 0 or args.requests <= 0 or args.max_tokens <= 0:
         parser.error("concurrency, requests, and max-tokens must be positive")
 
+    prompts = [args.fixed_prompt] if args.fixed_prompt is not None else PROMPTS
     for index in range(args.warmup_requests):
-        request_once(args.base_url, args.model, PROMPTS[index % len(PROMPTS)], 4, index)
+        request_once(args.base_url, args.model, prompts[index % len(prompts)], 4, index)
 
     started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
@@ -183,7 +188,7 @@ def main() -> None:
                 request_once,
                 args.base_url,
                 args.model,
-                PROMPTS[index % len(PROMPTS)],
+                prompts[index % len(prompts)],
                 args.max_tokens,
                 index,
             )
@@ -213,7 +218,7 @@ def main() -> None:
             "requests": args.requests,
             "max_tokens": args.max_tokens,
             "warmup_requests": args.warmup_requests,
-            "prompts": PROMPTS,
+            "prompts": prompts,
         },
         "summary": summarize(results, wall_seconds),
         "results": results,
