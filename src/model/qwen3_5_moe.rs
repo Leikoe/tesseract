@@ -10,6 +10,8 @@ use super::{
 
 #[cfg(feature = "cuda")]
 use super::{CudaForwardReport, CudaModelReport};
+#[cfg(feature = "cuda")]
+use crate::cuda::qwen3_5_moe::{self as cuda_program, Artifact, Config as CudaConfig};
 
 #[cfg(feature = "cuda")]
 pub(super) fn load_cuda_executor(
@@ -24,11 +26,12 @@ pub(super) fn load_cuda_executor(
 
 #[cfg(feature = "cuda")]
 pub(super) fn cuda_model_report(
-    _model_id: &str,
-    _model_dir: &Path,
-    _device_id: usize,
+    model_id: &str,
+    model_dir: &Path,
+    device_id: usize,
 ) -> Result<CudaModelReport, ModelError> {
-    Err(runtime_pending())
+    let model = Arc::new(Qwen35MoeText::load(model_dir)?);
+    cuda_program::checkpoint_report(model_id, model.cuda_artifact(), device_id)
 }
 
 #[cfg(feature = "cuda")]
@@ -54,10 +57,22 @@ struct TextConfig {
     dtype: String,
     eos_token_id: u32,
     hidden_size: usize,
+    #[cfg(feature = "cuda")]
+    layer_types: Vec<LayerKind>,
     num_attention_heads: usize,
+    #[cfg(feature = "cuda")]
+    num_experts: usize,
     num_hidden_layers: usize,
     num_key_value_heads: usize,
     vocab_size: usize,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LayerKind {
+    LinearAttention,
+    FullAttention,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -162,6 +177,29 @@ impl Qwen35MoeText {
             weights,
             eos_token_ids,
         })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Qwen35MoeText {
+    fn cuda_artifact(self: &Arc<Self>) -> Artifact {
+        Artifact {
+            model: self.clone(),
+            config: CudaConfig {
+                layers: self
+                    .config
+                    .text_config
+                    .layer_types
+                    .iter()
+                    .map(|kind| match kind {
+                        LayerKind::LinearAttention => cuda_program::LayerKind::LinearAttention,
+                        LayerKind::FullAttention => cuda_program::LayerKind::FullAttention,
+                    })
+                    .collect(),
+                num_experts: self.config.text_config.num_experts,
+            },
+            weights: self.weights.clone(),
+        }
     }
 }
 

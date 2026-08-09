@@ -23,6 +23,7 @@ pub(crate) mod executor;
 pub(crate) mod kernel_plan;
 pub(crate) mod kernels;
 pub(crate) mod linear;
+pub(crate) mod qwen3_5_moe;
 
 #[cutile::module]
 mod smoke_kernels {
