@@ -216,6 +216,10 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 ```
 
 ```text
+did you read sglang's kernels ? (or tokenspeed's)
+```
+
+```text
 <codex_internal_context source="goal">
 Continue working toward the active thread goal.
 

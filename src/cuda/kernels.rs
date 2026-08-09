@@ -603,8 +603,10 @@ mod tile {
                 block_start.broadcast(const_shape![BM]) + query_lane;
             let valid_query: Tile<bool, { [BM] }> =
                 lt_tile(query_rows, query_end.broadcast(const_shape![BM]));
+            let safe_query_rows: Tile<i32, { [BM] }> =
+                min_tile(query_rows, (query_end - 1i32).broadcast(const_shape![BM]));
             let feature: Tile<i32, { [D] }> = iota(const_shape![D]);
-            let query_offsets: Tile<i32, { [BM, D] }> = (query_rows
+            let query_load_offsets: Tile<i32, { [BM, D] }> = (safe_query_rows
                 * QUERY_HEADS.broadcast(const_shape![BM])
                 + query_head.broadcast(const_shape![BM]))
             .reshape(const_shape![BM, 1])
@@ -618,7 +620,7 @@ mod tile {
                 query_base.reshape(const_shape![1, 1]);
             let query_base: PointerTile<*mut bf16, { [BM, D] }> =
                 query_base.broadcast(const_shape![BM, D]);
-            let query_pointers = query_base.offset_tile(query_offsets);
+            let query_pointers = query_base.offset_tile(query_load_offsets);
             let query_mask: Tile<bool, { [BM, D] }> = valid_query
                 .reshape(const_shape![BM, 1])
                 .broadcast(const_shape![BM, D]);
@@ -626,8 +628,8 @@ mod tile {
                 query_pointers,
                 ordering::Weak,
                 None::<scope::TileBlock>,
-                Some(query_mask),
-                Some(0.0),
+                None,
+                None,
                 None,
                 Latency::<0>,
             );
@@ -637,13 +639,13 @@ mod tile {
                 lengths_base.reshape(const_shape![1]);
             let lengths_base: PointerTile<*mut i32, { [BM] }> =
                 lengths_base.broadcast(const_shape![BM]);
-            let length_pointers = lengths_base.offset_tile(query_rows);
+            let length_pointers = lengths_base.offset_tile(safe_query_rows);
             let (query_context_lengths, _): (Tile<i32, { [BM] }>, Token) = load_ptr_tko(
                 length_pointers,
                 ordering::Weak,
                 None::<scope::TileBlock>,
-                Some(valid_query),
-                Some(0i32),
+                None,
+                None,
                 None,
                 Latency::<0>,
             );
@@ -674,8 +676,6 @@ mod tile {
                 let slots: Tile<i32, { [BN] }> = bitcast(slots.reshape(const_shape![BN]));
                 let key_positions: Tile<i32, { [BN] }> =
                     (block * BN).broadcast(const_shape![BN]) + key_lane;
-                let valid_key: Tile<bool, { [BN] }> =
-                    lt_tile(key_positions, max_context_len.broadcast(const_shape![BN]));
                 let cache_rows: Tile<i32, { [BN] }> = slots * KV_HEADS.broadcast(const_shape![BN])
                     + kv_head.broadcast(const_shape![BN]);
                 let cache_offsets: Tile<i32, { [BN, D] }> = cache_rows
@@ -685,16 +685,13 @@ mod tile {
                     + cache_feature
                         .reshape(const_shape![1, D])
                         .broadcast(const_shape![BN, D]);
-                let cache_mask: Tile<bool, { [BN, D] }> = valid_key
-                    .reshape(const_shape![BN, 1])
-                    .broadcast(const_shape![BN, D]);
                 let key_pointers = key_base.offset_tile(cache_offsets);
                 let (key, _): (Tile<bf16, { [BN, D] }>, Token) = load_ptr_tko(
                     key_pointers,
                     ordering::Weak,
                     None::<scope::TileBlock>,
-                    Some(cache_mask),
-                    Some(0.0),
+                    None,
+                    None,
                     None,
                     Latency::<0>,
                 );
@@ -730,8 +727,8 @@ mod tile {
                     value_pointers,
                     ordering::Weak,
                     None::<scope::TileBlock>,
-                    Some(cache_mask),
-                    Some(0.0),
+                    None,
+                    None,
                     None,
                     Latency::<0>,
                 );
@@ -750,7 +747,16 @@ mod tile {
                 output_base.reshape(const_shape![1, 1]);
             let output_base: PointerTile<*mut bf16, { [BM, D] }> =
                 output_base.broadcast(const_shape![BM, D]);
-            let output_pointers = output_base.offset_tile(query_offsets);
+            let output_offsets: Tile<i32, { [BM, D] }> = (query_rows
+                * QUERY_HEADS.broadcast(const_shape![BM])
+                + query_head.broadcast(const_shape![BM]))
+            .reshape(const_shape![BM, 1])
+            .broadcast(const_shape![BM, D])
+                * D.broadcast(const_shape![BM, D])
+                + feature
+                    .reshape(const_shape![1, D])
+                    .broadcast(const_shape![BM, D]);
+            let output_pointers = output_base.offset_tile(output_offsets);
             let _output_store: Token = store_ptr_tko(
                 output_pointers,
                 output,
