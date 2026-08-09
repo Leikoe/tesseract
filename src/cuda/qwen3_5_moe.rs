@@ -5,7 +5,7 @@ use cuda_core::{Device, Stream};
 use cutile::{
     api,
     core::bf16,
-    tensor::{PartitionMut, Reshape, Tensor},
+    tensor::{PartitionMut, Reshape, Tensor, TensorView},
     tile_kernel::TileKernel,
 };
 
@@ -20,6 +20,7 @@ use super::{
     kernels,
     linear::{ExpertProjection, Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear},
     moe::{self as moe_backend, RoutingPlan},
+    qwen_attention::{AttentionInput, QwenFlatKvAttention},
 };
 
 type Bf16Tensor = Arc<Tensor<bf16>>;
@@ -302,6 +303,72 @@ impl Layer {
         let moe_output = self.moe.forward(moe_input, rows, stream)?;
         Ok((residual, Arc::new(moe_output)))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_full(
+        &self,
+        residual: Bf16Tensor,
+        update: Option<Bf16Tensor>,
+        backend: &QwenFlatKvAttention,
+        full_layer: usize,
+        positions: Arc<Tensor<u32>>,
+        current_slots: Arc<Tensor<u32>>,
+        request_indices: Arc<Tensor<u32>>,
+        context_slots: &TensorView<'_, u32>,
+        context_lengths: Arc<Tensor<i32>>,
+        rows: usize,
+        epsilon: f32,
+        stream: &Arc<Stream>,
+    ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
+        let (attention_input, residual) = match update {
+            Some(update) => gemma_add_rms_norm(
+                residual,
+                update,
+                self.input_norm.clone(),
+                rows,
+                epsilon,
+                stream,
+            )?,
+            None => (
+                gemma_rms_norm(
+                    residual.clone(),
+                    self.input_norm.clone(),
+                    rows,
+                    epsilon,
+                    stream,
+                )?,
+                residual,
+            ),
+        };
+        let Attention::Full(attention) = &self.attention else {
+            return Err(ModelError::Cuda(
+                "full-attention forward called for a linear-attention layer".into(),
+            ));
+        };
+        let attention_output = attention.forward(
+            attention_input,
+            backend,
+            full_layer,
+            positions,
+            current_slots,
+            request_indices,
+            context_slots,
+            context_lengths,
+            rows,
+            epsilon,
+            stream,
+        )?;
+        let (moe_input, residual) = gemma_add_rms_norm(
+            residual,
+            Arc::new(attention_output),
+            self.post_attention_norm.clone(),
+            rows,
+            epsilon,
+            stream,
+        )?;
+        let moe_output = self.moe.forward(moe_input, rows, stream)?;
+        Ok((residual, Arc::new(moe_output)))
+    }
 }
 
 impl Attention {
@@ -403,6 +470,43 @@ impl FullAttention {
             + self.query.device_bytes()
             + self.query_norm.num_bytes()
             + self.value.device_bytes()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
+        &self,
+        hidden: Bf16Tensor,
+        backend: &QwenFlatKvAttention,
+        layer: usize,
+        positions: Arc<Tensor<u32>>,
+        current_slots: Arc<Tensor<u32>>,
+        request_indices: Arc<Tensor<u32>>,
+        context_slots: &TensorView<'_, u32>,
+        context_lengths: Arc<Tensor<i32>>,
+        rows: usize,
+        epsilon: f32,
+        stream: &Arc<Stream>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        let q_gate = Arc::new(self.query.enqueue(hidden.clone(), rows, stream)?);
+        let key = Arc::new(self.key.enqueue(hidden.clone(), rows, stream)?);
+        let value = Arc::new(self.value.enqueue(hidden, rows, stream)?);
+        let attention = backend.enqueue(AttentionInput {
+            layer,
+            q_gate,
+            key,
+            value,
+            q_weight_delta: self.query_norm.clone(),
+            k_weight_delta: self.key_norm.clone(),
+            positions,
+            current_slots,
+            request_indices,
+            context_slots,
+            context_lengths,
+            rows,
+            epsilon,
+            stream,
+        })?;
+        self.output.enqueue(Arc::new(attention), rows, stream)
     }
 }
 
