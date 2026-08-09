@@ -180,6 +180,10 @@ sorry, use .get(0).ok_or(NoArchitecture) to distinguish the case where the manif
 
 use .first then lmao
 
+## User
+
+don't .map the model but rather Arc::new(<ModelType>::load(..)?)
+
 ```text
 you will need good grouped gemm kernels (nfp4 weights loads + bf16 activations loads + bf16 tensor cores w fp32 acc + cast back to bf16 before store)
 ```

@@ -114,12 +114,12 @@ fn declared_architecture<'a>(
 pub fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
     let manifest = model_manifest(model_dir)?;
     match declared_architecture(&manifest, model_id)? {
-        llama_3_2::Llama32::ARCH_NAME => llama_3_2::Llama32::load(model_id, model_dir)
-            .map(|model| Arc::new(model) as Arc<dyn Model>),
-        qwen3_5_moe::Qwen35MoeText::ARCH_NAME => {
-            qwen3_5_moe::Qwen35MoeText::load(model_id, model_dir)
-                .map(|model| Arc::new(model) as Arc<dyn Model>)
+        llama_3_2::Llama32::ARCH_NAME => {
+            Ok(Arc::new(llama_3_2::Llama32::load(model_id, model_dir)?))
         }
+        qwen3_5_moe::Qwen35MoeText::ARCH_NAME => Ok(Arc::new(qwen3_5_moe::Qwen35MoeText::load(
+            model_id, model_dir,
+        )?)),
         _ => Err(manifest.unsupported(model_id)),
     }
 }
