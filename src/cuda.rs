@@ -96,13 +96,11 @@ mod nvfp4_probe_kernels {
         lhs_scale_bytes: &Tensor<u8, { [-1, -1] }>,
         rhs_scale_bytes: &Tensor<u8, { [-1, -1] }>,
     ) {
-        let lhs_packed = lhs_packed.partition(const_shape![16, 8]);
-        let rhs_packed = rhs_packed.partition(const_shape![16, 8]);
-        let lhs_scale_bytes = lhs_scale_bytes.partition(const_shape![16, 1]);
-        let rhs_scale_bytes = rhs_scale_bytes.partition(const_shape![16, 1]);
+        let lhs_packed = lhs_packed.load_tile(const_shape![16, 8], [0, 0]);
+        let rhs_packed = rhs_packed.load_tile(const_shape![16, 8], [0, 0]);
+        let lhs_scale_bytes = lhs_scale_bytes.load_tile(const_shape![16, 1], [0, 0]);
+        let rhs_scale_bytes = rhs_scale_bytes.load_tile(const_shape![16, 1], [0, 0]);
         let sixteen: Tile<u8, { [16, 8] }> = constant(16u8, const_shape![16, 8]);
-        let lhs_packed = lhs_packed.load([0, 0]);
-        let rhs_packed = rhs_packed.load([0, 0]);
         let lhs_low = (lhs_packed % sixteen).reshape(const_shape![16, 8, 1]);
         let lhs_high = (lhs_packed / sixteen).reshape(const_shape![16, 8, 1]);
         let lhs_nibbles: Tile<u8, { [16, 8, 2] }> = cat(lhs_low, lhs_high, 2);
@@ -112,8 +110,8 @@ mod nvfp4_probe_kernels {
 
         let lhs = decode_fp4(lhs_nibbles.reshape(const_shape![16, 16]));
         let rhs = decode_fp4(rhs_nibbles.reshape(const_shape![16, 16]));
-        let lhs_scales = decode_e4m3(lhs_scale_bytes.load([0, 0])).broadcast(const_shape![16, 16]);
-        let rhs_scales = decode_e4m3(rhs_scale_bytes.load([0, 0])).broadcast(const_shape![16, 16]);
+        let lhs_scales = decode_e4m3(lhs_scale_bytes).broadcast(const_shape![16, 16]);
+        let rhs_scales = decode_e4m3(rhs_scale_bytes).broadcast(const_shape![16, 16]);
         let lhs: Tile<bf16, { [16, 16] }> = ftof(lhs * lhs_scales, rounding::NearestEven);
         let rhs: Tile<bf16, { [16, 16] }> = ftof(rhs * rhs_scales, rounding::NearestEven);
         let accumulator = constant(0.0f32, const_shape![16, 16]);
