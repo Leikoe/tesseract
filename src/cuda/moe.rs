@@ -189,7 +189,8 @@ mod kernels {
         let expert: Tile<i32, { [256] }> = iota(const_shape![256]);
         let zero: Tile<i32, { [256] }> = broadcast_scalar(ZERO, const_shape![256]);
         let selected = select(ge_tile(row, starts) & lt_tile(row, ends), expert, zero);
-        let selected: Tile<i32, { [1] }> = reduce_max(selected, 0i32);
+        let selected: Tile<i32, { [] }> = reduce_max(selected, 0i32);
+        let selected: Tile<i32, { [1] }> = selected.reshape(const_shape![1]);
         expert_by_tile.store(selected);
     }
 
