@@ -515,13 +515,19 @@ impl Program {
         };
         let mut execution = StreamExecution::new(stream);
 
+        let mut initial_hidden = Some(hidden);
         let mut pending: Option<(Bf16Tensor, Bf16Tensor)> = None;
         let mut full_layer = 0usize;
         for layer_index in 0..self.checkpoint.layers.len() {
             let layer = &self.checkpoint.layers[layer_index];
             let (residual, update) = match pending.take() {
                 Some((residual, update)) => (residual, Some(update)),
-                None => (hidden.clone(), None),
+                None => (
+                    initial_hidden.take().ok_or_else(|| {
+                        ModelError::Cuda("Qwen layer input is unavailable".into())
+                    })?,
+                    None,
+                ),
             };
             let result = match &layer.attention {
                 Attention::Linear(_) => {
