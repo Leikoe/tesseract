@@ -156,3 +156,27 @@ final shared-expert combine synchronizes once per layer, so an executor ticket
 still cannot complete while device work is in flight. The next engine-level
 step is a reusable workspace and explicit stream execution scope, followed by
 decode graph capture. The remaining GPU-kernel target is the dense FP8 leaf.
+
+## Recurrent-slot recycling regression
+
+Commit `cc57c49` fixes a production-only correctness failure exposed by running
+more requests than the recurrent-slot capacity. The scheduler recycled a slot,
+but the Qwen executor retained the preceding request's convolution tail and GDN
+matrix state. A fresh request could therefore depend on which request had most
+recently occupied its slot, and serial and packed execution disagreed despite
+greedy sampling.
+
+The executor now identifies a request's first prefill chunk by its zero starting
+position and clears that request's BF16 convolution tail and FP32 recurrent
+matrix on the model stream before the first layer consumes them. Continuation
+chunks retain their state. The stream execution scope owns the ordering and
+drains pending work on errors, so slot initialization cannot race a layer or be
+reported complete while still in flight.
+
+The A100 regression sequence deliberately ran four prompts serially first, so
+the slots contained unrelated prior state, and then submitted the same prompts
+with concurrency four. All four eight-token greedy continuations were
+byte-for-byte identical between serial and packed execution. Before the fix,
+all four differed. The complete CUDA differential suite also passed at this
+revision: grouped NVFP4 reported zero maximum absolute error, GDN recurrent
+decode reported `0.0005493164`, and full attention reported zero.
