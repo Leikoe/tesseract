@@ -37,12 +37,12 @@ mod kernels {
         packed_weight: &Tensor<u8, { [-1, -1] }>,
         weight_scale: &Tensor<bf16, { [-1, -1] }>,
         weight_global_scale: f32,
+        k_tiles: i32,
     ) {
         let pid = get_tile_block_id();
         let input = input.partition(const_shape![16, 16]);
         let packed_weight = packed_weight.partition(const_shape![16, 8]);
         let weight_scale = weight_scale.partition(const_shape![16, 1]);
-        let k_tiles = num_tiles(&input, 1);
         let sixteen: Tile<u8, { [16, 8] }> = constant(16u8, const_shape![16, 8]);
         let mut accumulator = constant(0.0f32, const_shape![16, 16]);
 
@@ -80,11 +80,11 @@ mod kernels {
         packed_weight: &Tensor<u8, { [-1, -1, -1] }>,
         weight_scale: &Tensor<bf16, { [-1, -1, -1] }>,
         weight_global_scale: &Tensor<f32, { [-1] }>,
+        k_tiles: i32,
     ) {
         let dispatched = dispatched.partition(const_shape![16, 16]);
         let packed_weight = packed_weight.partition(const_shape![1, 16, 8]);
         let weight_scale = weight_scale.partition(const_shape![1, 16, 1]);
-        let k_tiles = num_tiles(&dispatched, 1);
         let sixteen: Tile<u8, { [1, 16, 8] }> = constant(16u8, const_shape![1, 16, 8]);
 
         // `iter_indices` maps the full logical output grid onto a physical
@@ -318,6 +318,8 @@ impl Nvfp4W4A16Linear {
             self.packed_weight.clone(),
             self.weight_scale.clone(),
             self.weight_global_scale,
+            i32::try_from(self.input_size / GROUP_K)
+                .map_err(|_| ModelError::Cuda("NVFP4 K tile count overflowed i32".into()))?,
         )
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("execute NVFP4 W4A16: {error:?}")))?;
@@ -472,6 +474,9 @@ impl GroupedNvfp4W4A16 {
             self.packed_weight.clone(),
             self.weight_scale.clone(),
             self.weight_global_scale.clone(),
+            i32::try_from(self.input_size / GROUP_K).map_err(|_| {
+                ModelError::Cuda("grouped NVFP4 K tile count overflowed i32".into())
+            })?,
         )
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("execute grouped NVFP4 W4A16: {error:?}")))?;
