@@ -40,10 +40,11 @@ mod kernels {
         weight_global_scale: f32,
     ) {
         let pid = get_tile_block_id();
+        let k_tiles = Dim::new(K_TILES);
         let sixteen: Tile<u8, { [16, 8] }> = constant(16u8, const_shape![16, 8]);
         let mut accumulator = constant(0.0f32, const_shape![16, 16]);
 
-        for k_tile in 0i32..K_TILES {
+        for k_tile in k_tiles {
             let activation = input.load_tile(const_shape![16, 16], [pid.0, k_tile]);
             let packed = packed_weight.load_tile(const_shape![16, 8], [pid.1, k_tile]);
             let low = (packed % sixteen).reshape(const_shape![16, 8, 1]);
@@ -78,6 +79,7 @@ mod kernels {
         weight_global_scale: &Tensor<f32, { [-1] }>,
     ) {
         let sixteen: Tile<u8, { [1, 16, 8] }> = constant(16u8, const_shape![1, 16, 8]);
+        let k_tiles = Dim::new(K_TILES);
 
         // `iter_indices` maps the full logical output grid onto a physical
         // grid capped at the device's SM count. It mints proof-carrying,
@@ -92,7 +94,7 @@ mod kernels {
                 .broadcast(const_shape![16, 16]);
             let mut accumulator = constant(0.0f32, const_shape![16, 16]);
 
-            for k_tile in 0i32..K_TILES {
+            for k_tile in k_tiles {
                 let activation = dispatched.load_tile(const_shape![16, 16], [row_tile, k_tile]);
                 let packed =
                     packed_weight.load_tile(const_shape![1, 16, 8], [expert, column_tile, k_tile]);
