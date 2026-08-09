@@ -1,0 +1,20 @@
+{
+  "status": "deliberately_stopped_after_diagnosis",
+  "captured_at_utc": "2026-08-09T19:52:31Z",
+  "scenario": "half-window-131072",
+  "generated_input_tokens": 131062,
+  "server_prompt_tokens": 131072,
+  "declared_context_tokens": 262144,
+  "requested_output_tokens": 8,
+  "client_elapsed_seconds": 576,
+  "prefill_chunk_tokens": 512,
+  "prefill_positions_completed": 42496,
+  "prefill_fraction": 0.32421875,
+  "engine_steps": 84,
+  "generated_tokens": 0,
+  "completed_requests": 0,
+  "failed_requests": 0,
+  "cancelled_requests_after_client_stop": 1,
+  "kv_tokens_used_after_cancellation": 0,
+  "note": "Partial progress evidence only. The request was stopped once the repeated long-prefill behavior was reproduced; it had not produced its first token. SSE keep-alives caused the disconnected request to be cancelled and its KV allocation to be reclaimed."
+}
