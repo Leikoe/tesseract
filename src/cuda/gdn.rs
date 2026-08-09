@@ -443,10 +443,12 @@ mod kernels {
 
         let row: Tile<i32, { [16] }> = iota(const_shape![16]);
         let row: Tile<i32, { [16, 1] }> = row.reshape(const_shape![16, 1]);
+        let safe_row: Tile<i32, { [16, 1] }> =
+            min_tile(row, (len - 1i32).broadcast(const_shape![16, 1]));
         let column: Tile<i32, { [128] }> = iota(const_shape![128]);
         let column: Tile<i32, { [1, 128] }> = column.reshape(const_shape![1, 128]);
         let row_shape = const_shape![16, 1];
-        let key_offset = ((start.broadcast(row_shape) + row) * 8192i32.broadcast(row_shape)
+        let key_offset = ((start.broadcast(row_shape) + safe_row) * 8192i32.broadcast(row_shape)
             + ((key_head + 16i32) * 128i32).broadcast(row_shape))
         .broadcast(const_shape![16, 128])
             + column.broadcast(const_shape![16, 128]);
@@ -461,12 +463,16 @@ mod kernels {
             key_pointer,
             ordering::Weak,
             None::<scope::TileBlock>,
-            Some(valid_key),
-            Some(bf16::ZERO),
+            None,
+            None,
             None,
             Latency::<0>,
         );
-        let key_f32: Tile<f32, { [16, 128] }> = convert_tile(key);
+        let key_f32: Tile<f32, { [16, 128] }> = select(
+            valid_key,
+            convert_tile(key),
+            broadcast_scalar(ZERO, const_shape![16, 128]),
+        );
         let key_square_sum: Tile<f32, { [16, 1] }> = reduce_sum(key_f32 * key_f32, 1i32);
         let epsilon: Tile<f32, { [16, 1] }> = broadcast_scalar(EPSILON, const_shape![16, 1]);
         let key_inverse = rsqrt(key_square_sum + epsilon, ftz::Disabled);
@@ -477,7 +483,7 @@ mod kernels {
         let zero_matrix: Tile<f32, { [16, 16] }> = broadcast_scalar(ZERO, const_shape![16, 16]);
         let kkt: Tile<f32, { [16, 16] }> = mma(key, key.transpose(), zero_matrix);
 
-        let head_offset = (start.broadcast(row_shape) + row) * 32i32.broadcast(row_shape)
+        let head_offset = (start.broadcast(row_shape) + safe_row) * 32i32.broadcast(row_shape)
             + value_head.broadcast(row_shape);
         let log_base: PointerTile<*mut f32, { [] }> = pointer_to_tile(log_decay_cumsum_ptr);
         let log_base: PointerTile<*mut f32, { [1, 1] }> = log_base.reshape(const_shape![1, 1]);
@@ -487,10 +493,15 @@ mod kernels {
             log_pointer,
             ordering::Weak,
             None::<scope::TileBlock>,
-            Some(valid_row),
-            Some(ZERO),
+            None,
+            None,
             None,
             Latency::<0>,
+        );
+        let log_decay = select(
+            valid_row,
+            log_decay,
+            broadcast_scalar(ZERO, const_shape![16, 1]),
         );
         let beta_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(beta_ptr);
         let beta_base: PointerTile<*mut bf16, { [1, 1] }> = beta_base.reshape(const_shape![1, 1]);
@@ -501,12 +512,16 @@ mod kernels {
             beta_pointer,
             ordering::Weak,
             None::<scope::TileBlock>,
-            Some(valid_row),
-            Some(bf16::ZERO),
+            None,
+            None,
             None,
             Latency::<0>,
         );
-        let beta: Tile<f32, { [16, 1] }> = convert_tile(beta);
+        let beta: Tile<f32, { [16, 1] }> = select(
+            valid_row,
+            convert_tile(beta),
+            broadcast_scalar(ZERO, const_shape![16, 1]),
+        );
 
         let causal_column: Tile<i32, { [16] }> = iota(const_shape![16]);
         let causal_column: Tile<i32, { [1, 16] }> = causal_column.reshape(const_shape![1, 16]);
