@@ -18,7 +18,7 @@ use cutile::{
 use crate::{
     model::{
         ModelError,
-        weights::{WeightDtype, WeightSource},
+        weights::{WeightDtype, WeightSource, WeightTensor},
     },
     quantization::{decode_e2m1, decode_e4m3fn},
 };
@@ -539,14 +539,28 @@ pub(crate) fn validate_nvfp4_w4a16(
         .map(|index| if index % 2 == 0 { 0x38 } else { 0x40 })
         .collect::<Vec<_>>();
     let global_scale = 0.5f32;
-    let linear = Nvfp4W4A16Linear::from_host(
+    let source = Nvfp4ValidationSource {
+        prefix: "probe",
         input_size,
         output_size,
-        &packed,
-        &scale_bytes,
-        global_scale,
-        stream,
-    )?;
+        packed: &packed,
+        scales: &scale_bytes,
+        global_scale: global_scale.to_le_bytes(),
+        input_scale: 1.0f32.to_le_bytes(),
+    };
+    let linear = Nvfp4W4A16Linear::load(&source, "probe", stream)?;
+    let expected_device_bytes = packed
+        .len()
+        .checked_add(scale_bytes.len() * std::mem::size_of::<bf16>())
+        .ok_or_else(|| ModelError::Cuda("validation byte count overflowed".into()))?;
+    if linear.input_size() != input_size
+        || linear.output_size() != output_size
+        || linear.device_bytes() != expected_device_bytes
+    {
+        return Err(ModelError::Cuda(
+            "NVFP4 loader did not preserve geometry/device-byte accounting".into(),
+        ));
+    }
     let input_host = (0..TILE_M * input_size)
         .map(|index| bf16::from_f32((index % 7) as f32 - 3.0))
         .collect::<Vec<_>>();
@@ -618,6 +632,16 @@ fn validate_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError>
         &global_scales,
         stream,
     )?;
+    let expected_device_bytes = packed
+        .len()
+        .checked_add(scale_bytes.len() * std::mem::size_of::<bf16>())
+        .and_then(|bytes| bytes.checked_add(global_scales.len() * std::mem::size_of::<f32>()))
+        .ok_or_else(|| ModelError::Cuda("grouped validation byte count overflowed".into()))?;
+    if grouped.device_bytes() != expected_device_bytes {
+        return Err(ModelError::Cuda(
+            "grouped NVFP4 device-byte accounting mismatch".into(),
+        ));
+    }
     let rows = TILE_M * EXPERTS;
     let input_host = (0..rows * input_size)
         .map(|index| bf16::from_f32((index % 9) as f32 - 4.0))
@@ -659,4 +683,52 @@ fn validate_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError>
         }
     }
     Ok(max_abs_error)
+}
+
+struct Nvfp4ValidationSource<'a> {
+    prefix: &'a str,
+    input_size: usize,
+    output_size: usize,
+    packed: &'a [u8],
+    scales: &'a [u8],
+    global_scale: [u8; 4],
+    input_scale: [u8; 4],
+}
+
+impl WeightSource for Nvfp4ValidationSource<'_> {
+    fn tensor(&self, name: &str) -> Result<WeightTensor<'_>, ModelError> {
+        let suffix = name
+            .strip_prefix(self.prefix)
+            .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
+        match suffix {
+            ".weight" => Ok(WeightTensor::new(
+                WeightDtype::U8,
+                vec![self.output_size, self.input_size / 2],
+                self.packed,
+            )),
+            ".weight_scale" => Ok(WeightTensor::new(
+                WeightDtype::F8E4M3,
+                vec![self.output_size, self.input_size / GROUP_K],
+                self.scales,
+            )),
+            ".weight_scale_2" => Ok(WeightTensor::new(
+                WeightDtype::F32,
+                vec![],
+                &self.global_scale,
+            )),
+            ".input_scale" => Ok(WeightTensor::new(
+                WeightDtype::F32,
+                vec![],
+                &self.input_scale,
+            )),
+            _ => Err(ModelError::MissingTensor(name.into())),
+        }
+    }
+
+    fn names(&self) -> Vec<String> {
+        ["weight", "weight_scale", "weight_scale_2", "input_scale"]
+            .into_iter()
+            .map(|suffix| format!("{}.{suffix}", self.prefix))
+            .collect()
+    }
 }
