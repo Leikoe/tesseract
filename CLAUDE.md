@@ -149,6 +149,18 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 ```
 
 ```text
+you will need good grouped gemm kernels (nfp4 weights loads + bf16 activations loads + bf16 tensor cores w fp32 acc + cast back to bf16 before store)
+```
+
+```text
+you probably want persistent kernels ? check out the cutile(-rs) examples for all these high performance kernels.
+```
+
+```text
+this https://github.com/NVIDIA/cutile-python/tree/main/samples and https://github.com/NVIDIA/TileGym could help a ton if you wanna clone them in references/ and explore them
+```
+
+```text
 you should verify what actually works and what does. cutile might just as well do emulation correctly on sm80
 ```
 

@@ -17,6 +17,8 @@ fn main() -> anyhow::Result<()> {
     println!("gemm_rows={}", report.gemm_rows);
     print_capability("nvfp4_scaled_mma", nvfp4.scaled_mma);
     print_capability("nvfp4_byte_decode_mma", nvfp4.byte_decode_mma);
+    print_capability("nvfp4_w4a16_linear", nvfp4.w4a16_linear);
+    print_capability("nvfp4_grouped_w4a16", nvfp4.grouped_w4a16);
     println!("cutile_validation=ok");
     Ok(())
 }

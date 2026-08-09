@@ -22,6 +22,7 @@ pub(crate) mod dense_decoder;
 pub(crate) mod executor;
 pub(crate) mod kernel_plan;
 pub(crate) mod kernels;
+pub(crate) mod linear;
 
 #[cutile::module]
 mod smoke_kernels {
@@ -196,6 +197,8 @@ pub struct Nvfp4CapabilityReport {
     pub device_id: usize,
     pub scaled_mma: CudaKernelCapability,
     pub byte_decode_mma: CudaKernelCapability,
+    pub w4a16_linear: CudaKernelCapability,
+    pub grouped_w4a16: CudaKernelCapability,
 }
 
 #[derive(Debug, Error)]
@@ -220,6 +223,8 @@ pub enum CudaError {
         actual: f32,
         expected: f32,
     },
+    #[error("NVFP4 linear validation failed: {message}")]
+    QuantizedLinear { message: String },
     #[error(transparent)]
     Cublas(#[from] cublas::CublasError),
 }
@@ -336,10 +341,25 @@ pub fn probe_nvfp4(device_id: usize) -> Result<Nvfp4CapabilityReport, CudaError>
             },
         };
 
+    // These are the production W4A16 contracts used by dense projections and
+    // grouped MoE projections. Unlike the capability probes above, a numerical
+    // mismatch is a hard validation failure rather than an unavailable optional
+    // fast path.
+    let linear =
+        linear::validate_nvfp4_w4a16(&stream).map_err(|error| CudaError::QuantizedLinear {
+            message: error.to_string(),
+        })?;
+
     Ok(Nvfp4CapabilityReport {
         device_id,
         scaled_mma,
         byte_decode_mma,
+        w4a16_linear: CudaKernelCapability::Available {
+            max_abs_error: linear.max_abs_error,
+        },
+        grouped_w4a16: CudaKernelCapability::Available {
+            max_abs_error: linear.grouped_max_abs_error,
+        },
     })
 }
 
