@@ -100,3 +100,48 @@ Here's a thinking process:
 
 This exercises GDN recurrent-state continuation and full-attention KV-cache
 continuation after packed prefill, not only a standalone first-token forward.
+
+## Decode performance investigation
+
+Nsight Systems on commit `8142294` attributed 89.8% of GPU kernel time for a
+32-token generation to quantized GEMMs: 39.6% to grouped routed-expert NVFP4,
+34.0% to dense FP8 projections, and 16.2% to shared-expert NVFP4. GDN decode
+accounted for 1.4%; routing, dispatch, attention, and expert combination were
+each below 0.5%. The profile used 3,840 grouped-GEMM instances, exactly three
+expert projections across 40 layers and 32 forwards.
+
+The first decode fix in `8142294` separates logical token rows from the
+16-row outer tensor-core padding. A one-token decode now routes one logical row
+and reserves eight aligned expert tiles (128 dispatched rows), rather than
+routing all 16 physical rows and reserving up to 2,048 dispatched rows. The
+routing plan and expert map remain device-resident.
+
+Commit `fefb38a` widens the persistent grouped NVFP4 output tile from 16 to 64
+columns while retaining the checkpoint's native 16-element K scale group. The
+A100 `cuda-check` differential probe reports zero grouped NVFP4 error after the
+change. A rejected 32-wide K experiment demonstrated that adjacent scale groups
+cannot be folded by reshaping the stored scale tensor; the gate caught the
+result before checkpoint benchmarking.
+
+All timings below use the same running server, raw HTTP request, 11-token Qwen
+chat prompt for `Hi`, greedy sampling, and one running request. “Warm” excludes
+cuTile compilation but includes prefill, decode, sampling, and HTTP handling.
+
+| Revision | Change | 8 generated tokens | 32 generated tokens |
+| --- | --- | ---: | ---: |
+| `8142294` | logical-row routing, 16×16×16 grouped tile | 1.134 s | 3.981 s |
+| `fefb38a` | logical-row routing, 16×64×16 grouped tile | 0.921 s | 3.421 s |
+
+Both measured revisions returned the same eight-token continuation as SGLang:
+
+```text
+Here's a thinking process:
+
+1
+```
+
+The wider grouped tile improves these warm samples by 18.8% and 14.1%,
+respectively. The 32-token result is 2.67 ms per layer-forward end to end, or
+about 9.4 generated tokens/s after amortizing its one prefill forward. The
+remaining kernel profile points next to the dense FP8 and shared-expert NVFP4
+leaves, followed by reusable workspaces/CUDA graph capture for CPU launch gaps.

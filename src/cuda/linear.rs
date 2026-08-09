@@ -363,18 +363,23 @@ impl Fp8W8A16Linear {
                 input.shape()
             )));
         }
-        let mut output = api::zeros::<bf16>(&[rows, self.output_size])
-            .sync_on(stream)
+        // SAFETY: the returned tensor remains device-only and every consumer is
+        // enqueued on this same model-owned stream before a layer boundary sync.
+        let mut output = unsafe { api::zeros::<bf16>(&[rows, self.output_size]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate FP8 output: {error:?}")))?;
-        fp8_w8a16(
-            (&mut output).partition([TILE_M, TILE_N]),
-            input,
-            self.weight.clone(),
-            self.weight_scale,
-            FP8_SUBNORMAL_SCALE,
-        )
-        .generics(vec![(self.input_size / TILE_N).to_string()])
-        .sync_on(stream)
+        // SAFETY: allocation, inputs, and this launch are ordered on `stream`;
+        // callers keep the result device-resident until the layer boundary.
+        unsafe {
+            fp8_w8a16(
+                (&mut output).partition([TILE_M, TILE_N]),
+                input,
+                self.weight.clone(),
+                self.weight_scale,
+                FP8_SUBNORMAL_SCALE,
+            )
+            .generics(vec![(self.input_size / TILE_N).to_string()])
+            .async_on(stream)
+        }
         .map_err(|error| ModelError::Cuda(format!("execute FP8 W8A16: {error:?}")))?;
         Ok(output)
     }
@@ -561,18 +566,22 @@ impl Nvfp4W4A16Linear {
                 input.shape()
             )));
         }
-        let mut output = api::zeros::<bf16>(&[rows, self.output_size])
-            .sync_on(stream)
+        // SAFETY: the output stays on the same ordered stream until the layer
+        // boundary synchronizes it.
+        let mut output = unsafe { api::zeros::<bf16>(&[rows, self.output_size]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate NVFP4 output: {error:?}")))?;
-        nvfp4_w4a16(
-            (&mut output).partition([TILE_M, TILE_N]),
-            input,
-            self.packed_weight.clone(),
-            self.weight_scale.clone(),
-            self.weight_global_scale,
-        )
-        .generics(vec![(self.input_size / GROUP_K).to_string()])
-        .sync_on(stream)
+        // SAFETY: all dependencies and the result use the same ordered stream.
+        unsafe {
+            nvfp4_w4a16(
+                (&mut output).partition([TILE_M, TILE_N]),
+                input,
+                self.packed_weight.clone(),
+                self.weight_scale.clone(),
+                self.weight_global_scale,
+            )
+            .generics(vec![(self.input_size / GROUP_K).to_string()])
+            .async_on(stream)
+        }
         .map_err(|error| ModelError::Cuda(format!("execute NVFP4 W4A16: {error:?}")))?;
         Ok(output)
     }
@@ -791,8 +800,9 @@ impl GroupedNvfp4W4A16 {
                 .map_err(|error| {
                     ModelError::Cuda(format!("upload grouped expert map: {error:?}"))
                 })?;
-        let mut output = api::zeros::<bf16>(&[rows, self.output_size])
-            .sync_on(stream)
+        // SAFETY: upload, allocation, launch, and downstream consumers are
+        // ordered on the same stream; the layer boundary performs the sync.
+        let mut output = unsafe { api::zeros::<bf16>(&[rows, self.output_size]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate grouped output: {error:?}")))?;
         let logical_tiles = (rows / TILE_M)
             .checked_mul(self.output_size / GROUPED_TILE_N)
@@ -804,16 +814,20 @@ impl GroupedNvfp4W4A16 {
                 ModelError::Cuda("persistent grouped worker count overflowed u32".into())
             })?,
         );
-        grouped_nvfp4_w4a16(
-            output_partition,
-            dispatched,
-            Arc::new(expert_by_row_tile),
-            self.packed_weight.clone(),
-            self.weight_scale.clone(),
-            self.weight_global_scale.clone(),
-        )
-        .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()])
-        .sync_on(stream)
+        // SAFETY: every input and output is stream-ordered and remains on the
+        // device until the enclosing MoE layer synchronizes.
+        unsafe {
+            grouped_nvfp4_w4a16(
+                output_partition,
+                dispatched,
+                Arc::new(expert_by_row_tile),
+                self.packed_weight.clone(),
+                self.weight_scale.clone(),
+                self.weight_global_scale.clone(),
+            )
+            .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()])
+            .async_on(stream)
+        }
         .map_err(|error| ModelError::Cuda(format!("execute grouped NVFP4 W4A16: {error:?}")))?;
         Ok(output)
     }
@@ -834,8 +848,9 @@ impl GroupedNvfp4W4A16 {
                 "invalid device-resident grouped NVFP4 dispatch plan".into(),
             ));
         }
-        let mut output = api::zeros::<bf16>(&[rows, self.output_size])
-            .sync_on(stream)
+        // SAFETY: the result is consumed only by later operations on `stream`
+        // before the enclosing MoE layer synchronizes.
+        let mut output = unsafe { api::zeros::<bf16>(&[rows, self.output_size]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate grouped output: {error:?}")))?;
         let logical_tiles = (rows / TILE_M)
             .checked_mul(self.output_size / GROUPED_TILE_N)
@@ -847,16 +862,20 @@ impl GroupedNvfp4W4A16 {
                 ModelError::Cuda("persistent grouped worker count overflowed u32".into())
             })?,
         );
-        let (output_partition, ..) = grouped_nvfp4_w4a16(
-            output_partition,
-            dispatched,
-            expert_by_row_tile,
-            self.packed_weight.clone(),
-            self.weight_scale.clone(),
-            self.weight_global_scale.clone(),
-        )
-        .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()])
-        .sync_on(stream)
+        // SAFETY: all dependencies share `stream`, and the returned tensor is
+        // not observed on the host before the layer boundary synchronization.
+        let (output_partition, ..) = unsafe {
+            grouped_nvfp4_w4a16(
+                output_partition,
+                dispatched,
+                expert_by_row_tile,
+                self.packed_weight.clone(),
+                self.weight_scale.clone(),
+                self.weight_global_scale.clone(),
+            )
+            .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()])
+            .async_on(stream)
+        }
         .map_err(|error| ModelError::Cuda(format!("execute grouped NVFP4 W4A16: {error:?}")))?;
         drop(output_partition);
         Ok(output)

@@ -307,8 +307,9 @@ pub(crate) fn combine_shared(
             "invalid shared-expert combine geometry".into(),
         ));
     }
-    let mut output = api::zeros::<bf16>(&[rows, hidden_size])
-        .sync_on(stream)
+    // SAFETY: the allocation is immediately consumed on the same stream, and
+    // the following combine launch is the layer's synchronization boundary.
+    let mut output = unsafe { api::zeros::<bf16>(&[rows, hidden_size]).async_on(stream) }
         .map_err(|error| ModelError::Cuda(format!("allocate shared-expert output: {error:?}")))?;
     let (_, _, _, output_partition) = combine_shared_expert_bf16(
         routed,
@@ -359,14 +360,13 @@ impl RoutingPlan {
             .and_then(|replicas| replicas.checked_add(active_experts * (TILE_M - 1)))
             .ok_or_else(|| ModelError::Cuda("MoE dispatch capacity overflowed".into()))?
             .next_multiple_of(TILE_M);
-        let counts = api::zeros::<i32>(&[EXPERTS])
-            .sync_on(stream)
+        // SAFETY: all routing operations are ordered on the model-owned stream
+        // and remain device-only until the layer boundary synchronization.
+        let counts = unsafe { api::zeros::<i32>(&[EXPERTS]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate expert counts: {error:?}")))?;
-        let mut expert_ids = api::zeros::<i32>(&[rows, TOP_K])
-            .sync_on(stream)
+        let mut expert_ids = unsafe { api::zeros::<i32>(&[rows, TOP_K]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate expert IDs: {error:?}")))?;
-        let mut weights = api::zeros::<f32>(&[rows, TOP_K])
-            .sync_on(stream)
+        let mut weights = unsafe { api::zeros::<f32>(&[rows, TOP_K]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate routing weights: {error:?}")))?;
         let (_, expert_ids_partition, weights_partition, _) = unsafe {
             top8_router_256(
@@ -376,34 +376,37 @@ impl RoutingPlan {
                 counts.device_pointer(),
             )
         }
-        .sync_on(stream)
+        .async_on(stream)
         .map_err(|error| ModelError::Cuda(format!("execute top-8 routing: {error:?}")))?;
         drop(expert_ids_partition);
         drop(weights_partition);
-        let (weights_partition,) = renormalize_top8((&mut weights).partition([1, TOP_K]))
-            .sync_on(stream)
-            .map_err(|error| ModelError::Cuda(format!("renormalize top-8 routing: {error:?}")))?;
+        // SAFETY: this launch follows the router on the same stream.
+        let (weights_partition,) =
+            unsafe { renormalize_top8((&mut weights).partition([1, TOP_K])).async_on(stream) }
+                .map_err(|error| {
+                    ModelError::Cuda(format!("renormalize top-8 routing: {error:?}"))
+                })?;
         drop(weights_partition);
         let expert_ids = Arc::new(expert_ids);
 
-        let mut starts = api::zeros::<i32>(&[EXPERTS])
-            .sync_on(stream)
+        let mut starts = unsafe { api::zeros::<i32>(&[EXPERTS]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate expert starts: {error:?}")))?;
-        let mut cursors = api::zeros::<i32>(&[EXPERTS])
-            .sync_on(stream)
+        let mut cursors = unsafe { api::zeros::<i32>(&[EXPERTS]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate expert cursors: {error:?}")))?;
-        let (_, starts_partition, cursors_partition) = aligned_expert_prefix(
-            Arc::new(counts),
-            (&mut starts).partition([EXPERTS]),
-            (&mut cursors).partition([EXPERTS]),
-        )
-        .sync_on(stream)
+        // SAFETY: count production and this scan are ordered on `stream`.
+        let (_, starts_partition, cursors_partition) = unsafe {
+            aligned_expert_prefix(
+                Arc::new(counts),
+                (&mut starts).partition([EXPERTS]),
+                (&mut cursors).partition([EXPERTS]),
+            )
+            .async_on(stream)
+        }
         .map_err(|error| ModelError::Cuda(format!("scan expert counts: {error:?}")))?;
         drop(starts_partition);
         drop(cursors_partition);
         let starts = Arc::new(starts);
-        let mut positions = api::zeros::<i32>(&[rows, TOP_K])
-            .sync_on(stream)
+        let mut positions = unsafe { api::zeros::<i32>(&[rows, TOP_K]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate dispatch positions: {error:?}")))?;
         let (_, positions_partition, _) = unsafe {
             assign_dispatch_rows(
@@ -412,7 +415,7 @@ impl RoutingPlan {
                 cursors.device_pointer(),
             )
         }
-        .sync_on(stream)
+        .async_on(stream)
         .map_err(|error| ModelError::Cuda(format!("assign expert dispatch rows: {error:?}")))?;
         drop(positions_partition);
 
@@ -443,11 +446,13 @@ impl RoutingPlan {
         {
             return Err(ModelError::Cuda("invalid MoE dispatch geometry".into()));
         }
-        let dispatched = api::zeros::<bf16>(&[self.max_dispatched_rows, hidden_size])
-            .sync_on(stream)
-            .map_err(|error| ModelError::Cuda(format!("allocate dispatched rows: {error:?}")))?;
-        let mut tickets = api::zeros::<i32>(&[rows, TOP_K])
-            .sync_on(stream)
+        // SAFETY: routing metadata, allocation, and consumers are ordered on
+        // the same stream and remain device-only through the MoE pipeline.
+        let dispatched = unsafe {
+            api::zeros::<bf16>(&[self.max_dispatched_rows, hidden_size]).async_on(stream)
+        }
+        .map_err(|error| ModelError::Cuda(format!("allocate dispatched rows: {error:?}")))?;
+        let mut tickets = unsafe { api::zeros::<i32>(&[rows, TOP_K]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate dispatch tickets: {error:?}")))?;
         let (_, _, tickets_partition, _) = unsafe {
             dispatch_bf16(
@@ -458,21 +463,23 @@ impl RoutingPlan {
             )
         }
         .generics(vec![hidden_size.to_string(), BLOCK.to_string()])
-        .sync_on(stream)
+        .async_on(stream)
         .map_err(|error| ModelError::Cuda(format!("dispatch MoE activations: {error:?}")))?;
         drop(tickets_partition);
         drop(tickets);
 
         let row_tiles = self.max_dispatched_rows.div_ceil(TILE_M);
-        let mut expert_by_tile = api::zeros::<i32>(&[row_tiles])
-            .sync_on(stream)
+        let mut expert_by_tile = unsafe { api::zeros::<i32>(&[row_tiles]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate expert row map: {error:?}")))?;
-        let (_, _, expert_by_tile_partition) = expert_by_row_tile(
-            self.starts.clone(),
-            self.ends.clone(),
-            (&mut expert_by_tile).partition([1]),
-        )
-        .sync_on(stream)
+        // SAFETY: prefix metadata and this map construction share `stream`.
+        let (_, _, expert_by_tile_partition) = unsafe {
+            expert_by_row_tile(
+                self.starts.clone(),
+                self.ends.clone(),
+                (&mut expert_by_tile).partition([1]),
+            )
+            .async_on(stream)
+        }
         .map_err(|error| ModelError::Cuda(format!("build expert row map: {error:?}")))?;
         drop(expert_by_tile_partition);
         Ok(Dispatched {
@@ -497,14 +504,14 @@ impl RoutingPlan {
         {
             return Err(ModelError::Cuda("invalid MoE combine geometry".into()));
         }
-        let output = api::zeros::<bf16>(&[output_rows, hidden_size])
-            .sync_on(stream)
+        // SAFETY: the output remains device-only and is consumed on `stream`
+        // before the final shared-expert combine synchronizes the layer.
+        let output = unsafe { api::zeros::<bf16>(&[output_rows, hidden_size]).async_on(stream) }
             .map_err(|error| ModelError::Cuda(format!("allocate MoE output: {error:?}")))?;
-        let mut tickets = api::zeros::<i32>(&[rows, hidden_size / BLOCK])
-            .sync_on(stream)
-            .map_err(|error| {
-                ModelError::Cuda(format!("allocate MoE combine tickets: {error:?}"))
-            })?;
+        let mut tickets =
+            unsafe { api::zeros::<i32>(&[rows, hidden_size / BLOCK]).async_on(stream) }.map_err(
+                |error| ModelError::Cuda(format!("allocate MoE combine tickets: {error:?}")),
+            )?;
         let (_, _, _, tickets_partition, _) = unsafe {
             combine_top8_bf16(
                 expert_output,
@@ -515,7 +522,7 @@ impl RoutingPlan {
             )
         }
         .generics(vec![hidden_size.to_string(), BLOCK.to_string()])
-        .sync_on(stream)
+        .async_on(stream)
         .map_err(|error| ModelError::Cuda(format!("combine expert outputs: {error:?}")))?;
         drop(tickets_partition);
         drop(tickets);
