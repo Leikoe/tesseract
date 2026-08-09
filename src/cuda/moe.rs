@@ -561,17 +561,43 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
             )));
         }
     }
-    let combined = plan.combine(dispatched.hidden, rows, hidden_size, stream)?;
-    let combined: Vec<bf16> = combined
-        .to_host_vec()
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("download combined rows: {error:?}")))?;
-    for (index, (actual, expected)) in combined.iter().zip(&hidden_host).enumerate() {
+    let combined = Arc::new(plan.combine(dispatched.hidden, rows, hidden_size, stream)?);
+    let combined_host = download(&combined, stream, "combined rows")?;
+    for (index, (actual, expected)) in combined_host.iter().zip(&hidden_host).enumerate() {
         if (actual.to_f32() - expected.to_f32()).abs() > 1.0e-2 {
             return Err(ModelError::Cuda(format!(
                 "MoE identity combine mismatch at {index}: {} != {}",
                 actual.to_f32(),
                 expected.to_f32()
+            )));
+        }
+    }
+    let shared = api::copy_host_vec_to_device(&Arc::new(hidden_host.clone()))
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("upload shared-expert probe: {error:?}")))?
+        .reshape(&[rows, hidden_size])
+        .map_err(|error| ModelError::Cuda(format!("reshape shared-expert probe: {error:?}")))?;
+    let gate_logits = api::zeros::<bf16>(&[rows, 1])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate shared gate probe: {error:?}")))?;
+    let with_shared = combine_shared(
+        combined,
+        Arc::new(shared),
+        Arc::new(gate_logits),
+        rows,
+        hidden_size,
+        stream,
+    )?;
+    let with_shared: Vec<bf16> = with_shared
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("download shared-expert probe: {error:?}")))?;
+    for (index, (actual, input)) in with_shared.iter().zip(&hidden_host).enumerate() {
+        let expected = bf16::from_f32(input.to_f32() * 1.5).to_f32();
+        if (actual.to_f32() - expected).abs() > 1.0e-2 {
+            return Err(ModelError::Cuda(format!(
+                "shared-expert combine mismatch at {index}: {} != {expected}",
+                actual.to_f32()
             )));
         }
     }
