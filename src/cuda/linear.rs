@@ -11,7 +11,7 @@ use cuda_core::{IntoResult, Stream};
 use cutile::{
     api,
     core::bf16,
-    tensor::{Reshape, Tensor, ToHostVec},
+    tensor::{IntoPartition, Reshape, Tensor, ToHostVec},
 };
 
 use crate::{
