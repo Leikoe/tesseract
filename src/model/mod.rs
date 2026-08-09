@@ -100,17 +100,13 @@ fn model_manifest(model_dir: &Path) -> Result<ModelManifest, ModelError> {
     serde_json::from_str(&text).map_err(|source| ModelError::Json { path, source })
 }
 
-#[expect(
-    clippy::get_first,
-    reason = "the checkpoint architecture is explicitly entry zero"
-)]
 fn declared_architecture<'a>(
     manifest: &'a ModelManifest,
     model_id: &str,
 ) -> Result<&'a str, ModelError> {
     manifest
         .architectures
-        .get(0)
+        .first()
         .map(String::as_str)
         .ok_or_else(|| ModelError::NoArchitecture(model_id.into()))
 }
