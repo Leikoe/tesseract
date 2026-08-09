@@ -238,8 +238,11 @@ pub(crate) struct AttentionInput<'a> {
     pub(crate) positions: Arc<Tensor<u32>>,
     pub(crate) current_slots: Arc<Tensor<u32>>,
     pub(crate) request_indices: Arc<Tensor<u32>>,
+    pub(crate) query_start_offsets: Arc<Tensor<u32>>,
     pub(crate) context_slots: &'a TensorView<'a, u32>,
     pub(crate) context_lengths: Arc<Tensor<i32>>,
+    pub(crate) requests: usize,
+    pub(crate) max_query_tokens: usize,
     pub(crate) rows: usize,
     pub(crate) epsilon: f32,
     pub(crate) stream: &'a Arc<Stream>,
@@ -335,28 +338,70 @@ impl QwenFlatKvAttention {
             .map_err(|error| {
                 ModelError::Cuda(format!("allocate Qwen attention output: {error:?}"))
             })?;
-        const KEY_BLOCK: usize = 16;
-        let (_, _, _, _, _, _, attention_partition, _, _) = unsafe {
-            kernels::ragged_attention_bf16(
-                Arc::new(query),
-                input.request_indices,
-                input.context_slots,
-                input.context_lengths,
-                state.key.device_pointer(),
-                state.value.device_pointer(),
-                (&mut attention).partition([1, 1, HEAD_DIM]),
-                1.0 / (HEAD_DIM as f32).sqrt(),
-                (QUERY_HEADS / KV_HEADS) as i32,
-            )
+        if input.max_query_tokens > 1 {
+            const QUERY_BLOCK: usize = 64;
+            const KEY_BLOCK: usize = 64;
+            let query_blocks = input.max_query_tokens.div_ceil(QUERY_BLOCK);
+            let grid = (
+                u32::try_from(input.requests).map_err(|_| {
+                    ModelError::Cuda("Qwen attention request grid overflowed".into())
+                })?,
+                QUERY_HEADS as u32,
+                u32::try_from(query_blocks).map_err(|_| {
+                    ModelError::Cuda("Qwen attention query-block grid overflowed".into())
+                })?,
+            );
+            unsafe {
+                kernels::ragged_prefill_attention_bf16(
+                    query.device_pointer(),
+                    input.query_start_offsets,
+                    input.context_slots,
+                    input.context_lengths.device_pointer(),
+                    state.key.device_pointer(),
+                    state.value.device_pointer(),
+                    attention.device_pointer(),
+                    1.0 / (HEAD_DIM as f32).sqrt(),
+                    (QUERY_HEADS / KV_HEADS) as i32,
+                )
+            }
+            .generics(vec![
+                QUERY_BLOCK.to_string(),
+                KEY_BLOCK.to_string(),
+                HEAD_DIM.to_string(),
+                QUERY_HEADS.to_string(),
+                KV_HEADS.to_string(),
+            ])
+            .grid(grid)
+            .sync_on(input.stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!("execute Qwen tiled prefill attention: {error:?}"))
+            })?;
+        } else {
+            const KEY_BLOCK: usize = 16;
+            let (_, _, _, _, _, _, attention_partition, _, _) = unsafe {
+                kernels::ragged_attention_bf16(
+                    Arc::new(query),
+                    input.request_indices,
+                    input.context_slots,
+                    input.context_lengths,
+                    state.key.device_pointer(),
+                    state.value.device_pointer(),
+                    (&mut attention).partition([1, 1, HEAD_DIM]),
+                    1.0 / (HEAD_DIM as f32).sqrt(),
+                    (QUERY_HEADS / KV_HEADS) as i32,
+                )
+            }
+            .generics(vec![
+                KEY_BLOCK.to_string(),
+                HEAD_DIM.to_string(),
+                KV_HEADS.to_string(),
+            ])
+            .sync_on(input.stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!("execute Qwen ragged decode attention: {error:?}"))
+            })?;
+            drop(attention_partition);
         }
-        .generics(vec![
-            KEY_BLOCK.to_string(),
-            HEAD_DIM.to_string(),
-            KV_HEADS.to_string(),
-        ])
-        .sync_on(input.stream)
-        .map_err(|error| ModelError::Cuda(format!("execute Qwen ragged attention: {error:?}")))?;
-        drop(attention_partition);
 
         let mut gated = api::zeros::<bf16>(&[rows, QUERY_HEADS, HEAD_DIM])
             .sync_on(input.stream)
@@ -433,6 +478,7 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<AttentionProbe, ModelError> 
     let positions = upload_u32(&[0, 1], &[rows], stream)?;
     let slots = upload_u32(&[0, 1], &[rows], stream)?;
     let request_indices = upload_u32(&[0, 1], &[rows], stream)?;
+    let query_start_offsets = upload_u32(&[0, 1, 2], &[rows + 1], stream)?;
     let context_lengths = upload_i32(&[1, 1], &[rows], stream)?;
     let context_slots = upload_u32(&[0, 1], &[rows, 1], stream)?;
     let context_view = context_slots.view(&[rows, 1]).map_err(|error| {
@@ -441,16 +487,19 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<AttentionProbe, ModelError> 
     let backend = QwenFlatKvAttention::load(1, rows, 4, 10_000_000.0, stream)?;
     let output = backend.enqueue(AttentionInput {
         layer: 0,
-        q_gate,
-        key,
-        value,
+        q_gate: q_gate.clone(),
+        key: key.clone(),
+        value: value.clone(),
         q_weight_delta: norm.clone(),
-        k_weight_delta: norm,
-        positions,
-        current_slots: slots,
+        k_weight_delta: norm.clone(),
+        positions: positions.clone(),
+        current_slots: slots.clone(),
         request_indices,
+        query_start_offsets,
         context_slots: &context_view,
         context_lengths,
+        requests: rows,
+        max_query_tokens: 1,
         rows,
         epsilon: 1.0e-6,
         stream,
@@ -474,6 +523,62 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<AttentionProbe, ModelError> 
                 if error > 0.01 || !actual[index].to_f32().is_finite() {
                     return Err(ModelError::Cuda(format!(
                         "Qwen full-attention mismatch at {index}: {} != {expected}",
+                        actual[index].to_f32()
+                    )));
+                }
+            }
+        }
+    }
+
+    let request_indices = upload_u32(&[0, 0], &[rows], stream)?;
+    let query_start_offsets = upload_u32(&[0, 2], &[2], stream)?;
+    let context_lengths = upload_i32(&[1, 2], &[rows], stream)?;
+    let context_slots = upload_u32(&[0, 1], &[1, rows], stream)?;
+    let context_view = context_slots.view(&[1, rows]).map_err(|error| {
+        ModelError::Cuda(format!(
+            "view Qwen tiled attention context probe: {error:?}"
+        ))
+    })?;
+    let output = backend.enqueue(AttentionInput {
+        layer: 0,
+        q_gate,
+        key,
+        value,
+        q_weight_delta: norm.clone(),
+        k_weight_delta: norm,
+        positions,
+        current_slots: slots,
+        request_indices,
+        query_start_offsets,
+        context_slots: &context_view,
+        context_lengths,
+        requests: 1,
+        max_query_tokens: rows,
+        rows,
+        epsilon: 1.0e-6,
+        stream,
+    })?;
+    let actual: Vec<bf16> = output.to_host_vec().sync_on(stream).map_err(|error| {
+        ModelError::Cuda(format!("download Qwen tiled attention probe: {error:?}"))
+    })?;
+    for row in 0..rows {
+        for query_head in 0..QUERY_HEADS {
+            let kv_head = query_head / (QUERY_HEADS / KV_HEADS);
+            for element in 0..HEAD_DIM {
+                let index = (row * QUERY_HEADS + query_head) * HEAD_DIM + element;
+                let first = value_host[kv_head * HEAD_DIM + element].to_f32();
+                let second = value_host[(KV_HEADS + kv_head) * HEAD_DIM + element].to_f32();
+                let attended = if row == 0 {
+                    first
+                } else {
+                    (first + second) * 0.5
+                };
+                let expected = bf16::from_f32(attended * 0.5).to_f32();
+                let error = (actual[index].to_f32() - expected).abs();
+                max_abs_error = max_abs_error.max(error);
+                if error > 0.01 || !actual[index].to_f32().is_finite() {
+                    return Err(ModelError::Cuda(format!(
+                        "Qwen tiled full-attention mismatch at {index}: {} != {expected}",
                         actual[index].to_f32()
                     )));
                 }
@@ -526,4 +631,18 @@ fn upload_i32(
             ModelError::Cuda(format!("reshape Qwen attention I32 probe: {error:?}"))
         })?;
     Ok(Arc::new(tensor))
+}
+
+#[cfg(test)]
+mod tests {
+    use cuda_core::Device;
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU and CUDA 13.2+"]
+    fn decode_and_tiled_prefill_match_the_reference() {
+        let device = Device::new(0).expect("initialize CUDA device");
+        let stream = device.new_stream().expect("create CUDA stream");
+        let result = super::probe(&stream).expect("run Qwen attention probes");
+        assert!(result.max_abs_error <= 0.01, "{result:?}");
+    }
 }
