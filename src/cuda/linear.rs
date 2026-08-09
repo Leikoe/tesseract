@@ -548,7 +548,7 @@ pub(crate) fn validate_nvfp4_w4a16(
         .reshape(&[TILE_M, input_size])
         .map_err(|error| ModelError::Cuda(format!("reshape NVFP4 test input: {error:?}")))?;
     let output = Arc::new(linear.enqueue(Arc::new(input), TILE_M, stream)?);
-    let actual: Vec<bf16> = output
+    let actual_values: Vec<bf16> = output
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("copy NVFP4 test output: {error:?}")))?;
@@ -565,11 +565,15 @@ pub(crate) fn validate_nvfp4_w4a16(
                 expected += input_host[row * input_size + k].to_f32() * weight;
             }
             let expected = bf16::from_f32(expected).to_f32();
-            let actual = actual[row * output_size + column].to_f32();
+            let actual = actual_values[row * output_size + column].to_f32();
             max_abs_error = max_abs_error.max((actual - expected).abs());
             if !actual.is_finite() || (actual - expected).abs() > 0.25 {
+                let actual_row = actual_values[row * output_size..(row + 1) * output_size]
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>();
                 return Err(ModelError::Cuda(format!(
-                    "NVFP4 differential mismatch at ({row}, {column}): {actual} != {expected}"
+                    "NVFP4 differential mismatch at ({row}, {column}): {actual} != {expected}; actual row {actual_row:?}"
                 )));
             }
         }
