@@ -236,6 +236,10 @@ always assume nvcc is in path OR CUDA_HOME is properly set OR CUDA is at /usr/lo
 ```
 
 ```text
+continue
+```
+
+```text
 did you read sglang's kernels ? (or tokenspeed's)
 ```
 
