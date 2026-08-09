@@ -973,7 +973,6 @@ impl Layer {
             rows,
             epsilon,
             execution,
-            workspace,
         )?;
         let (moe_input, residual) = gemma_add_rms_norm(
             residual,
@@ -982,6 +981,7 @@ impl Layer {
             rows,
             epsilon,
             execution,
+            workspace,
         )?;
         let moe_output = self
             .moe
