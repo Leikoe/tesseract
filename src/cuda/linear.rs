@@ -26,12 +26,11 @@ use crate::{
 const TILE_M: usize = 16;
 const TILE_N: usize = 16;
 const GROUP_K: usize = 16;
+const FP8_SUBNORMAL_SCALE: f32 = 1.0 / 512.0;
 
 #[cutile::module]
 mod kernels {
     use cutile::core::*;
-
-    const FP8_SUBNORMAL_SCALE: f32 = 1.0 / 512.0;
 
     #[cutile::entry()]
     fn fp8_w8a16<const K_TILES: i32>(
@@ -39,6 +38,7 @@ mod kernels {
         input: &Tensor<bf16, { [-1, -1] }>,
         weight: &Tensor<u8, { [-1, -1] }>,
         weight_scale: f32,
+        subnormal_scale: f32,
     ) {
         let pid = get_tile_block_id();
         let k_tiles = Dim::new(K_TILES);
@@ -48,7 +48,7 @@ mod kernels {
             let activation = input.load_tile(const_shape![16, 16], [pid.0, k_tile]);
             let encoded: Tile<i32, { [16, 16] }> =
                 exti(weight.load_tile(const_shape![16, 16], [pid.1, k_tile]));
-            let decoded = decode_fp8(encoded);
+            let decoded = decode_fp8(encoded, subnormal_scale);
             let scale = broadcast_scalar(weight_scale, const_shape![16, 16]);
             let weight: Tile<bf16, { [16, 16] }> = ftof(decoded * scale, rounding::NearestEven);
             accumulator = mma(activation, weight.transpose(), accumulator);
@@ -183,7 +183,10 @@ mod kernels {
         select(eq_tile(sign, one), zero_f - value, value)
     }
 
-    fn decode_fp8(encoded: Tile<i32, { [16, 16] }>) -> Tile<f32, { [16, 16] }> {
+    fn decode_fp8(
+        encoded: Tile<i32, { [16, 16] }>,
+        subnormal_scale: f32,
+    ) -> Tile<f32, { [16, 16] }> {
         let shape = const_shape![16, 16];
         let byte_modulus: Tile<i32, { [16, 16] }> = constant(256i32, shape);
         let zero_i32: Tile<i32, { [16, 16] }> = constant(0i32, shape);
@@ -197,7 +200,7 @@ mod kernels {
         let one_f: Tile<f32, { [16, 16] }> = constant(1.0f32, shape);
         let eight_f: Tile<f32, { [16, 16] }> = constant(8.0f32, shape);
         let seven_f: Tile<f32, { [16, 16] }> = constant(7.0f32, shape);
-        let subnormal_scale: Tile<f32, { [16, 16] }> = constant(FP8_SUBNORMAL_SCALE, shape);
+        let subnormal_scale: Tile<f32, { [16, 16] }> = broadcast_scalar(subnormal_scale, shape);
         let normal =
             (one_f + true_div(mantissa_f, eight_f)) * exp2(exponent_f - seven_f, ftz::Disabled);
         let subnormal = mantissa_f * subnormal_scale;
@@ -310,6 +313,7 @@ impl Fp8W8A16Linear {
             input,
             self.weight.clone(),
             self.weight_scale,
+            FP8_SUBNORMAL_SCALE,
         )
         .generics(vec![(self.input_size / TILE_N).to_string()])
         .sync_on(stream)
