@@ -149,9 +149,8 @@ mod kernels {
         let position = positions.partition(const_shape![1, 1]).load([pid.0, pid.1]);
         let hidden = hidden.partition(const_shape![1, BLOCK]);
         let base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(dispatched_ptr);
-        let base: PointerTile<*mut bf16, { [1, BLOCK] }> = base
-            .reshape(const_shape![1, 1])
-            .broadcast(const_shape![1, BLOCK]);
+        let base: PointerTile<*mut bf16, { [1, 1] }> = base.reshape(const_shape![1, 1]);
+        let base: PointerTile<*mut bf16, { [1, BLOCK] }> = base.broadcast(const_shape![1, BLOCK]);
         let lane: Tile<i32, { [BLOCK] }> = iota(const_shape![BLOCK]);
         let lane: Tile<i32, { [1, BLOCK] }> = lane.reshape(const_shape![1, BLOCK]);
         for block in 0i32..(HIDDEN / BLOCK) {
