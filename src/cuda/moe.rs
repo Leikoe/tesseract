@@ -136,9 +136,93 @@ mod kernels {
         );
         positions.store(position);
     }
+
+    #[cutile::entry()]
+    unsafe fn dispatch_bf16<const HIDDEN: i32, const BLOCK: i32>(
+        hidden: &Tensor<bf16, { [-1, HIDDEN] }>,
+        positions: &Tensor<i32, { [-1, 8] }>,
+        tickets: &mut Tensor<i32, { [1, 1] }>,
+        dispatched_ptr: *mut bf16,
+    ) {
+        let pid = get_tile_block_id();
+        let position = positions.partition(const_shape![1, 1]).load([pid.0, pid.1]);
+        let hidden = hidden.partition(const_shape![1, BLOCK]);
+        let base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(dispatched_ptr);
+        let base: PointerTile<*mut bf16, { [1, BLOCK] }> = base
+            .reshape(const_shape![1, 1])
+            .broadcast(const_shape![1, BLOCK]);
+        let lane: Tile<i32, { [BLOCK] }> = iota(const_shape![BLOCK]);
+        let lane: Tile<i32, { [1, BLOCK] }> = lane.reshape(const_shape![1, BLOCK]);
+        for block in 0i32..(HIDDEN / BLOCK) {
+            let offset =
+                (position * HIDDEN + block * BLOCK).broadcast(const_shape![1, BLOCK]) + lane;
+            let pointer = base.offset_tile(offset);
+            let values = hidden.load([pid.0, block]);
+            let _token = store_ptr_tko(
+                pointer,
+                values,
+                ordering::Weak,
+                None::<scope::Device>,
+                None,
+                None,
+                Latency::<0>,
+            );
+        }
+        tickets.store(position);
+    }
+
+    #[cutile::entry()]
+    fn expert_by_row_tile(
+        starts: &Tensor<i32, { [256] }>,
+        ends: &Tensor<i32, { [256] }>,
+        expert_by_tile: &mut Tensor<i32, { [1] }>,
+    ) {
+        const TILE_M: i32 = 16;
+        const ZERO: i32 = 0;
+        let row = get_tile_block_id().0 * TILE_M;
+        let row: Tile<i32, { [256] }> = row.broadcast(const_shape![256]);
+        let starts = starts.load_tile(const_shape![256], [0i32]);
+        let ends = ends.load_tile(const_shape![256], [0i32]);
+        let expert: Tile<i32, { [256] }> = iota(const_shape![256]);
+        let zero: Tile<i32, { [256] }> = broadcast_scalar(ZERO, const_shape![256]);
+        let selected = select(ge_tile(row, starts) & lt_tile(row, ends), expert, zero);
+        let selected: Tile<i32, { [1] }> = reduce_max(selected, 0i32);
+        expert_by_tile.store(selected);
+    }
+
+    #[cutile::entry()]
+    fn combine_top8_bf16<const HIDDEN: i32, const BLOCK: i32>(
+        expert_output: &Tensor<bf16, { [-1, HIDDEN] }>,
+        positions: &Tensor<i32, { [-1, 8] }>,
+        weights: &Tensor<f32, { [-1, 8] }>,
+        output: &mut Tensor<bf16, { [1, BLOCK] }>,
+    ) {
+        const ZERO: f32 = 0.0;
+        let pid = get_tile_block_id();
+        let expert_output = expert_output.partition(const_shape![1, BLOCK]);
+        let positions = positions.partition(const_shape![1, 1]);
+        let weights = weights.partition(const_shape![1, 1]);
+        let mut accumulator: Tile<f32, { [1, BLOCK] }> =
+            broadcast_scalar(ZERO, const_shape![1, BLOCK]);
+        for rank in 0i32..8i32 {
+            let position = positions.load([pid.0, rank]);
+            let position: i32 = tile_to_scalar(position.reshape(const_shape![]));
+            let values: Tile<f32, { [1, BLOCK] }> =
+                convert_tile(expert_output.load([position, pid.1]));
+            let weight = weights
+                .load([pid.0, rank])
+                .broadcast(const_shape![1, BLOCK]);
+            accumulator = accumulator + values * weight;
+        }
+        let output_tile: Tile<bf16, { [1, BLOCK] }> = ftof(accumulator, rounding::NearestEven);
+        output.store(output_tile);
+    }
 }
 
-use kernels::{aligned_expert_prefix, assign_dispatch_rows, renormalize_top8, top8_router_256};
+use kernels::{
+    aligned_expert_prefix, assign_dispatch_rows, combine_top8_bf16, dispatch_bf16,
+    expert_by_row_tile, renormalize_top8, top8_router_256,
+};
 
 pub(crate) struct RoutingPlan {
     pub(crate) expert_ids: Arc<Tensor<i32>>,
@@ -147,6 +231,11 @@ pub(crate) struct RoutingPlan {
     pub(crate) ends: Arc<Tensor<i32>>,
     pub(crate) positions: Arc<Tensor<i32>>,
     pub(crate) max_dispatched_rows: usize,
+}
+
+pub(crate) struct Dispatched {
+    pub(crate) hidden: Arc<Tensor<bf16>>,
+    pub(crate) expert_by_row_tile: Arc<Tensor<i32>>,
 }
 
 impl RoutingPlan {
@@ -165,7 +254,8 @@ impl RoutingPlan {
         let max_dispatched_rows = rows
             .checked_mul(TOP_K)
             .and_then(|replicas| replicas.checked_add(active_experts * (TILE_M - 1)))
-            .ok_or_else(|| ModelError::Cuda("MoE dispatch capacity overflowed".into()))?;
+            .ok_or_else(|| ModelError::Cuda("MoE dispatch capacity overflowed".into()))?
+            .next_multiple_of(TILE_M);
         let counts = api::zeros::<i32>(&[EXPERTS])
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("allocate expert counts: {error:?}")))?;
@@ -232,6 +322,89 @@ impl RoutingPlan {
             max_dispatched_rows,
         })
     }
+
+    pub(crate) fn dispatch(
+        &self,
+        hidden: Arc<Tensor<bf16>>,
+        rows: usize,
+        hidden_size: usize,
+        stream: &Arc<Stream>,
+    ) -> Result<Dispatched, ModelError> {
+        const BLOCK: usize = 256;
+        if hidden_size == 0
+            || !hidden_size.is_multiple_of(BLOCK)
+            || hidden.shape() != [rows as i32, hidden_size as i32]
+            || self.positions.shape() != [rows as i32, TOP_K as i32]
+        {
+            return Err(ModelError::Cuda("invalid MoE dispatch geometry".into()));
+        }
+        let mut dispatched = api::zeros::<bf16>(&[self.max_dispatched_rows, hidden_size])
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("allocate dispatched rows: {error:?}")))?;
+        let mut tickets = api::zeros::<i32>(&[rows, TOP_K])
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("allocate dispatch tickets: {error:?}")))?;
+        let (_, _, tickets_partition, _) = unsafe {
+            dispatch_bf16(
+                hidden,
+                self.positions.clone(),
+                (&mut tickets).partition([1, 1]),
+                dispatched.device_pointer(),
+            )
+        }
+        .generics(vec![hidden_size.to_string(), BLOCK.to_string()])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("dispatch MoE activations: {error:?}")))?;
+        drop(tickets_partition);
+        drop(tickets);
+
+        let row_tiles = self.max_dispatched_rows.div_ceil(TILE_M);
+        let mut expert_by_tile = api::zeros::<i32>(&[row_tiles])
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("allocate expert row map: {error:?}")))?;
+        let (_, _, expert_by_tile_partition) = expert_by_row_tile(
+            self.starts.clone(),
+            self.ends.clone(),
+            (&mut expert_by_tile).partition([1]),
+        )
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("build expert row map: {error:?}")))?;
+        drop(expert_by_tile_partition);
+        Ok(Dispatched {
+            hidden: Arc::new(dispatched),
+            expert_by_row_tile: Arc::new(expert_by_tile),
+        })
+    }
+
+    pub(crate) fn combine(
+        &self,
+        expert_output: Arc<Tensor<bf16>>,
+        rows: usize,
+        hidden_size: usize,
+        stream: &Arc<Stream>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        const BLOCK: usize = 256;
+        if hidden_size == 0
+            || !hidden_size.is_multiple_of(BLOCK)
+            || expert_output.shape() != [self.max_dispatched_rows as i32, hidden_size as i32]
+        {
+            return Err(ModelError::Cuda("invalid MoE combine geometry".into()));
+        }
+        let mut output = api::zeros::<bf16>(&[rows, hidden_size])
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("allocate MoE output: {error:?}")))?;
+        let (_, _, _, output_partition) = combine_top8_bf16(
+            expert_output,
+            self.positions.clone(),
+            self.weights.clone(),
+            (&mut output).partition([1, BLOCK]),
+        )
+        .generics(vec![hidden_size.to_string(), BLOCK.to_string()])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("combine expert outputs: {error:?}")))?;
+        drop(output_partition);
+        Ok(output)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -286,6 +459,45 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
         return Err(ModelError::Cuda(format!(
             "router weights do not sum to one: max error {max_weight_sum_error}"
         )));
+    }
+
+    let hidden_size = 256usize;
+    let hidden_host = (0..rows * hidden_size)
+        .map(|index| bf16::from_f32((index % 31) as f32 / 32.0))
+        .collect::<Vec<_>>();
+    let hidden = api::copy_host_vec_to_device(&Arc::new(hidden_host.clone()))
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("upload dispatch probe: {error:?}")))?
+        .reshape(&[rows, hidden_size])
+        .map_err(|error| ModelError::Cuda(format!("reshape dispatch probe: {error:?}")))?;
+    let dispatched = plan.dispatch(Arc::new(hidden), rows, hidden_size, stream)?;
+    let dispatched_host: Vec<bf16> = download(&dispatched.hidden, stream, "dispatched rows")?;
+    let expert_by_tile: Vec<i32> =
+        download(&dispatched.expert_by_row_tile, stream, "expert row map")?;
+    for (assignment, (&expert, &position)) in ids.iter().zip(&positions).enumerate() {
+        let row = assignment / TOP_K;
+        let actual = &dispatched_host
+            [position as usize * hidden_size..(position as usize + 1) * hidden_size];
+        let expected = &hidden_host[row * hidden_size..(row + 1) * hidden_size];
+        if actual != expected || expert_by_tile[position as usize / TILE_M] != expert {
+            return Err(ModelError::Cuda(format!(
+                "dispatched assignment {assignment} does not preserve its activation/expert"
+            )));
+        }
+    }
+    let combined = plan.combine(dispatched.hidden, rows, hidden_size, stream)?;
+    let combined: Vec<bf16> = combined
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("download combined rows: {error:?}")))?;
+    for (index, (actual, expected)) in combined.iter().zip(&hidden_host).enumerate() {
+        if (actual.to_f32() - expected.to_f32()).abs() > 1.0e-2 {
+            return Err(ModelError::Cuda(format!(
+                "MoE identity combine mismatch at {index}: {} != {}",
+                actual.to_f32(),
+                expected.to_f32()
+            )));
+        }
     }
     Ok(RoutingProbe {
         max_weight_sum_error,

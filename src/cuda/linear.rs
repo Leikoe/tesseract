@@ -751,6 +751,50 @@ impl GroupedNvfp4W4A16 {
         .map_err(|error| ModelError::Cuda(format!("execute grouped NVFP4 W4A16: {error:?}")))?;
         Ok(output)
     }
+
+    pub(crate) fn enqueue_device_plan(
+        &self,
+        dispatched: Arc<Tensor<bf16>>,
+        rows: usize,
+        expert_by_row_tile: Arc<Tensor<i32>>,
+        stream: &Arc<Stream>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        if rows == 0
+            || !rows.is_multiple_of(TILE_M)
+            || dispatched.shape() != [rows as i32, self.input_size as i32]
+            || expert_by_row_tile.shape() != [(rows / TILE_M) as i32]
+        {
+            return Err(ModelError::Cuda(
+                "invalid device-resident grouped NVFP4 dispatch plan".into(),
+            ));
+        }
+        let mut output = api::zeros::<bf16>(&[rows, self.output_size])
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("allocate grouped output: {error:?}")))?;
+        let logical_tiles = (rows / TILE_M)
+            .checked_mul(self.output_size / TILE_N)
+            .ok_or_else(|| ModelError::Cuda("grouped output tile count overflowed".into()))?;
+        let workers = logical_tiles.min(device_sm_count(stream)?);
+        let output_partition = (&mut output).partition([TILE_M, TILE_N]).map(
+            [8, 1],
+            u32::try_from(workers).map_err(|_| {
+                ModelError::Cuda("persistent grouped worker count overflowed u32".into())
+            })?,
+        );
+        let (output_partition, ..) = grouped_nvfp4_w4a16(
+            output_partition,
+            dispatched,
+            expert_by_row_tile,
+            self.packed_weight.clone(),
+            self.weight_scale.clone(),
+            self.weight_global_scale.clone(),
+        )
+        .generics(vec![(self.input_size / GROUP_K).to_string()])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("execute grouped NVFP4 W4A16: {error:?}")))?;
+        drop(output_partition);
+        Ok(output)
+    }
 }
 
 fn device_sm_count(stream: &Arc<Stream>) -> Result<usize, ModelError> {
