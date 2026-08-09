@@ -103,6 +103,7 @@ struct PaddedBatch {
     context_slots: Vec<u32>,
     context_bucket: usize,
     requests: usize,
+    logical_rows: usize,
     rows: usize,
 }
 
@@ -211,6 +212,7 @@ impl PaddedBatch {
             context_slots,
             context_bucket,
             requests,
+            logical_rows,
             rows,
         })
     }
@@ -457,6 +459,7 @@ impl Program {
             self.max_batch_tokens,
         )?;
         let rows = padded.rows;
+        let logical_rows = padded.logical_rows;
         let stream = &self.stream;
         let token_ids = upload_u32(&padded.token_ids, stream, "Qwen token IDs")?;
         let positions = upload_u32(&padded.positions, stream, "Qwen positions")?;
@@ -514,6 +517,7 @@ impl Program {
                         recurrent_slots.clone(),
                         prefill.as_ref(),
                         rows,
+                        logical_rows,
                         self.config.rms_norm_eps,
                         stream,
                     )?
@@ -533,6 +537,7 @@ impl Program {
                         &context_slots,
                         context_lengths.clone(),
                         rows,
+                        logical_rows,
                         self.config.rms_norm_eps,
                         stream,
                     )?;
@@ -788,6 +793,7 @@ impl Layer {
         state_slots: Arc<Tensor<i32>>,
         prefill: Option<&GdnPrefillPlan>,
         rows: usize,
+        logical_rows: usize,
         epsilon: f32,
         stream: &Arc<Stream>,
     ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
@@ -833,7 +839,7 @@ impl Layer {
             epsilon,
             stream,
         )?;
-        let moe_output = self.moe.forward(moe_input, rows, stream)?;
+        let moe_output = self.moe.forward(moe_input, rows, logical_rows, stream)?;
         Ok((residual, Arc::new(moe_output)))
     }
 
@@ -850,6 +856,7 @@ impl Layer {
         context_slots: &TensorView<'_, u32>,
         context_lengths: Arc<Tensor<i32>>,
         rows: usize,
+        logical_rows: usize,
         epsilon: f32,
         stream: &Arc<Stream>,
     ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
@@ -899,7 +906,7 @@ impl Layer {
             epsilon,
             stream,
         )?;
-        let moe_output = self.moe.forward(moe_input, rows, stream)?;
+        let moe_output = self.moe.forward(moe_input, rows, logical_rows, stream)?;
         Ok((residual, Arc::new(moe_output)))
     }
 }
@@ -1084,10 +1091,15 @@ impl Moe {
         &self,
         hidden: Bf16Tensor,
         rows: usize,
+        logical_rows: usize,
         stream: &Arc<Stream>,
     ) -> Result<Tensor<bf16>, ModelError> {
         const HIDDEN_SIZE: usize = 2048;
-        if !rows.is_multiple_of(16) || hidden.shape() != [rows as i32, HIDDEN_SIZE as i32] {
+        if logical_rows == 0
+            || logical_rows > rows
+            || !rows.is_multiple_of(16)
+            || hidden.shape() != [rows as i32, HIDDEN_SIZE as i32]
+        {
             return Err(ModelError::Cuda("invalid Qwen MoE input geometry".into()));
         }
 
@@ -1100,8 +1112,8 @@ impl Moe {
             "Qwen routed-expert logits",
             stream,
         )?;
-        let routing = RoutingPlan::build(router_logits, rows, stream)?;
-        let dispatched = routing.dispatch(hidden.clone(), rows, HIDDEN_SIZE, stream)?;
+        let routing = RoutingPlan::build(router_logits, logical_rows, stream)?;
+        let dispatched = routing.dispatch(hidden.clone(), logical_rows, HIDDEN_SIZE, stream)?;
         let dispatched_rows = routing.max_dispatched_rows;
         let routed_gate = self.routed_gate.enqueue_device_plan(
             dispatched.hidden.clone(),
@@ -1128,7 +1140,13 @@ impl Moe {
             dispatched.expert_by_row_tile,
             stream,
         )?;
-        let routed = routing.combine(Arc::new(routed_down), rows, HIDDEN_SIZE, stream)?;
+        let routed = routing.combine(
+            Arc::new(routed_down),
+            logical_rows,
+            rows,
+            HIDDEN_SIZE,
+            stream,
+        )?;
 
         let shared_gate = self.shared_gate.enqueue(hidden.clone(), rows, stream)?;
         let shared_up = self.shared_up.enqueue(hidden.clone(), rows, stream)?;
