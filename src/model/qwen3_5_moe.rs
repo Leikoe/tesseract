@@ -15,13 +15,20 @@ use crate::cuda::qwen3_5_moe::{self as cuda_program, Artifact, Config as CudaCon
 
 #[cfg(feature = "cuda")]
 pub(super) fn load_cuda_executor(
-    _model_dir: &Path,
-    _device_id: usize,
-    _kv_capacity_tokens: usize,
-    _max_batch_tokens: usize,
-    _max_running: usize,
+    model_dir: &Path,
+    device_id: usize,
+    kv_capacity_tokens: usize,
+    max_batch_tokens: usize,
+    max_running: usize,
 ) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError> {
-    Err(runtime_pending())
+    let model = Arc::new(Qwen35MoeText::load(model_dir)?);
+    cuda_program::load_executor(
+        model.cuda_artifact(),
+        device_id,
+        kv_capacity_tokens,
+        max_batch_tokens,
+        max_running,
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -208,8 +215,9 @@ impl Qwen35MoeText {
 
 #[cfg(feature = "cuda")]
 impl Qwen35MoeText {
-    fn cuda_artifact(&self) -> Artifact {
+    fn cuda_artifact(self: &Arc<Self>) -> Artifact {
         Artifact {
+            model: self.clone(),
             config: CudaConfig {
                 attn_output_gate: self.config.text_config.attn_output_gate,
                 head_dim: self.config.text_config.head_dim,

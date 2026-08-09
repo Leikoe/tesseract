@@ -5,17 +5,22 @@ use cuda_core::{Device, Stream};
 use cutile::{
     api,
     core::bf16,
-    tensor::{PartitionMut, Reshape, Tensor, TensorView},
+    tensor::{PartitionMut, Reshape, Tensor, TensorView, ToHostVec},
     tile_kernel::TileKernel,
 };
 
-use crate::model::{
-    CudaModelReport, ModelError,
-    weights::{WeightDtype, WeightSource},
+use crate::{
+    engine::{ExecutionError, ModelExecutor, StateSchema, TokenId},
+    model::{
+        CudaModelReport, Model, ModelError,
+        weights::{WeightDtype, WeightSource},
+    },
 };
 
 use super::{
+    batch::CudaBatch,
     cublas,
+    executor::{CudaExecutor, ModelProgram, ProgramOutput},
     gdn::{self as gdn_backend, GdnPrefillPlan, GdnState},
     kernels,
     linear::{ExpertProjection, Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear},
@@ -62,6 +67,7 @@ pub(crate) struct Config {
 }
 
 pub(crate) struct Artifact {
+    pub(crate) model: Arc<dyn Model>,
     pub(crate) config: Config,
     pub(crate) weights: Arc<dyn WeightSource>,
 }
@@ -71,6 +77,143 @@ pub(crate) struct Checkpoint {
     final_norm: Bf16Tensor,
     lm_head: Nvfp4W4A16Linear,
     layers: Vec<Layer>,
+}
+
+struct Program {
+    model: Arc<dyn Model>,
+    config: Config,
+    checkpoint: Checkpoint,
+    stream: Arc<Stream>,
+    attention: QwenFlatKvAttention,
+    recurrent: Vec<Option<GdnState>>,
+    state_schema: StateSchema,
+    kv_capacity: usize,
+    recurrent_capacity: usize,
+    max_batch_tokens: usize,
+}
+
+struct PaddedBatch {
+    token_ids: Vec<u32>,
+    positions: Vec<u32>,
+    current_slots: Vec<u32>,
+    request_indices: Vec<u32>,
+    recurrent_slots: Vec<i32>,
+    query_start_offsets: Vec<u32>,
+    context_lengths: Vec<i32>,
+    context_slots: Vec<u32>,
+    context_bucket: usize,
+    requests: usize,
+    rows: usize,
+}
+
+const ROW_ALIGNMENT: usize = 16;
+const PRIVATE_PADDING_SLOTS: usize = ROW_ALIGNMENT - 1;
+const HIDDEN_SIZE: usize = 2048;
+const EMBEDDING_BLOCK: usize = 256;
+
+impl PaddedBatch {
+    fn new(
+        batch: &CudaBatch,
+        kv_capacity: usize,
+        recurrent_capacity: usize,
+        max_batch_tokens: usize,
+    ) -> Result<Self, ModelError> {
+        let logical_rows = batch.num_tokens();
+        if logical_rows == 0 || logical_rows > max_batch_tokens {
+            return Err(ModelError::Cuda(format!(
+                "Qwen batch has {logical_rows} tokens; configured maximum is {max_batch_tokens}"
+            )));
+        }
+        let rows = logical_rows.div_ceil(ROW_ALIGNMENT) * ROW_ALIGNMENT;
+        let padding = rows - logical_rows;
+        let mut token_ids = batch.token_ids.clone();
+        let mut positions = batch.positions.clone();
+        let mut current_slots = batch.current_slots.clone();
+        let mut request_indices = batch.request_indices.clone();
+        let mut context_lengths = batch.context_lengths.clone();
+        let mut query_start_offsets = batch.query_start_offsets.clone();
+        let mut recurrent_slots = batch
+            .recurrent_slots
+            .iter()
+            .map(|slot| {
+                let slot = slot.ok_or_else(|| {
+                    ModelError::Cuda("Qwen batch is missing a recurrent-state slot".into())
+                })?;
+                i32::try_from(slot)
+                    .map_err(|_| ModelError::Cuda("Qwen recurrent slot exceeds i32".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if current_slots
+            .iter()
+            .any(|slot| *slot as usize >= kv_capacity)
+            || recurrent_slots
+                .iter()
+                .any(|slot| *slot < 0 || *slot as usize >= recurrent_capacity)
+        {
+            return Err(ModelError::Cuda(
+                "Qwen batch references state outside its scheduler-owned capacity".into(),
+            ));
+        }
+        let logical_requests = batch.request_count();
+        let mut contexts = batch.contexts().to_vec();
+        for index in 0..padding {
+            let private_kv = kv_capacity
+                .checked_add(index)
+                .and_then(|slot| u32::try_from(slot).ok())
+                .ok_or_else(|| ModelError::Cuda("Qwen private KV slot overflowed".into()))?;
+            let private_recurrent = recurrent_capacity
+                .checked_add(index)
+                .and_then(|slot| i32::try_from(slot).ok())
+                .ok_or_else(|| ModelError::Cuda("Qwen private recurrent slot overflowed".into()))?;
+            token_ids.push(0);
+            positions.push(0);
+            current_slots.push(private_kv);
+            request_indices.push(
+                u32::try_from(logical_requests + index)
+                    .map_err(|_| ModelError::Cuda("Qwen request index overflowed".into()))?,
+            );
+            context_lengths.push(1);
+            recurrent_slots.push(private_recurrent);
+            let next = query_start_offsets
+                .last()
+                .copied()
+                .and_then(|offset| offset.checked_add(1))
+                .ok_or_else(|| ModelError::Cuda("Qwen query offset overflowed".into()))?;
+            query_start_offsets.push(next);
+            contexts.push(vec![private_kv]);
+        }
+        let requests = contexts.len();
+        let context_bucket = contexts
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(1)
+            .div_ceil(16)
+            * 16;
+        let sentinel = u32::try_from(kv_capacity)
+            .map_err(|_| ModelError::Cuda("Qwen KV sentinel overflowed".into()))?;
+        let mut context_slots = Vec::with_capacity(requests * context_bucket);
+        for context in contexts {
+            context_slots.extend_from_slice(&context);
+            context_slots.resize(
+                context_slots.len() + context_bucket - context.len(),
+                sentinel,
+            );
+        }
+        Ok(Self {
+            token_ids,
+            positions,
+            current_slots,
+            request_indices,
+            recurrent_slots,
+            query_start_offsets,
+            context_lengths,
+            context_slots,
+            context_bucket,
+            requests,
+            rows,
+        })
+    }
 }
 
 struct Layer {
@@ -245,6 +388,306 @@ impl Checkpoint {
             + self.lm_head.device_bytes()
             + self.layers.iter().map(Layer::device_bytes).sum::<usize>()
     }
+}
+
+impl Program {
+    fn load(
+        artifact: Artifact,
+        device_id: usize,
+        kv_capacity: usize,
+        max_batch_tokens: usize,
+        max_running: usize,
+    ) -> Result<Self, ModelError> {
+        let physical_kv_capacity = kv_capacity
+            .checked_add(PRIVATE_PADDING_SLOTS)
+            .ok_or_else(|| ModelError::Cuda("Qwen physical KV capacity overflowed".into()))?;
+        let physical_recurrent_capacity = max_running
+            .checked_add(PRIVATE_PADDING_SLOTS)
+            .ok_or_else(|| ModelError::Cuda("Qwen recurrent capacity overflowed".into()))?;
+        let device = Device::new(device_id).map_err(|error| {
+            ModelError::Cuda(format!("initialize device {device_id}: {error:?}"))
+        })?;
+        let stream = device
+            .new_stream()
+            .map_err(|error| ModelError::Cuda(format!("create stream: {error:?}")))?;
+        let checkpoint = Checkpoint::load(&artifact, &stream)?;
+        let full_layers = artifact
+            .config
+            .layers
+            .iter()
+            .filter(|kind| **kind == LayerKind::FullAttention)
+            .count();
+        let attention = QwenFlatKvAttention::load(
+            full_layers,
+            physical_kv_capacity,
+            artifact.config.max_position_embeddings,
+            artifact.config.rope_theta,
+            &stream,
+        )?;
+        let mut recurrent = Vec::with_capacity(artifact.config.layers.len());
+        for kind in &artifact.config.layers {
+            recurrent.push(match kind {
+                LayerKind::LinearAttention => {
+                    Some(GdnState::zeros(physical_recurrent_capacity, &stream)?)
+                }
+                LayerKind::FullAttention => None,
+            });
+        }
+        let state_schema = StateSchema::try_hybrid(kv_capacity, max_running)
+            .map_err(|error| ModelError::InvalidConfig(error.to_string()))?;
+        Ok(Self {
+            model: artifact.model,
+            config: artifact.config,
+            checkpoint,
+            stream,
+            attention,
+            recurrent,
+            state_schema,
+            kv_capacity,
+            recurrent_capacity: max_running,
+            max_batch_tokens,
+        })
+    }
+
+    fn forward(&mut self, batch: &CudaBatch) -> Result<ProgramOutput, ModelError> {
+        let padded = PaddedBatch::new(
+            batch,
+            self.kv_capacity,
+            self.recurrent_capacity,
+            self.max_batch_tokens,
+        )?;
+        let rows = padded.rows;
+        let stream = &self.stream;
+        let token_ids = upload_u32(&padded.token_ids, stream, "Qwen token IDs")?;
+        let positions = upload_u32(&padded.positions, stream, "Qwen positions")?;
+        let current_slots = upload_u32(&padded.current_slots, stream, "Qwen current KV slots")?;
+        let request_indices = upload_u32(&padded.request_indices, stream, "Qwen request indices")?;
+        let recurrent_slots =
+            upload_i32_named(&padded.recurrent_slots, stream, "Qwen recurrent slots")?;
+        let context_lengths =
+            upload_i32_named(&padded.context_lengths, stream, "Qwen context lengths")?;
+        let context_storage = upload_u32(&padded.context_slots, stream, "Qwen context slots")?;
+        let context_slots = context_storage
+            .view(&[padded.requests, padded.context_bucket])
+            .map_err(|error| ModelError::Cuda(format!("view Qwen context slots: {error:?}")))?;
+        let mut hidden = api::zeros::<bf16>(&[rows, HIDDEN_SIZE])
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("allocate Qwen embedding: {error:?}")))?;
+        let (_, _, hidden_partition) = kernels::embedding_bf16(
+            &token_ids,
+            &*self.checkpoint.embedding,
+            (&mut hidden).partition([1, EMBEDDING_BLOCK]),
+        )
+        .generics(vec![HIDDEN_SIZE.to_string(), EMBEDDING_BLOCK.to_string()])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("execute Qwen embedding: {error:?}")))?;
+        drop(hidden_partition);
+        let hidden = Arc::new(hidden);
+        let prefill = if batch.num_prefill_tokens > 0 {
+            Some(GdnPrefillPlan::from_offsets(
+                &padded.query_start_offsets,
+                stream,
+            )?)
+        } else {
+            None
+        };
+
+        let mut pending: Option<(Bf16Tensor, Bf16Tensor)> = None;
+        let mut full_layer = 0usize;
+        for layer_index in 0..self.checkpoint.layers.len() {
+            let layer = &self.checkpoint.layers[layer_index];
+            let previous = pending.take();
+            let result = match &layer.attention {
+                Attention::Linear(_) => {
+                    let state = self.recurrent[layer_index].as_mut().ok_or_else(|| {
+                        ModelError::Cuda(format!(
+                            "Qwen linear layer {layer_index} has no recurrent state"
+                        ))
+                    })?;
+                    layer.forward_linear(
+                        previous
+                            .as_ref()
+                            .map(|(residual, _)| residual.clone())
+                            .unwrap_or_else(|| hidden.clone()),
+                        previous.as_ref().map(|(_, update)| update.clone()),
+                        state,
+                        recurrent_slots.clone(),
+                        prefill.as_ref(),
+                        rows,
+                        self.config.rms_norm_eps,
+                        stream,
+                    )?
+                }
+                Attention::Full(_) => {
+                    let result = layer.forward_full(
+                        previous
+                            .as_ref()
+                            .map(|(residual, _)| residual.clone())
+                            .unwrap_or_else(|| hidden.clone()),
+                        previous.as_ref().map(|(_, update)| update.clone()),
+                        &self.attention,
+                        full_layer,
+                        positions.clone(),
+                        current_slots.clone(),
+                        request_indices.clone(),
+                        &context_slots,
+                        context_lengths.clone(),
+                        rows,
+                        self.config.rms_norm_eps,
+                        stream,
+                    )?;
+                    full_layer += 1;
+                    result
+                }
+            };
+            pending = Some(result);
+        }
+
+        if batch.samples.is_empty() {
+            return Ok(ProgramOutput::None);
+        }
+        let (residual, update) =
+            pending.ok_or_else(|| ModelError::Cuda("Qwen checkpoint has no layers".into()))?;
+        let (final_hidden, _) = gemma_add_rms_norm(
+            residual,
+            update,
+            self.checkpoint.final_norm.clone(),
+            rows,
+            self.config.rms_norm_eps,
+            stream,
+        )?;
+        self.sample(final_hidden, batch)
+    }
+
+    fn sample(
+        &self,
+        final_hidden: Bf16Tensor,
+        batch: &CudaBatch,
+    ) -> Result<ProgramOutput, ModelError> {
+        const ARGMAX_BLOCK: usize = 256;
+        const ARGMAX_REDUCE_BLOCK: usize = 1024;
+        let samples = batch.samples.len();
+        let sample_rows = samples.div_ceil(ROW_ALIGNMENT) * ROW_ALIGNMENT;
+        let mut padded_sample_rows = batch.sample_rows.clone();
+        padded_sample_rows.resize(sample_rows, batch.sample_rows[0]);
+        let sample_rows_device = upload_u32(&padded_sample_rows, &self.stream, "Qwen sample rows")?;
+        let mut sampled_hidden = api::zeros::<bf16>(&[sample_rows, HIDDEN_SIZE])
+            .sync_on(&self.stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!("allocate Qwen sampled hidden states: {error:?}"))
+            })?;
+        let (_, _, sampled_partition) = unsafe {
+            kernels::gather_rows_bf16(
+                final_hidden.device_pointer(),
+                &sample_rows_device,
+                (&mut sampled_hidden).partition([1, EMBEDDING_BLOCK]),
+            )
+        }
+        .generics(vec![HIDDEN_SIZE.to_string(), EMBEDDING_BLOCK.to_string()])
+        .sync_on(&self.stream)
+        .map_err(|error| ModelError::Cuda(format!("gather Qwen sample rows: {error:?}")))?;
+        drop(sampled_partition);
+        let logits =
+            self.checkpoint
+                .lm_head
+                .enqueue(Arc::new(sampled_hidden), sample_rows, &self.stream)?;
+        if batch.all_samples_greedy {
+            let blocks = self.config.vocab_size.div_ceil(ARGMAX_BLOCK);
+            let mut block_max = api::zeros::<f32>(&[sample_rows, blocks])
+                .sync_on(&self.stream)
+                .map_err(|error| ModelError::Cuda(format!("allocate Qwen argmax: {error:?}")))?;
+            let mut block_index = api::zeros::<u32>(&[sample_rows, blocks])
+                .sync_on(&self.stream)
+                .map_err(|error| {
+                    ModelError::Cuda(format!("allocate Qwen argmax indices: {error:?}"))
+                })?;
+            let (_, block_max_partition, block_index_partition, _) =
+                kernels::argmax_blocks_batch_bf16(
+                    Arc::new(logits),
+                    (&mut block_max).partition([1, 1]),
+                    (&mut block_index).partition([1, 1]),
+                    self.config.vocab_size as i32,
+                )
+                .generics(vec![ARGMAX_BLOCK.to_string()])
+                .sync_on(&self.stream)
+                .map_err(|error| ModelError::Cuda(format!("execute Qwen argmax: {error:?}")))?;
+            drop(block_max_partition);
+            drop(block_index_partition);
+            let mut sampled = api::zeros::<u32>(&[sample_rows])
+                .sync_on(&self.stream)
+                .map_err(|error| {
+                    ModelError::Cuda(format!("allocate Qwen sampled tokens: {error:?}"))
+                })?;
+            let (_, _, sampled_partition, _) = kernels::argmax_reduce_batch_bf16(
+                Arc::new(block_max),
+                Arc::new(block_index),
+                (&mut sampled).partition([1]),
+                blocks as i32,
+            )
+            .generics(vec![ARGMAX_REDUCE_BLOCK.to_string()])
+            .sync_on(&self.stream)
+            .map_err(|error| ModelError::Cuda(format!("reduce Qwen argmax: {error:?}")))?;
+            drop(sampled_partition);
+            let mut sampled = sampled
+                .to_host_vec()
+                .sync_on(&self.stream)
+                .map_err(|error| {
+                    ModelError::Cuda(format!("download Qwen sampled tokens: {error:?}"))
+                })?;
+            sampled.truncate(samples);
+            return Ok(ProgramOutput::Tokens(
+                sampled.into_iter().map(TokenId::new).collect(),
+            ));
+        }
+        let logits = logits
+            .to_host_vec()
+            .sync_on(&self.stream)
+            .map_err(|error| ModelError::Cuda(format!("download Qwen logits: {error:?}")))?;
+        let mut logits = logits.into_iter().map(bf16::to_f32).collect::<Vec<_>>();
+        logits.truncate(samples * self.config.vocab_size);
+        Ok(ProgramOutput::HostLogits {
+            values: logits,
+            vocab_size: self.config.vocab_size,
+        })
+    }
+}
+
+impl ModelProgram for Program {
+    fn model(&self) -> Arc<dyn Model> {
+        self.model.clone()
+    }
+
+    fn state_schema(&self) -> &StateSchema {
+        &self.state_schema
+    }
+
+    fn execute(&mut self, batch: &CudaBatch) -> Result<ProgramOutput, ExecutionError> {
+        self.forward(batch)
+            .map_err(|error| ExecutionError::Execution(error.to_string()))
+    }
+}
+
+pub(crate) fn load_executor(
+    artifact: Artifact,
+    device_id: usize,
+    kv_capacity_tokens: usize,
+    max_batch_tokens: usize,
+    max_running: usize,
+) -> Result<Box<dyn ModelExecutor>, ModelError> {
+    let program = Program::load(
+        artifact,
+        device_id,
+        kv_capacity_tokens,
+        max_batch_tokens,
+        max_running,
+    )?;
+    tracing::info!(
+        kv_capacity_tokens,
+        max_batch_tokens,
+        max_running,
+        "Qwen hybrid CUDA executor loaded"
+    );
+    Ok(Box::new(CudaExecutor::new(program)))
 }
 
 impl Layer {
@@ -852,4 +1295,26 @@ fn load_f32(
         .reshape(tensor.shape())
         .map_err(|error| ModelError::Cuda(format!("reshape `{name}`: {error:?}")))?;
     Ok(Arc::new(device))
+}
+
+fn upload_u32(
+    values: &[u32],
+    stream: &Arc<Stream>,
+    name: &str,
+) -> Result<Arc<Tensor<u32>>, ModelError> {
+    api::copy_host_vec_to_device(&Arc::new(values.to_vec()))
+        .sync_on(stream)
+        .map(Arc::new)
+        .map_err(|error| ModelError::Cuda(format!("upload {name}: {error:?}")))
+}
+
+fn upload_i32_named(
+    values: &[i32],
+    stream: &Arc<Stream>,
+    name: &str,
+) -> Result<Arc<Tensor<i32>>, ModelError> {
+    api::copy_host_vec_to_device(&Arc::new(values.to_vec()))
+        .sync_on(stream)
+        .map(Arc::new)
+        .map_err(|error| ModelError::Cuda(format!("upload {name}: {error:?}")))
 }
