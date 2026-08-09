@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::cuda::{
     execution::StreamExecution,
-    linear::{Fp8W8A16Linear, Nvfp4W4A16Linear},
+    linear::{Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear},
 };
 use crate::{model::ModelError, quantization::decode_e4m3fn};
 
@@ -570,6 +570,7 @@ pub struct KernelBenchmarkReport {
     pub cutile_nvfp4_max_abs_error: f32,
     pub marlin_fp8_max_abs_error: f32,
     pub marlin_nvfp4_max_abs_error: f32,
+    pub marlin_grouped_nvfp4_max_abs_error: f32,
     pub samples: Vec<KernelBenchmarkSample>,
 }
 
@@ -580,6 +581,12 @@ pub struct KernelBenchmarkSample {
     pub rows: usize,
     pub output_size: usize,
     pub input_size: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_pattern: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_experts: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_rows: Option<usize>,
     pub raw_ms: Vec<f32>,
     pub minimum_ms: f32,
     pub median_ms: f32,
@@ -641,6 +648,24 @@ pub fn benchmark(
             &mut samples,
         )?;
     }
+    benchmark_grouped_nvfp4_shape(
+        &stream,
+        rows,
+        2048,
+        512,
+        warmup_iterations,
+        timed_iterations,
+        &mut samples,
+    )?;
+    benchmark_grouped_nvfp4_shape(
+        &stream,
+        rows,
+        512,
+        2048,
+        warmup_iterations,
+        timed_iterations,
+        &mut samples,
+    )?;
     Ok(KernelBenchmarkReport {
         device_id,
         warmup_iterations,
@@ -649,6 +674,7 @@ pub fn benchmark(
         cutile_nvfp4_max_abs_error: cutile_probe.max_abs_error,
         marlin_fp8_max_abs_error: marlin_probe.fp8_max_abs_error,
         marlin_nvfp4_max_abs_error: marlin_probe.nvfp4_max_abs_error,
+        marlin_grouped_nvfp4_max_abs_error: marlin_probe.grouped_nvfp4_max_abs_error,
         samples,
     })
 }
@@ -735,6 +761,107 @@ fn benchmark_nvfp4_case(
         stream,
     )?);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_grouped_nvfp4_shape(
+    stream: &Arc<Stream>,
+    row_counts: &[usize],
+    input_size: usize,
+    output_size: usize,
+    warmup: usize,
+    iterations: usize,
+    samples: &mut Vec<KernelBenchmarkSample>,
+) -> Result<(), ModelError> {
+    const EXPERTS: usize = 256;
+    let packed = (0..EXPERTS * output_size * input_size / 2)
+        .map(|index| {
+            let expert = index / (output_size * input_size / 2);
+            let low = ((index * 2 + expert) % 16) as u8;
+            let high = ((index * 2 + 1 + expert * 3) % 16) as u8;
+            low | (high << 4)
+        })
+        .collect::<Vec<_>>();
+    let scales = (0..EXPERTS * output_size * (input_size / 16))
+        .map(|index| [0x30, 0x38, 0x40, 0x44][index % 4])
+        .collect::<Vec<_>>();
+    let globals = (0..EXPERTS)
+        .map(|expert| [0.25, 0.5, 0.75, 1.0][expert % 4])
+        .collect::<Vec<_>>();
+    let cutile = GroupedNvfp4W4A16::from_host_owned(
+        EXPERTS,
+        input_size,
+        output_size,
+        packed.clone(),
+        scales.clone(),
+        globals.clone(),
+        stream,
+    )?;
+    let marlin = MarlinMoe::nvfp4(&packed, &scales, &globals, input_size, output_size, stream)?;
+    for &rows in row_counts {
+        let block_rows = if rows >= 512 && rows.is_multiple_of(64) {
+            64
+        } else {
+            16
+        };
+        for pattern in ["uniform", "skewed"] {
+            let expert_map = grouped_expert_map(rows / block_rows, EXPERTS, pattern);
+            if pattern == "skewed" && expert_map.len() < 2 {
+                continue;
+            }
+            let expert_map = upload(expert_map, stream, "upload grouped benchmark expert map")?;
+            let input = benchmark_input(rows, input_size, stream)?;
+            samples.push(time_cutile_grouped(
+                &cutile,
+                input.clone(),
+                expert_map.clone(),
+                rows,
+                input_size,
+                output_size,
+                block_rows,
+                pattern,
+                warmup,
+                iterations,
+                stream,
+            )?);
+            samples.push(time_marlin_grouped(
+                &marlin,
+                input,
+                expert_map,
+                rows,
+                input_size,
+                output_size,
+                block_rows,
+                pattern,
+                warmup,
+                iterations,
+                stream,
+            )?);
+        }
+    }
+    Ok(())
+}
+
+fn grouped_expert_map(blocks: usize, experts: usize, pattern: &str) -> Vec<i32> {
+    match pattern {
+        "uniform" => (0..blocks)
+            .map(|block| ((block * experts / blocks.max(1)).min(experts - 1)) as i32)
+            .collect(),
+        "skewed" => {
+            let hot_blocks = (blocks * 3 / 4).max(1);
+            (0..blocks)
+                .map(|block| {
+                    if block < hot_blocks {
+                        0
+                    } else {
+                        1 + ((block - hot_blocks) * (experts - 1) / (blocks - hot_blocks).max(1))
+                            as i32
+                    }
+                })
+                .collect()
+        }
+        _ => unreachable!("benchmark routing patterns are closed"),
+    }
 }
 
 fn benchmark_input(
@@ -831,6 +958,143 @@ fn time_cutile_nvfp4(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn time_cutile_grouped(
+    linear: &GroupedNvfp4W4A16,
+    input: Arc<Tensor<bf16>>,
+    expert_map: Arc<Tensor<i32>>,
+    rows: usize,
+    input_size: usize,
+    output_size: usize,
+    block_rows: usize,
+    routing_pattern: &'static str,
+    warmup: usize,
+    iterations: usize,
+    stream: &Arc<Stream>,
+) -> Result<KernelBenchmarkSample, ModelError> {
+    let mut output = api::zeros::<bf16>(&[rows, output_size])
+        .sync_on(stream)
+        .map_err(|error| {
+            ModelError::Cuda(format!("allocate grouped benchmark output: {error:?}"))
+        })?;
+    for _ in 0..warmup {
+        let mut execution = StreamExecution::new(stream);
+        output = linear.enqueue_device_plan_into(
+            input.clone(),
+            rows,
+            expert_map.clone(),
+            output,
+            &mut execution,
+        )?;
+        execution.synchronize("warm grouped cuTile comparison")?;
+    }
+    let mut raw_ms = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = TimingEvent::new(stream)?;
+        let end = TimingEvent::new(stream)?;
+        start.record(stream)?;
+        let mut execution = StreamExecution::new(stream);
+        output = linear.enqueue_device_plan_into(
+            input.clone(),
+            rows,
+            expert_map.clone(),
+            output,
+            &mut execution,
+        )?;
+        end.record(stream)?;
+        raw_ms.push(start.elapsed_ms(&end, stream)?);
+        execution.mark_synchronized();
+    }
+    Ok(summarize_grouped(
+        "cutile_grouped",
+        rows,
+        output_size,
+        input_size,
+        routing_pattern,
+        linear.num_experts(),
+        block_rows,
+        raw_ms,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn time_marlin_grouped(
+    linear: &MarlinMoe,
+    input: Arc<Tensor<bf16>>,
+    expert_map: Arc<Tensor<i32>>,
+    rows: usize,
+    input_size: usize,
+    output_size: usize,
+    block_rows: usize,
+    routing_pattern: &'static str,
+    warmup: usize,
+    iterations: usize,
+    stream: &Arc<Stream>,
+) -> Result<KernelBenchmarkSample, ModelError> {
+    let output = api::zeros::<bf16>(&[rows, output_size])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate grouped Marlin output: {error:?}")))?;
+    let temporary = api::zeros::<f32>(&[rows, output_size])
+        .sync_on(stream)
+        .map_err(|error| {
+            ModelError::Cuda(format!("allocate grouped Marlin temporary: {error:?}"))
+        })?;
+    let sorted_token_ids = upload(
+        (0..rows as i32).collect(),
+        stream,
+        "upload grouped benchmark sorted token IDs",
+    )?;
+    let padded_count = upload(
+        vec![rows as i32],
+        stream,
+        "upload grouped benchmark padded count",
+    )?;
+    for _ in 0..warmup {
+        linear.execute(
+            &input,
+            &output,
+            &temporary,
+            &sorted_token_ids,
+            &expert_map,
+            &padded_count,
+            rows,
+            block_rows,
+            stream,
+        )?;
+    }
+    unsafe { stream.synchronize() }
+        .map_err(|error| ModelError::Cuda(format!("warm grouped Marlin kernel: {error:?}")))?;
+    let mut raw_ms = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = TimingEvent::new(stream)?;
+        let end = TimingEvent::new(stream)?;
+        start.record(stream)?;
+        linear.execute(
+            &input,
+            &output,
+            &temporary,
+            &sorted_token_ids,
+            &expert_map,
+            &padded_count,
+            rows,
+            block_rows,
+            stream,
+        )?;
+        end.record(stream)?;
+        raw_ms.push(start.elapsed_ms(&end, stream)?);
+    }
+    Ok(summarize_grouped(
+        "marlin_grouped",
+        rows,
+        output_size,
+        input_size,
+        routing_pattern,
+        linear.num_experts(),
+        block_rows,
+        raw_ms,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn time_marlin(
     linear: &MarlinLinear,
     input: Arc<Tensor<bf16>>,
@@ -894,6 +1158,9 @@ fn summarize(
         rows,
         output_size,
         input_size,
+        routing_pattern: None,
+        num_experts: None,
+        block_rows: None,
         raw_ms,
         minimum_ms,
         median_ms,
@@ -901,6 +1168,31 @@ fn summarize(
         logical_tflops,
         packed_weight_gb_per_second: packed_bytes / seconds / 1.0e9,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn summarize_grouped(
+    implementation: &'static str,
+    rows: usize,
+    output_size: usize,
+    input_size: usize,
+    routing_pattern: &'static str,
+    num_experts: usize,
+    block_rows: usize,
+    raw_ms: Vec<f32>,
+) -> KernelBenchmarkSample {
+    let mut sample = summarize(
+        implementation,
+        MarlinQuantization::Nvfp4,
+        rows,
+        output_size,
+        input_size,
+        raw_ms,
+    );
+    sample.routing_pattern = Some(routing_pattern);
+    sample.num_experts = Some(num_experts);
+    sample.block_rows = Some(block_rows);
+    sample
 }
 
 struct TimingEvent(sys::CUevent);

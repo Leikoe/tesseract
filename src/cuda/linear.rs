@@ -914,6 +914,10 @@ impl ExpertProjection {
 }
 
 impl GroupedNvfp4W4A16 {
+    pub(crate) const fn num_experts(&self) -> usize {
+        self.num_experts
+    }
+
     pub(crate) const fn output_size(&self) -> usize {
         self.output_size
     }
@@ -981,7 +985,7 @@ impl GroupedNvfp4W4A16 {
         )
     }
 
-    fn from_host_owned(
+    pub(super) fn from_host_owned(
         num_experts: usize,
         input_size: usize,
         output_size: usize,
