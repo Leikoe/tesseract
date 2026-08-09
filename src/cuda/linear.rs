@@ -478,7 +478,7 @@ mod kernels {
         let magnitude_bits = select(eq_tile(exponent, zero_i32), subnormal_bits, normal_bits);
         const BF16_SIGN_BIT: i32 = 0x8000;
         let bits = magnitude_bits + sign * broadcast_scalar(BF16_SIGN_BIT, shape);
-        let bits: Tile<u16, { [64, 16] }> = trunci(bits, overflow::None);
+        let bits: Tile<u16, { [64, 16] }> = trunci(bits, overflow::NoUnsignedWrap);
         let decoded: Tile<bf16, { [64, 16] }> = bitcast(bits);
         convert_tile(decoded)
     }
