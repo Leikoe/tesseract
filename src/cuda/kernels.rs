@@ -654,10 +654,11 @@ mod tile {
 
             const NEGATIVE_INFINITY: f32 = -1.0e30f32;
             let mut row_max: Tile<f32, { [BM, 1] }> =
-                constant(NEGATIVE_INFINITY, const_shape![BM, 1]);
+                broadcast_scalar(NEGATIVE_INFINITY, const_shape![BM, 1]);
             const ZERO: f32 = 0.0f32;
-            let mut row_sum: Tile<f32, { [BM, 1] }> = constant(ZERO, const_shape![BM, 1]);
-            let mut accumulator: Tile<f32, { [BM, D] }> = constant(ZERO, const_shape![BM, D]);
+            let mut row_sum: Tile<f32, { [BM, 1] }> = broadcast_scalar(ZERO, const_shape![BM, 1]);
+            let mut accumulator: Tile<f32, { [BM, D] }> =
+                broadcast_scalar(ZERO, const_shape![BM, D]);
             let key_lane: Tile<i32, { [BN] }> = iota(const_shape![BN]);
             let context_slots = context_slots.partition(const_shape![1, BN]);
             let cache_feature: Tile<i32, { [D] }> = iota(const_shape![D]);
@@ -695,7 +696,8 @@ mod tile {
                     None,
                     Latency::<0>,
                 );
-                let scores_zero: Tile<f32, { [BM, BN] }> = constant(ZERO, const_shape![BM, BN]);
+                let scores_zero: Tile<f32, { [BM, BN] }> =
+                    broadcast_scalar(ZERO, const_shape![BM, BN]);
                 let scores: Tile<f32, { [BM, BN] }> = mma(query, key.transpose(), scores_zero);
                 let causal: Tile<bool, { [BM, BN] }> = lt_tile(
                     key_positions
@@ -710,7 +712,7 @@ mod tile {
                 let scaled: Tile<f32, { [BM, BN] }> =
                     scores * scale.broadcast(const_shape![BM, BN]);
                 let negative_infinity: Tile<f32, { [BM, BN] }> =
-                    constant(NEGATIVE_INFINITY, const_shape![BM, BN]);
+                    broadcast_scalar(NEGATIVE_INFINITY, const_shape![BM, BN]);
                 let scores = select(causal, scaled, negative_infinity);
                 let block_max: Tile<f32, { [BM] }> = reduce_max(scores, 1i32);
                 let block_max: Tile<f32, { [BM, 1] }> = block_max.reshape(const_shape![BM, 1]);
@@ -738,7 +740,7 @@ mod tile {
             }
 
             const EPSILON: f32 = 1.0e-8f32;
-            let epsilon: Tile<f32, { [BM, 1] }> = constant(EPSILON, const_shape![BM, 1]);
+            let epsilon: Tile<f32, { [BM, 1] }> = broadcast_scalar(EPSILON, const_shape![BM, 1]);
             let denominator: Tile<f32, { [BM, D] }> =
                 max_tile(row_sum, epsilon).broadcast(const_shape![BM, D]);
             let output: Tile<bf16, { [BM, D] }> = convert_tile(true_div(accumulator, denominator));
