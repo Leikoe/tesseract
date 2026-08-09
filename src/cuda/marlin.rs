@@ -7,7 +7,7 @@ use cuda_core::{IntoResult, Stream, sys};
 use cutile::{
     DType, api,
     core::{bf16, f16},
-    tensor::{Reshape, Tensor, ToHostVec},
+    tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
 };
 use serde::Serialize;
 
