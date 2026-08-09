@@ -31,8 +31,31 @@ pub(crate) enum LayerKind {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
+    pub(crate) attn_output_gate: bool,
+    pub(crate) head_dim: usize,
+    pub(crate) hidden_act: String,
+    pub(crate) hidden_size: usize,
     pub(crate) layers: Vec<LayerKind>,
+    pub(crate) linear_conv_kernel_dim: usize,
+    pub(crate) linear_key_head_dim: usize,
+    pub(crate) linear_num_key_heads: usize,
+    pub(crate) linear_num_value_heads: usize,
+    pub(crate) linear_value_head_dim: usize,
+    pub(crate) mamba_ssm_dtype: String,
+    pub(crate) max_position_embeddings: usize,
+    pub(crate) moe_intermediate_size: usize,
     pub(crate) num_experts: usize,
+    pub(crate) num_experts_per_tok: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_key_value_heads: usize,
+    pub(crate) partial_rotary_factor: f32,
+    pub(crate) rms_norm_eps: f32,
+    pub(crate) rope_interleaved: bool,
+    pub(crate) rope_section: Vec<usize>,
+    pub(crate) rope_theta: f32,
+    pub(crate) rope_type: String,
+    pub(crate) shared_expert_intermediate_size: usize,
+    pub(crate) vocab_size: usize,
 }
 
 pub(crate) struct Artifact {

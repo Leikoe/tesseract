@@ -52,19 +52,45 @@ fn runtime_pending() -> ModelError {
     )
 }
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[derive(Debug, Deserialize)]
 struct TextConfig {
+    attn_output_gate: bool,
     dtype: String,
     eos_token_id: u32,
+    head_dim: usize,
+    hidden_act: String,
     hidden_size: usize,
     #[cfg(feature = "cuda")]
     layer_types: Vec<LayerKind>,
+    linear_conv_kernel_dim: usize,
+    linear_key_head_dim: usize,
+    linear_num_key_heads: usize,
+    linear_num_value_heads: usize,
+    linear_value_head_dim: usize,
+    mamba_ssm_dtype: String,
+    max_position_embeddings: usize,
+    moe_intermediate_size: usize,
     num_attention_heads: usize,
     #[cfg(feature = "cuda")]
     num_experts: usize,
+    num_experts_per_tok: usize,
     num_hidden_layers: usize,
     num_key_value_heads: usize,
+    partial_rotary_factor: f32,
+    rms_norm_eps: f32,
+    rope_parameters: RopeParameters,
+    shared_expert_intermediate_size: usize,
     vocab_size: usize,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+struct RopeParameters {
+    mrope_interleaved: bool,
+    mrope_section: Vec<usize>,
+    rope_theta: f32,
+    rope_type: String,
 }
 
 #[cfg(feature = "cuda")]
@@ -185,6 +211,10 @@ impl Qwen35MoeText {
     fn cuda_artifact(&self) -> Artifact {
         Artifact {
             config: CudaConfig {
+                attn_output_gate: self.config.text_config.attn_output_gate,
+                head_dim: self.config.text_config.head_dim,
+                hidden_act: self.config.text_config.hidden_act.clone(),
+                hidden_size: self.config.text_config.hidden_size,
                 layers: self
                     .config
                     .text_config
@@ -195,7 +225,34 @@ impl Qwen35MoeText {
                         LayerKind::FullAttention => cuda_program::LayerKind::FullAttention,
                     })
                     .collect(),
+                linear_conv_kernel_dim: self.config.text_config.linear_conv_kernel_dim,
+                linear_key_head_dim: self.config.text_config.linear_key_head_dim,
+                linear_num_key_heads: self.config.text_config.linear_num_key_heads,
+                linear_num_value_heads: self.config.text_config.linear_num_value_heads,
+                linear_value_head_dim: self.config.text_config.linear_value_head_dim,
+                mamba_ssm_dtype: self.config.text_config.mamba_ssm_dtype.clone(),
+                max_position_embeddings: self.config.text_config.max_position_embeddings,
+                moe_intermediate_size: self.config.text_config.moe_intermediate_size,
                 num_experts: self.config.text_config.num_experts,
+                num_experts_per_tok: self.config.text_config.num_experts_per_tok,
+                num_attention_heads: self.config.text_config.num_attention_heads,
+                num_key_value_heads: self.config.text_config.num_key_value_heads,
+                partial_rotary_factor: self.config.text_config.partial_rotary_factor,
+                rms_norm_eps: self.config.text_config.rms_norm_eps,
+                rope_interleaved: self.config.text_config.rope_parameters.mrope_interleaved,
+                rope_section: self
+                    .config
+                    .text_config
+                    .rope_parameters
+                    .mrope_section
+                    .clone(),
+                rope_theta: self.config.text_config.rope_parameters.rope_theta,
+                rope_type: self.config.text_config.rope_parameters.rope_type.clone(),
+                shared_expert_intermediate_size: self
+                    .config
+                    .text_config
+                    .shared_expert_intermediate_size,
+                vocab_size: self.config.text_config.vocab_size,
             },
             weights: self.weights.clone(),
         }

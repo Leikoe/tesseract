@@ -154,9 +154,7 @@ mod kernels {
 
     #[cutile::entry()]
     unsafe fn qwen_gdn_decode(
-        query: &Tensor<bf16, { [-1, 16, 128] }>,
-        key: &Tensor<bf16, { [-1, 16, 128] }>,
-        value: &Tensor<bf16, { [-1, 32, 128] }>,
+        mixed_qkv: &Tensor<bf16, { [-1, 8192] }>,
         a: &Tensor<bf16, { [-1, 32] }>,
         b: &Tensor<bf16, { [-1, 32] }>,
         a_log: &Tensor<f32, { [32] }>,
@@ -178,15 +176,16 @@ mod kernels {
         let key_head = value_head / 2i32;
         let value_offset = value_block * 32i32;
 
+        let mixed_qkv_128 = mixed_qkv.partition(const_shape![1, 128]);
         let query: Tile<f32, { [128] }> = convert_tile(
-            query
-                .partition(const_shape![1, 1, 128])
-                .load([row, key_head, 0i32])
+            mixed_qkv_128
+                .load([row, key_head])
                 .reshape(const_shape![128]),
         );
+        let key_block = key_head + 16i32;
         let key: Tile<f32, { [128] }> = convert_tile(
-            key.partition(const_shape![1, 1, 128])
-                .load([row, key_head, 0i32])
+            mixed_qkv_128
+                .load([row, key_block])
                 .reshape(const_shape![128]),
         );
         let query_norm: Tile<f32, { [1] }> = reduce_sum(query * query, 0i32);
@@ -206,10 +205,11 @@ mod kernels {
                 .reshape(const_shape![1])
                 .broadcast(const_shape![128]);
 
+        let packed_value_block = 128i32 + value_head * 4i32 + value_block;
         let value: Tile<f32, { [32] }> = convert_tile(
-            value
-                .partition(const_shape![1, 1, 32])
-                .load([row, value_head, value_block])
+            mixed_qkv
+                .partition(const_shape![1, 32])
+                .load([row, packed_value_block])
                 .reshape(const_shape![32]),
         );
         let a_value: Tile<f32, { [] }> = convert_tile(
@@ -443,9 +443,7 @@ impl RecurrentState {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode(
         &mut self,
-        query: Arc<Tensor<bf16>>,
-        key: Arc<Tensor<bf16>>,
-        value: Arc<Tensor<bf16>>,
+        mixed_qkv: Arc<Tensor<bf16>>,
         a: Arc<Tensor<bf16>>,
         b: Arc<Tensor<bf16>>,
         a_log: Arc<Tensor<f32>>,
@@ -457,9 +455,7 @@ impl RecurrentState {
         if self.slots == 0 {
             return Err(ModelError::Cuda("GDN state has no slots".into()));
         }
-        if query.shape() != [rows as i32, KEY_HEADS as i32, HEAD_DIM as i32]
-            || key.shape() != query.shape()
-            || value.shape() != [rows as i32, VALUE_HEADS as i32, HEAD_DIM as i32]
+        if mixed_qkv.shape() != [rows as i32, CONV_FEATURES as i32]
             || a.shape() != [rows as i32, VALUE_HEADS as i32]
             || b.shape() != a.shape()
             || a_log.shape() != [VALUE_HEADS as i32]
@@ -471,11 +467,9 @@ impl RecurrentState {
         let mut output = api::zeros::<bf16>(&[rows, VALUE_HEADS, HEAD_DIM])
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("allocate GDN output: {error:?}")))?;
-        let (_, _, _, _, _, _, _, _, _, output_partition) = unsafe {
+        let (_, _, _, _, _, _, _, output_partition) = unsafe {
             qwen_gdn_decode(
-                query,
-                key,
-                value,
+                mixed_qkv,
                 a,
                 b,
                 a_log,
@@ -512,20 +506,28 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
     let dt_bias = (0..VALUE_HEADS)
         .map(|index| -0.5 + index as f32 / 64.0)
         .collect::<Vec<_>>();
+    let mut mixed_qkv_host = Vec::with_capacity(rows * CONV_FEATURES);
+    for row in 0..rows {
+        mixed_qkv_host.extend_from_slice(
+            &query_host[row * KEY_HEADS * HEAD_DIM..(row + 1) * KEY_HEADS * HEAD_DIM],
+        );
+        mixed_qkv_host.extend_from_slice(
+            &key_host[row * KEY_HEADS * HEAD_DIM..(row + 1) * KEY_HEADS * HEAD_DIM],
+        );
+        mixed_qkv_host.extend_from_slice(
+            &value_host[row * VALUE_HEADS * HEAD_DIM..(row + 1) * VALUE_HEADS * HEAD_DIM],
+        );
+    }
     let state_slots = vec![1i32, 0i32];
     let mut state = RecurrentState::zeros(2, stream)?;
-    let query = upload_bf16(&query_host, &[rows, KEY_HEADS, HEAD_DIM], stream)?;
-    let key = upload_bf16(&key_host, &[rows, KEY_HEADS, HEAD_DIM], stream)?;
-    let value = upload_bf16(&value_host, &[rows, VALUE_HEADS, HEAD_DIM], stream)?;
+    let mixed_qkv = upload_bf16(&mixed_qkv_host, &[rows, CONV_FEATURES], stream)?;
     let a = upload_bf16(&a_host, &[rows, VALUE_HEADS], stream)?;
     let b = upload_bf16(&b_host, &[rows, VALUE_HEADS], stream)?;
     let a_log_device = upload_f32(&a_log, &[VALUE_HEADS], stream)?;
     let dt_bias_device = upload_f32(&dt_bias, &[VALUE_HEADS], stream)?;
     let state_slots = upload_i32(&state_slots, stream)?;
     let _first = state.decode(
-        query.clone(),
-        key.clone(),
-        value.clone(),
+        mixed_qkv.clone(),
         a.clone(),
         b.clone(),
         a_log_device.clone(),
@@ -535,9 +537,7 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
         stream,
     )?;
     let output = state.decode(
-        query,
-        key,
-        value,
+        mixed_qkv,
         a,
         b,
         a_log_device,
