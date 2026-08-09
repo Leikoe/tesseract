@@ -104,6 +104,7 @@ struct PaddedBatch {
     context_slots: Vec<u32>,
     context_bucket: usize,
     requests: usize,
+    reset_recurrent_slots: Vec<i32>,
     logical_rows: usize,
     rows: usize,
 }
@@ -157,6 +158,13 @@ impl PaddedBatch {
             ));
         }
         let logical_requests = batch.request_count();
+        let mut reset_recurrent_slots = Vec::with_capacity(logical_requests);
+        for (request, slot) in recurrent_slots.iter().copied().enumerate() {
+            let row = batch.query_start_offsets[request] as usize;
+            if batch.positions[row] == 0 {
+                reset_recurrent_slots.push(slot);
+            }
+        }
         let mut contexts = batch.contexts().to_vec();
         for index in 0..padding {
             let private_kv = kv_capacity
@@ -213,6 +221,7 @@ impl PaddedBatch {
             context_slots,
             context_bucket,
             requests,
+            reset_recurrent_slots,
             logical_rows,
             rows,
         })
@@ -509,6 +518,7 @@ impl Program {
                             "Qwen linear layer {layer_index} has no recurrent state"
                         ))
                     })?;
+                    state.reset_slots(&padded.reset_recurrent_slots, &mut execution)?;
                     layer.forward_linear(
                         previous
                             .as_ref()

@@ -3,14 +3,14 @@
 use std::sync::Arc;
 
 use cuda_async::device_operation::DeviceOp;
-use cuda_core::Stream;
+use cuda_core::{IntoResult, Stream};
 use cutile::{
     api,
     core::bf16,
     tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
 };
 
-use crate::{chunking::plan_packed_queries, model::ModelError};
+use crate::{chunking::plan_packed_queries, cuda::execution::StreamExecution, model::ModelError};
 
 const KEY_HEADS: usize = 16;
 const VALUE_HEADS: usize = 32;
@@ -1498,6 +1498,69 @@ impl GdnState {
             tensor,
             slots,
         })
+    }
+
+    /// Clears scheduler-recycled recurrent slots before their position-zero
+    /// token is processed. The reset is enqueued on the model stream so it is
+    /// ordered before both convolution and matrix-state reads.
+    pub(crate) fn reset_slots(
+        &mut self,
+        slots: &[i32],
+        execution: &mut StreamExecution<'_>,
+    ) -> Result<(), ModelError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        if slots
+            .iter()
+            .any(|slot| *slot < 0 || *slot as usize >= self.slots)
+        {
+            return Err(ModelError::Cuda(
+                "GDN reset references a recurrent slot outside state capacity".into(),
+            ));
+        }
+        const BF16_BYTES: usize = std::mem::size_of::<bf16>();
+        const F32_BYTES: usize = std::mem::size_of::<f32>();
+        const CONV_SLOT_ELEMENTS: usize = CONV_FEATURES * CONV_STATE_WIDTH;
+        const TENSOR_SLOT_ELEMENTS: usize = VALUE_HEADS * HEAD_DIM * HEAD_DIM;
+        let conv_base = self.conv.device_pointer().cu_deviceptr();
+        let tensor_base = self.tensor.device_pointer().cu_deviceptr();
+        execution.mark_pending();
+        let stream = execution.stream();
+        for slot in slots {
+            let slot = *slot as usize;
+            let conv_offset = slot
+                .checked_mul(CONV_SLOT_ELEMENTS * BF16_BYTES)
+                .ok_or_else(|| {
+                    ModelError::Cuda("GDN convolution reset offset overflowed".into())
+                })?;
+            let tensor_offset = slot
+                .checked_mul(TENSOR_SLOT_ELEMENTS * F32_BYTES)
+                .ok_or_else(|| ModelError::Cuda("GDN tensor reset offset overflowed".into()))?;
+            unsafe {
+                cuda_core::sys::cuMemsetD8Async(
+                    conv_base + conv_offset as u64,
+                    0,
+                    CONV_SLOT_ELEMENTS * BF16_BYTES,
+                    stream.cu_stream(),
+                )
+                .result()
+                .map_err(|error| {
+                    ModelError::Cuda(format!("clear GDN convolution slot {slot}: {error:?}"))
+                })?;
+                cuda_core::sys::cuMemsetD8Async(
+                    tensor_base + tensor_offset as u64,
+                    0,
+                    TENSOR_SLOT_ELEMENTS * F32_BYTES,
+                    stream.cu_stream(),
+                )
+                .result()
+                .map_err(|error| {
+                    ModelError::Cuda(format!("clear GDN matrix slot {slot}: {error:?}"))
+                })?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn decode_conv(
