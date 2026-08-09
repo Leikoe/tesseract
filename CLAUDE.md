@@ -156,6 +156,10 @@ you can use latest cutile-rs without worries I think
 
 why are we validating ? you should parse and not validate.
 
+## User
+
+you should look at how sglang handles loading a quantized model (and how they get the info that it's quantized in the first place)
+
 ```text
 you will need good grouped gemm kernels (nfp4 weights loads + bf16 activations loads + bf16 tensor cores w fp32 acc + cast back to bf16 before store)
 ```

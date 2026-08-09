@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use serde::Deserialize;
 
@@ -127,25 +127,28 @@ struct TextConfig {
     vocab_size: usize,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+enum LayerQuantization {
+    #[serde(rename = "FP8")]
+    Fp8,
+    #[serde(rename = "MXFP8")]
+    Mxfp8,
+    #[serde(rename = "NVFP4")]
+    Nvfp4,
+    #[serde(rename = "W4A16_NVFP4")]
+    W4A16Nvfp4,
+}
+
 #[derive(Debug, Deserialize)]
-struct QuantSpec {
-    dynamic: bool,
-    num_bits: usize,
-    #[serde(rename = "type")]
-    kind: String,
+struct QuantizedLayer {
+    quant_algo: LayerQuantization,
     group_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
-struct QuantGroup {
-    input_activations: QuantSpec,
-    weights: QuantSpec,
-    targets: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct QuantizationConfig {
-    config_groups: std::collections::HashMap<String, QuantGroup>,
+    quant_algo: String,
+    quantized_layers: HashMap<String, QuantizedLayer>,
     quant_method: String,
 }
 
@@ -268,59 +271,24 @@ impl Config {
 
 impl QuantizationConfig {
     fn parse_targets(&self) -> Result<(), ModelError> {
-        if self.quant_method != "modelopt" {
+        if self.quant_method != "modelopt" || self.quant_algo != "MIXED_PRECISION" {
             return Err(ModelError::InvalidConfig(
                 "Qwen3.6 requires a ModelOpt mixed-precision export".into(),
             ));
         }
-        let mut saw_fp8 = false;
-        let mut saw_nvfp4 = false;
-        let mut targets = HashSet::new();
-        for group in self.config_groups.values() {
-            let weights = &group.weights;
-            let activations = &group.input_activations;
-            let is_fp8 = weights.kind == "float"
-                && activations.kind == "float"
-                && !weights.dynamic
-                && !activations.dynamic
-                && weights.num_bits == 8
-                && activations.num_bits == 8
-                && weights.group_size.is_none()
-                && activations.group_size.is_none();
-            let is_nvfp4 = weights.kind == "float"
-                && activations.kind == "float"
-                && !weights.dynamic
-                && !activations.dynamic
-                && weights.num_bits == 4
-                && activations.num_bits == 4
-                && weights.group_size == Some(16)
-                && activations.group_size == Some(16);
-            if !is_fp8 && !is_nvfp4 {
-                return Err(ModelError::InvalidConfig(
-                    "Qwen3.6 contains an unsupported ModelOpt quantization group".into(),
-                ));
-            }
-            if group.targets.is_empty()
-                || group
-                    .targets
-                    .iter()
-                    .any(|target| target.is_empty() || !targets.insert(target.clone()))
-            {
-                return Err(ModelError::InvalidConfig(
-                    "Qwen3.6 quantization targets are empty or duplicated".into(),
-                ));
-            }
-            saw_fp8 |= is_fp8;
-            saw_nvfp4 |= is_nvfp4;
-        }
-        if !saw_fp8 || !saw_nvfp4 {
+        if self.quantized_layers.is_empty()
+            || self.quantized_layers.iter().any(|(name, layer)| {
+                name.is_empty()
+                    || matches!(
+                        layer.quant_algo,
+                        LayerQuantization::Nvfp4 | LayerQuantization::W4A16Nvfp4
+                    ) && layer.group_size != Some(16)
+            })
+        {
             return Err(ModelError::InvalidConfig(
-                "Qwen3.6 requires both FP8 and NVFP4 quantization groups".into(),
+                "Qwen3.6 contains empty or unrepresentable per-layer quantization metadata".into(),
             ));
         }
-        // Quantized layer artifacts parse their own target entry and tensor
-        // representation at construction. Do not reconstruct the producer's
-        // full manifest here merely to compare it back to the checkpoint.
         Ok(())
     }
 }

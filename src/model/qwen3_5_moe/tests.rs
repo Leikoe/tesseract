@@ -12,11 +12,6 @@ fn target_config() -> Config {
             }
         })
         .collect();
-    let fp8 = [
-        "model.language_model.layers.0.linear_attn.in_proj_qkv",
-        "model.language_model.layers.0.linear_attn.in_proj_z",
-    ];
-    let nvfp4 = ["model.language_model.layers.0.mlp.experts"];
     let value = json!({
         "architectures": ["Qwen3_5MoeForConditionalGeneration"],
         "dtype": "bfloat16",
@@ -57,9 +52,11 @@ fn target_config() -> Config {
         },
         "quantization_config": {
             "quant_method": "modelopt",
-            "config_groups": {
-                "group_0": {"input_activations":{"dynamic":false,"num_bits":8,"type":"float"},"weights":{"dynamic":false,"num_bits":8,"type":"float"},"targets":fp8},
-                "group_1": {"input_activations":{"dynamic":false,"num_bits":4,"type":"float","group_size":16},"weights":{"dynamic":false,"num_bits":4,"type":"float","group_size":16},"targets":nvfp4}
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.language_model.layers.0.linear_attn.in_proj_qkv": {"quant_algo":"FP8"},
+                "model.language_model.layers.0.linear_attn.in_proj_z": {"quant_algo":"FP8"},
+                "model.language_model.layers.0.mlp.experts": {"quant_algo":"W4A16_NVFP4","group_size":16}
             }
         }
     });
@@ -81,11 +78,8 @@ fn parses_quantization_targets_without_reconstructing_the_manifest() {
     let mut config = target_config();
     config
         .quantization_config
-        .config_groups
-        .get_mut("group_0")
-        .unwrap()
-        .targets
-        .pop();
+        .quantized_layers
+        .remove("model.language_model.layers.0.linear_attn.in_proj_z");
     config.validate().unwrap();
 }
 

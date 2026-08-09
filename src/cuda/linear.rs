@@ -450,47 +450,6 @@ impl GroupedNvfp4W4A16 {
         )
     }
 
-    fn from_host(
-        num_experts: usize,
-        input_size: usize,
-        output_size: usize,
-        packed_weight: &[u8],
-        scale_bytes: &[u8],
-        weight_global_scale: &[f32],
-        stream: &Arc<Stream>,
-    ) -> Result<Self, ModelError> {
-        let expected_weights = num_experts
-            .checked_mul(output_size)
-            .and_then(|size| size.checked_mul(input_size / 2));
-        let expected_scales = num_experts
-            .checked_mul(output_size)
-            .and_then(|size| size.checked_mul(input_size / GROUP_K));
-        if num_experts == 0
-            || input_size == 0
-            || output_size == 0
-            || !input_size.is_multiple_of(GROUP_K)
-            || !output_size.is_multiple_of(TILE_N)
-            || expected_weights != Some(packed_weight.len())
-            || expected_scales != Some(scale_bytes.len())
-            || weight_global_scale.len() != num_experts
-            || weight_global_scale
-                .iter()
-                .any(|scale| !scale.is_finite() || *scale <= 0.0)
-        {
-            return invalid_tensor("grouped_nvfp4", "invalid grouped W4A16 artifact");
-        }
-
-        Self::from_host_owned(
-            num_experts,
-            input_size,
-            output_size,
-            packed_weight.to_vec(),
-            scale_bytes.to_vec(),
-            weight_global_scale.to_vec(),
-            stream,
-        )
-    }
-
     fn from_host_owned(
         num_experts: usize,
         input_size: usize,
@@ -785,6 +744,14 @@ fn validate_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError>
     };
     let grouped =
         GroupedNvfp4W4A16::load(&source, "experts", ExpertProjection::Gate, EXPERTS, stream)?;
+    for projection in [ExpertProjection::Up, ExpertProjection::Down] {
+        let parsed = GroupedNvfp4W4A16::load(&source, "experts", projection, EXPERTS, stream)?;
+        if parsed.device_bytes() != grouped.device_bytes() {
+            return Err(ModelError::Cuda(
+                "grouped projection parser produced inconsistent storage".into(),
+            ));
+        }
+    }
     let expected_device_bytes = packed
         .len()
         .checked_add(scale_bytes.len() * std::mem::size_of::<bf16>())
@@ -912,23 +879,27 @@ impl WeightSource for GroupedNvfp4ValidationSource<'_> {
             .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
         let packed_stride = self.output_size * (self.input_size / 2);
         let scale_stride = self.output_size * (self.input_size / GROUP_K);
+        let suffix = ["gate_proj.", "up_proj.", "down_proj."]
+            .into_iter()
+            .find_map(|projection| suffix.strip_prefix(projection))
+            .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
         match suffix {
-            "gate_proj.weight" => Ok(WeightTensor::new(
+            "weight" => Ok(WeightTensor::new(
                 WeightDtype::U8,
                 vec![self.output_size, self.input_size / 2],
                 &self.packed[expert * packed_stride..(expert + 1) * packed_stride],
             )),
-            "gate_proj.weight_scale" => Ok(WeightTensor::new(
+            "weight_scale" => Ok(WeightTensor::new(
                 WeightDtype::F8E4M3,
                 vec![self.output_size, self.input_size / GROUP_K],
                 &self.scales[expert * scale_stride..(expert + 1) * scale_stride],
             )),
-            "gate_proj.weight_scale_2" => Ok(WeightTensor::new(
+            "weight_scale_2" => Ok(WeightTensor::new(
                 WeightDtype::F32,
                 vec![],
                 &self.global_scales[expert],
             )),
-            "gate_proj.input_scale" => Ok(WeightTensor::new(
+            "input_scale" => Ok(WeightTensor::new(
                 WeightDtype::F32,
                 vec![],
                 &self.input_scales[expert],
@@ -940,8 +911,13 @@ impl WeightSource for GroupedNvfp4ValidationSource<'_> {
     fn names(&self) -> Vec<String> {
         (0..self.global_scales.len())
             .flat_map(|expert| {
-                ["weight", "weight_scale", "weight_scale_2", "input_scale"]
-                    .map(move |suffix| format!("{}.{expert}.gate_proj.{suffix}", self.prefix))
+                ["gate_proj", "up_proj", "down_proj"]
+                    .into_iter()
+                    .flat_map(move |projection| {
+                        ["weight", "weight_scale", "weight_scale_2", "input_scale"].map(
+                            move |suffix| format!("{}.{expert}.{projection}.{suffix}", self.prefix),
+                        )
+                    })
             })
             .collect()
     }
