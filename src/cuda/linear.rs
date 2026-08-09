@@ -202,7 +202,8 @@ mod kernels {
         let magnitude = select(eq_tile(exponent, zero_i32), subnormal, normal);
         let zero_f: Tile<f32, { [16, 16] }> = constant(0.0f32, shape);
         let negative = zero_f - magnitude;
-        select(eq_tile(sign, constant(1i32, shape)), negative, magnitude)
+        let one_i32: Tile<i32, { [16, 16] }> = constant(1i32, shape);
+        select(eq_tile(sign, one_i32), negative, magnitude)
     }
 }
 
