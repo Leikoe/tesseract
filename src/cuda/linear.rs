@@ -11,7 +11,7 @@ use cuda_core::{IntoResult, Stream};
 use cutile::{
     api,
     core::bf16,
-    tensor::{IntoPartition, Reshape, Tensor, ToHostVec},
+    tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
 };
 
 use crate::{
@@ -303,12 +303,11 @@ impl Nvfp4W4A16Linear {
                 input.shape()
             )));
         }
-        let output = api::zeros::<bf16>(&[rows, self.output_size])
+        let mut output = api::zeros::<bf16>(&[rows, self.output_size])
             .sync_on(stream)
-            .map_err(|error| ModelError::Cuda(format!("allocate NVFP4 output: {error:?}")))?
-            .partition([TILE_M, TILE_N]);
-        let (output, ..) = nvfp4_w4a16(
-            output,
+            .map_err(|error| ModelError::Cuda(format!("allocate NVFP4 output: {error:?}")))?;
+        nvfp4_w4a16(
+            (&mut output).partition([TILE_M, TILE_N]),
             input,
             self.packed_weight.clone(),
             self.weight_scale.clone(),
@@ -318,7 +317,7 @@ impl Nvfp4W4A16Linear {
         )
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("execute NVFP4 W4A16: {error:?}")))?;
-        Ok(output.unpartition())
+        Ok(output)
     }
 }
 
@@ -448,22 +447,21 @@ impl GroupedNvfp4W4A16 {
                 .map_err(|error| {
                     ModelError::Cuda(format!("upload grouped expert map: {error:?}"))
                 })?;
-        let output = api::zeros::<bf16>(&[rows, self.output_size])
+        let mut output = api::zeros::<bf16>(&[rows, self.output_size])
             .sync_on(stream)
-            .map_err(|error| ModelError::Cuda(format!("allocate grouped output: {error:?}")))?
-            .partition([TILE_M, TILE_N]);
+            .map_err(|error| ModelError::Cuda(format!("allocate grouped output: {error:?}")))?;
         let logical_tiles = (rows / TILE_M)
             .checked_mul(self.output_size / TILE_N)
             .ok_or_else(|| ModelError::Cuda("grouped output tile count overflowed".into()))?;
         let workers = logical_tiles.min(device_sm_count(stream)?);
-        let output = output.map(
+        let output_partition = (&mut output).partition([TILE_M, TILE_N]).map(
             [8, 1],
             u32::try_from(workers).map_err(|_| {
                 ModelError::Cuda("persistent grouped worker count overflowed u32".into())
             })?,
         );
-        let (output, ..) = grouped_nvfp4_w4a16(
-            output,
+        grouped_nvfp4_w4a16(
+            output_partition,
             dispatched,
             Arc::new(expert_by_row_tile),
             self.packed_weight.clone(),
@@ -475,7 +473,7 @@ impl GroupedNvfp4W4A16 {
         )
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("execute grouped NVFP4 W4A16: {error:?}")))?;
-        Ok(output.unpartition())
+        Ok(output)
     }
 }
 
