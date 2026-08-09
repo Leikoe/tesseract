@@ -8,7 +8,6 @@ use cutile::{
     api,
     core::bf16,
     tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
-    tile_kernel::TileKernel,
 };
 
 use crate::model::ModelError;
@@ -64,7 +63,7 @@ mod kernels {
             let (_previous, _token): (Tile<i32, { [1] }>, Token) = atomic_rmw_tko(
                 selected_ptr,
                 one,
-                atomic::AddI,
+                atomic::Add,
                 ordering::Relaxed,
                 scope::Device,
                 None,
@@ -104,7 +103,10 @@ mod kernels {
         const ALIGNMENT: i32 = 16;
         const SCAN_IDENTITY: i32 = 0;
         let counts = counts.load_tile(const_shape![256], [0i32]);
-        let padded = ((counts + ALIGNMENT_MINUS_ONE) / ALIGNMENT) * ALIGNMENT;
+        let alignment_minus_one: Tile<i32, { [256] }> =
+            constant(ALIGNMENT_MINUS_ONE, const_shape![256]);
+        let alignment: Tile<i32, { [256] }> = constant(ALIGNMENT, const_shape![256]);
+        let padded = ((counts + alignment_minus_one) / alignment) * alignment;
         let inclusive = scan_sum(padded, 0i32, reverse::Forward, SCAN_IDENTITY);
         let exclusive = inclusive - padded;
         starts.store(exclusive);
@@ -126,7 +128,7 @@ mod kernels {
         let (position, _token): (Tile<i32, { [1, 1] }>, Token) = atomic_rmw_tko(
             cursors.offset_tile(expert),
             one,
-            atomic::AddI,
+            atomic::Add,
             ordering::Relaxed,
             scope::Device,
             None,
@@ -173,7 +175,7 @@ impl RoutingPlan {
         let mut weights = api::zeros::<f32>(&[rows, TOP_K])
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("allocate routing weights: {error:?}")))?;
-        let (_, expert_ids, weights, _) = unsafe {
+        let (_, expert_ids_partition, weights_partition, _) = unsafe {
             top8_router_256(
                 logits,
                 (&mut expert_ids).partition([1, TOP_K]),
@@ -183,12 +185,13 @@ impl RoutingPlan {
         }
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("execute top-8 routing: {error:?}")))?;
-        let expert_ids = Arc::new(expert_ids.unpartition());
-        let mut weights = weights.unpartition();
-        let weights = renormalize_top8((&mut weights).partition([1, TOP_K]))
+        drop(expert_ids_partition);
+        drop(weights_partition);
+        let (weights_partition,) = renormalize_top8((&mut weights).partition([1, TOP_K]))
             .sync_on(stream)
-            .map_err(|error| ModelError::Cuda(format!("renormalize top-8 routing: {error:?}")))?
-            .unpartition();
+            .map_err(|error| ModelError::Cuda(format!("renormalize top-8 routing: {error:?}")))?;
+        drop(weights_partition);
+        let expert_ids = Arc::new(expert_ids);
 
         let mut starts = api::zeros::<i32>(&[EXPERTS])
             .sync_on(stream)
@@ -196,16 +199,20 @@ impl RoutingPlan {
         let mut cursors = api::zeros::<i32>(&[EXPERTS])
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("allocate expert cursors: {error:?}")))?;
-        let (_, starts, cursors) =
-            aligned_expert_prefix(Arc::new(counts), &mut starts, &mut cursors)
-                .sync_on(stream)
-                .map_err(|error| ModelError::Cuda(format!("scan expert counts: {error:?}")))?;
+        let (_, starts_partition, cursors_partition) = aligned_expert_prefix(
+            Arc::new(counts),
+            (&mut starts).partition([EXPERTS]),
+            (&mut cursors).partition([EXPERTS]),
+        )
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("scan expert counts: {error:?}")))?;
+        drop(starts_partition);
+        drop(cursors_partition);
         let starts = Arc::new(starts);
-        let cursors = cursors;
         let mut positions = api::zeros::<i32>(&[rows, TOP_K])
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("allocate dispatch positions: {error:?}")))?;
-        let (_, positions, _) = unsafe {
+        let (_, positions_partition, _) = unsafe {
             assign_dispatch_rows(
                 expert_ids.clone(),
                 (&mut positions).partition([1, 1]),
@@ -214,13 +221,14 @@ impl RoutingPlan {
         }
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("assign expert dispatch rows: {error:?}")))?;
+        drop(positions_partition);
 
         Ok(Self {
             expert_ids,
             weights: Arc::new(weights),
             starts,
             ends: Arc::new(cursors),
-            positions: Arc::new(positions.unpartition()),
+            positions: Arc::new(positions),
             max_dispatched_rows,
         })
     }
