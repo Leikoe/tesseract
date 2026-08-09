@@ -1026,10 +1026,10 @@ mod kernels {
                 0i32,
             );
             let last_log: Tile<f32, { [] }> = last_log.reshape(const_shape![]);
+            let last_log: Tile<f32, { [1, 1] }> = last_log.reshape(const_shape![1, 1]);
+            let decay_by_row = exp(last_log.broadcast(const_shape![16, 1]) - log_decay);
             let v_decay: Tile<bf16, { [16, 32] }> = ftof(
-                v_new
-                    * exp(last_log.broadcast(const_shape![16, 1]) - log_decay)
-                        .broadcast(const_shape![16, 32]),
+                v_new * decay_by_row.broadcast(const_shape![16, 32]),
                 rounding::NearestEven,
             );
             let state_decay = exp(last_log).broadcast(const_shape![32, 128]);
