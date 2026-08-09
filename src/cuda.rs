@@ -129,7 +129,7 @@ mod nvfp4_probe_kernels {
     }
 
     fn decode_fp4(nibbles: Tile<u8, { [16, 128] }>) -> Tile<f32, { [16, 128] }> {
-        let eight = constant(8u8, const_shape![16, 128]);
+        let eight: Tile<u8, { [16, 128] }> = constant(8u8, const_shape![16, 128]);
         let magnitude = nibbles % eight;
         let sign = nibbles / eight;
         let one: Tile<u8, { [16, 128] }> = constant(1u8, const_shape![16, 128]);
@@ -139,72 +139,46 @@ mod nvfp4_probe_kernels {
         let five: Tile<u8, { [16, 128] }> = constant(5u8, const_shape![16, 128]);
         let six: Tile<u8, { [16, 128] }> = constant(6u8, const_shape![16, 128]);
         let seven: Tile<u8, { [16, 128] }> = constant(7u8, const_shape![16, 128]);
-        let mut value = constant(0.0f32, const_shape![16, 128]);
-        value = select(
-            eq_tile(magnitude, one),
-            constant(0.5f32, const_shape![16, 128]),
-            value,
-        );
-        value = select(
-            eq_tile(magnitude, two),
-            constant(1.0f32, const_shape![16, 128]),
-            value,
-        );
-        value = select(
-            eq_tile(magnitude, three),
-            constant(1.5f32, const_shape![16, 128]),
-            value,
-        );
-        value = select(
-            eq_tile(magnitude, four),
-            constant(2.0f32, const_shape![16, 128]),
-            value,
-        );
-        value = select(
-            eq_tile(magnitude, five),
-            constant(3.0f32, const_shape![16, 128]),
-            value,
-        );
-        value = select(
-            eq_tile(magnitude, six),
-            constant(4.0f32, const_shape![16, 128]),
-            value,
-        );
-        value = select(
-            eq_tile(magnitude, seven),
-            constant(6.0f32, const_shape![16, 128]),
-            value,
-        );
-        select(
-            eq_tile(sign, one),
-            constant(0.0f32, const_shape![16, 128]) - value,
-            value,
-        )
+        let zero_f: Tile<f32, { [16, 128] }> = constant(0.0f32, const_shape![16, 128]);
+        let half_f: Tile<f32, { [16, 128] }> = constant(0.5f32, const_shape![16, 128]);
+        let one_f: Tile<f32, { [16, 128] }> = constant(1.0f32, const_shape![16, 128]);
+        let one_half_f: Tile<f32, { [16, 128] }> = constant(1.5f32, const_shape![16, 128]);
+        let two_f: Tile<f32, { [16, 128] }> = constant(2.0f32, const_shape![16, 128]);
+        let three_f: Tile<f32, { [16, 128] }> = constant(3.0f32, const_shape![16, 128]);
+        let four_f: Tile<f32, { [16, 128] }> = constant(4.0f32, const_shape![16, 128]);
+        let six_f: Tile<f32, { [16, 128] }> = constant(6.0f32, const_shape![16, 128]);
+        let mut value = zero_f;
+        value = select(eq_tile(magnitude, one), half_f, value);
+        value = select(eq_tile(magnitude, two), one_f, value);
+        value = select(eq_tile(magnitude, three), one_half_f, value);
+        value = select(eq_tile(magnitude, four), two_f, value);
+        value = select(eq_tile(magnitude, five), three_f, value);
+        value = select(eq_tile(magnitude, six), four_f, value);
+        value = select(eq_tile(magnitude, seven), six_f, value);
+        select(eq_tile(sign, one), zero_f - value, value)
     }
 
     fn decode_e4m3(bytes: Tile<u8, { [16, 8] }>) -> Tile<f32, { [16, 8] }> {
-        let eight = constant(8u8, const_shape![16, 8]);
-        let sixteen = constant(16u8, const_shape![16, 8]);
+        let eight: Tile<u8, { [16, 8] }> = constant(8u8, const_shape![16, 8]);
+        let sixteen: Tile<u8, { [16, 8] }> = constant(16u8, const_shape![16, 8]);
         let exponent = (bytes / eight) % sixteen;
         let mantissa = bytes % eight;
         let zero_u8: Tile<u8, { [16, 8] }> = constant(0u8, const_shape![16, 8]);
         let one_u8: Tile<u8, { [16, 8] }> = constant(1u8, const_shape![16, 8]);
         let exponent_f: Tile<f32, { [16, 8] }> = itof(exponent, rounding::NearestEven);
         let mantissa_f: Tile<f32, { [16, 8] }> = itof(mantissa, rounding::NearestEven);
-        let normal = (constant(1.0f32, const_shape![16, 8])
-            + mantissa_f / constant(8.0f32, const_shape![16, 8]))
-            * pow(
-                constant(2.0f32, const_shape![16, 8]),
-                exponent_f - constant(7.0f32, const_shape![16, 8]),
-            );
-        let subnormal = mantissa_f / constant(512.0f32, const_shape![16, 8]);
+        let zero_f: Tile<f32, { [16, 8] }> = constant(0.0f32, const_shape![16, 8]);
+        let one_f: Tile<f32, { [16, 8] }> = constant(1.0f32, const_shape![16, 8]);
+        let two_f: Tile<f32, { [16, 8] }> = constant(2.0f32, const_shape![16, 8]);
+        let seven_f: Tile<f32, { [16, 8] }> = constant(7.0f32, const_shape![16, 8]);
+        let eight_f: Tile<f32, { [16, 8] }> = constant(8.0f32, const_shape![16, 8]);
+        let five_twelve_f: Tile<f32, { [16, 8] }> = constant(512.0f32, const_shape![16, 8]);
+        let normal = (one_f + mantissa_f / eight_f) * pow(two_f, exponent_f - seven_f);
+        let subnormal = mantissa_f / five_twelve_f;
         let unsigned = select(eq_tile(exponent, zero_u8), subnormal, normal);
-        let sign = bytes / constant(128u8, const_shape![16, 8]);
-        select(
-            eq_tile(sign, one_u8),
-            constant(0.0f32, const_shape![16, 8]) - unsigned,
-            unsigned,
-        )
+        let one_twenty_eight: Tile<u8, { [16, 8] }> = constant(128u8, const_shape![16, 8]);
+        let sign = bytes / one_twenty_eight;
+        select(eq_tile(sign, one_u8), zero_f - unsigned, unsigned)
     }
 }
 
