@@ -627,7 +627,7 @@ mod tile {
                 ordering::Weak,
                 None::<scope::TileBlock>,
                 Some(query_mask),
-                Some(bf16::ZERO),
+                Some(0.0),
                 None,
                 Latency::<0>,
             );
@@ -694,7 +694,7 @@ mod tile {
                     ordering::Weak,
                     None::<scope::TileBlock>,
                     Some(cache_mask),
-                    Some(bf16::ZERO),
+                    Some(0.0),
                     None,
                     Latency::<0>,
                 );
@@ -731,7 +731,7 @@ mod tile {
                     ordering::Weak,
                     None::<scope::TileBlock>,
                     Some(cache_mask),
-                    Some(bf16::ZERO),
+                    Some(0.0),
                     None,
                     Latency::<0>,
                 );
