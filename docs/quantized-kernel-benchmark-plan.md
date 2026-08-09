@@ -33,13 +33,21 @@ with different BF16 output is rejected rather than hidden behind throughput.
 
 The stable implementation identifiers are:
 
-- `cutile_packed`: the current persistent cuTile byte-decode kernel;
+- `cutile_legacy_expanded_scales`: the current persistent cuTile byte-weight
+  kernel, which expands E4M3 block scales to BF16 and is baseline-only;
+- `cutile_storage_faithful`: a cuTile kernel retaining both weight and scale
+  tensors in their manifest-declared byte representations;
 - `cutile_repacked`: any load-time-repacked and staged cuTile successor;
 - `marlin`: the SM80 Marlin implementation using its required load-time layout;
 - `bf16_expanded_ceiling`: cuBLAS with expanded BF16 weights, diagnostic only.
 
 Backend selection uses measured workload classes at construction or warmup. It
 does not inspect formats or choose a kernel inside the token hot path.
+
+`cutile_legacy_expanded_scales` is not eligible for production selection. It is
+retained so changing scale representation cannot be mistaken for a kernel
+speedup. A repacked scale layout is eligible only if its elements remain E4M3;
+reordering storage is different from widening it to BF16.
 
 ## Shape matrix
 

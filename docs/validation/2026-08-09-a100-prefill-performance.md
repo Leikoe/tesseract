@@ -130,10 +130,10 @@ The raw ceiling reports are
 and
 [`group64-half-window.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/group64-half-window.json).
 
-## Manifest-compliant packed FP8 follow-up
+## Packed FP8-weight follow-up and NVFP4 scale caveat
 
-Revision `301644e` restored FP8 device storage while retaining the large-prefill
-grouped tile. Revisions `ac5746a` and `1038456` then replaced a per-weight
+Revision `301644e` restored FP8 projection-weight device storage while retaining
+the large-prefill grouped tile. Revisions `ac5746a` and `1038456` then replaced a per-weight
 `exp2` FP8 decoder with exact BF16 bit construction. The permanent A100
 differential probe passes normals, subnormals, both signs, and the production
 MMA path. Warm 8K TTFT is 7.02123 seconds, or 1,167.96 input tokens/second.
@@ -148,7 +148,15 @@ path, but remains 8.63x slower than SGLang's 15.98190-second TTFT and 8.42x
 lower in input throughput. The remaining gap is therefore not explained by
 the removed scalar `exp2` operation.
 
-The raw compliant report is
+This revision is weight-storage-faithful but not yet fully
+manifest-storage-faithful: `Nvfp4W4A16Linear` and `GroupedNvfp4W4A16` retain
+packed FP4 weights but widen their manifest-declared E4M3 block-scale tensors
+to BF16 during loading. The results remain useful baselines for the current
+kernel, but that implementation is not eligible as the final production
+backend. A storage-faithful or Marlin-repacked successor must keep those scale
+elements E4M3 on device.
+
+The raw packed-FP8-weight report is
 [`packed-bitdecode-group64-warm-8192.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/packed-bitdecode-group64-warm-8192.json).
 The exact-context report is
 [`packed-bitdecode-group64-half-window.json`](../benchmarks/2026-08-09-qwen-serving/post-tiled/packed-bitdecode-group64-half-window.json).
