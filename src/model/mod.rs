@@ -23,7 +23,6 @@ pub struct ChatMessage<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSummary {
-    pub id: String,
     pub architecture: String,
     pub dtype: String,
     pub layers: usize,
@@ -68,7 +67,6 @@ pub trait IncrementalDecoder: Send {
 /// details, prompt syntax, tensor names, and model-specific validation stay in
 /// the implementing model's source file.
 pub trait Model: Send + Sync {
-    fn id(&self) -> &str;
     fn render_chat(&self, messages: &[ChatMessage<'_>]) -> Result<String, ModelError>;
     fn encode(&self, text: &str) -> Result<Vec<u32>, ModelError>;
     fn decoder(&self) -> Box<dyn IncrementalDecoder>;
@@ -90,26 +88,21 @@ fn model_manifest(model_dir: &Path) -> Result<ModelManifest, ModelError> {
     serde_json::from_str(&text).map_err(|source| ModelError::Json { path, source })
 }
 
-fn declared_architecture<'a>(
-    manifest: &'a ModelManifest,
-    model_id: &str,
-) -> Result<&'a str, ModelError> {
+fn declared_architecture(manifest: &ModelManifest) -> Result<&str, ModelError> {
     manifest
         .architectures
         .first()
         .map(String::as_str)
-        .ok_or_else(|| ModelError::NoArchitecture(model_id.into()))
+        .ok_or(ModelError::NoArchitecture)
 }
 
-pub fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
+pub fn load(model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
     let manifest = model_manifest(model_dir)?;
-    match declared_architecture(&manifest, model_id)? {
-        llama_3_2::Llama32::ARCH_NAME => {
-            Ok(Arc::new(llama_3_2::Llama32::load(model_id, model_dir)?))
+    match declared_architecture(&manifest)? {
+        llama_3_2::Llama32::ARCH_NAME => Ok(Arc::new(llama_3_2::Llama32::load(model_dir)?)),
+        qwen3_5_moe::Qwen35MoeText::ARCH_NAME => {
+            Ok(Arc::new(qwen3_5_moe::Qwen35MoeText::load(model_dir)?))
         }
-        qwen3_5_moe::Qwen35MoeText::ARCH_NAME => Ok(Arc::new(qwen3_5_moe::Qwen35MoeText::load(
-            model_id, model_dir,
-        )?)),
         _ => Err(ModelError::UnsupportedArchitecture {
             architectures: manifest.architectures,
             model_type: manifest.model_type,
@@ -119,7 +112,6 @@ pub fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelErr
 
 #[cfg(feature = "cuda")]
 pub fn load_cuda_executor(
-    model_id: &str,
     model_dir: &Path,
     device_id: usize,
     kv_capacity_tokens: usize,
@@ -128,9 +120,8 @@ pub fn load_cuda_executor(
 ) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError> {
     crate::cuda::enable_persistent_cubin_cache()?;
     let manifest = model_manifest(model_dir)?;
-    match declared_architecture(&manifest, model_id)? {
+    match declared_architecture(&manifest)? {
         llama_3_2::Llama32::ARCH_NAME => llama_3_2::load_cuda_executor(
-            model_id,
             model_dir,
             device_id,
             kv_capacity_tokens,
@@ -138,7 +129,6 @@ pub fn load_cuda_executor(
             max_running,
         ),
         qwen3_5_moe::Qwen35MoeText::ARCH_NAME => qwen3_5_moe::load_cuda_executor(
-            model_id,
             model_dir,
             device_id,
             kv_capacity_tokens,
@@ -160,7 +150,7 @@ pub fn validate_cuda_model(
 ) -> Result<CudaModelReport, ModelError> {
     crate::cuda::enable_persistent_cubin_cache()?;
     let manifest = model_manifest(model_dir)?;
-    match declared_architecture(&manifest, model_id)? {
+    match declared_architecture(&manifest)? {
         llama_3_2::Llama32::ARCH_NAME => {
             llama_3_2::validate_cuda_model(model_id, model_dir, device_id)
         }
@@ -183,7 +173,7 @@ pub fn validate_cuda_next_token(
 ) -> Result<CudaForwardReport, ModelError> {
     crate::cuda::enable_persistent_cubin_cache()?;
     let manifest = model_manifest(model_dir)?;
-    match declared_architecture(&manifest, model_id)? {
+    match declared_architecture(&manifest)? {
         llama_3_2::Llama32::ARCH_NAME => {
             llama_3_2::validate_cuda_next_token(model_id, model_dir, device_id, prompt)
         }
@@ -201,8 +191,8 @@ pub fn validate_cuda_next_token(
 pub enum ModelError {
     #[error("unsupported model `{0}`")]
     UnsupportedModel(String),
-    #[error("model `{0}` does not declare an architecture")]
-    NoArchitecture(String),
+    #[error("model config does not declare an architecture")]
+    NoArchitecture,
     #[error("unsupported execution path: {0}")]
     UnsupportedExecution(String),
     #[error("unsupported architecture(s) {architectures:?} for model type `{model_type}`")]
@@ -271,7 +261,7 @@ mod tests {
             model_type: "llama".into(),
         };
         assert_eq!(
-            declared_architecture(&manifest, "test-model").unwrap(),
+            declared_architecture(&manifest).unwrap(),
             llama_3_2::Llama32::ARCH_NAME
         );
     }
@@ -283,7 +273,7 @@ mod tests {
             model_type: "qwen3_5_moe".into(),
         };
         assert_eq!(
-            declared_architecture(&manifest, "test-model").unwrap(),
+            declared_architecture(&manifest).unwrap(),
             qwen3_5_moe::Qwen35MoeText::ARCH_NAME
         );
     }
@@ -295,7 +285,7 @@ mod tests {
             model_type: "unknown".into(),
         };
         assert_eq!(
-            declared_architecture(&manifest, "test-model").unwrap(),
+            declared_architecture(&manifest).unwrap(),
             "UnknownForCausalLM"
         );
     }
@@ -306,7 +296,7 @@ mod tests {
             architectures: Vec::new(),
             model_type: "unknown".into(),
         };
-        let error = declared_architecture(&manifest, "test-model").unwrap_err();
-        assert!(matches!(error, ModelError::NoArchitecture(model) if model == "test-model"));
+        let error = declared_architecture(&manifest).unwrap_err();
+        assert!(matches!(error, ModelError::NoArchitecture));
     }
 }

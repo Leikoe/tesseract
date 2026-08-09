@@ -21,7 +21,7 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let model = model::load(&args.model, &args.model_path).context("model loading failed")?;
+    let model = model::load(&args.model_path).context("model loading failed")?;
     let prompt = model
         .render_chat(&[ChatMessage {
             role: ChatRole::User,
@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
     let probe = model.encode(&prompt).context("tokenizer probe failed")?;
 
     let summary = model.summary();
-    println!("model_id={}", summary.id);
+    println!("model_id={}", args.model);
     println!("architecture={}", summary.architecture);
     println!("dtype={}", summary.dtype);
     println!("layers={}", summary.layers);

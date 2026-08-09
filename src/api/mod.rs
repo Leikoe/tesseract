@@ -136,7 +136,8 @@ mod tests {
         config: EngineConfig,
     ) -> (Router, Arc<Metrics>) {
         let metrics = Arc::new(Metrics::default());
-        let engine = EngineHandle::spawn(executor, config, 8, Arc::clone(&metrics)).unwrap();
+        let engine =
+            EngineHandle::spawn("test-model", executor, config, 8, Arc::clone(&metrics)).unwrap();
         (
             router(AppState {
                 engine,
@@ -148,7 +149,7 @@ mod tests {
 
     fn test_app() -> Router {
         test_app_with(
-            DeterministicExecutor::new("test-model"),
+            DeterministicExecutor::new(),
             EngineConfig {
                 max_pending: 8,
                 max_running: 2,
@@ -283,7 +284,7 @@ mod tests {
     #[tokio::test]
     async fn overload_returns_openai_rate_limit_error() {
         let (app, metrics) = test_app_with(
-            DeterministicExecutor::new("test-model")
+            DeterministicExecutor::new()
                 .with_submission_delay(std::time::Duration::from_millis(50)),
             EngineConfig {
                 max_pending: 0,

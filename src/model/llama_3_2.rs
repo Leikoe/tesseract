@@ -18,14 +18,13 @@ use crate::cuda::dense_decoder::{
 
 #[cfg(feature = "cuda")]
 pub(super) fn load_cuda_executor(
-    model_id: &str,
     model_dir: &Path,
     device_id: usize,
     kv_capacity_tokens: usize,
     max_batch_tokens: usize,
     max_running: usize,
 ) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError> {
-    let model = Arc::new(Llama32::load(model_id, model_dir)?);
+    let model = Arc::new(Llama32::load(model_dir)?);
     dense_decoder::load_executor(
         model.dense_decoder_artifact()?,
         device_id,
@@ -41,9 +40,9 @@ pub(super) fn validate_cuda_model(
     model_dir: &Path,
     device_id: usize,
 ) -> Result<CudaModelReport, ModelError> {
-    let model = Llama32::load(model_id, model_dir)?;
+    let model = Llama32::load(model_dir)?;
     dense_decoder::validate(
-        model.id(),
+        model_id,
         model.weights.as_ref(),
         "model.norm.weight",
         device_id,
@@ -57,8 +56,8 @@ pub(super) fn validate_cuda_next_token(
     device_id: usize,
     prompt: &str,
 ) -> Result<CudaForwardReport, ModelError> {
-    let model = Arc::new(Llama32::load(model_id, model_dir)?);
-    dense_decoder::validate_next_token(model.dense_decoder_artifact()?, device_id, prompt)
+    let model = Arc::new(Llama32::load(model_dir)?);
+    dense_decoder::validate_next_token(model_id, model.dense_decoder_artifact()?, device_id, prompt)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,7 +190,6 @@ const TOKENIZER_WARMUP_TEXT: &str = concat!(
 );
 
 pub(super) struct Llama32 {
-    id: String,
     config: Config,
     tokenizer: Tokenizer,
     weights: Arc<dyn WeightSource>,
@@ -200,7 +198,7 @@ pub(super) struct Llama32 {
 impl Llama32 {
     pub(super) const ARCH_NAME: &'static str = "LlamaForCausalLM";
 
-    pub(super) fn load(model_id: &str, model_dir: &Path) -> Result<Self, ModelError> {
+    pub(super) fn load(model_dir: &Path) -> Result<Self, ModelError> {
         let config = Config::load(model_dir)?;
         let weights: Arc<dyn WeightSource> = Arc::new(SafeTensorSource::open(model_dir)?);
         validate_weights(weights.as_ref(), &config)?;
@@ -212,7 +210,6 @@ impl Llama32 {
         // the first user request sees steady-state preprocessing latency.
         tokenizer.warm(TOKENIZER_WARMUP_TEXT)?;
         Ok(Self {
-            id: model_id.into(),
             config,
             tokenizer,
             weights,
@@ -273,10 +270,6 @@ impl Llama32 {
 }
 
 impl Model for Llama32 {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
     fn render_chat(&self, messages: &[ChatMessage<'_>]) -> Result<String, ModelError> {
         render_chat(messages)
     }
@@ -295,7 +288,6 @@ impl Model for Llama32 {
 
     fn summary(&self) -> ModelSummary {
         ModelSummary {
-            id: self.id.clone(),
             architecture: self.config.architectures[0].clone(),
             dtype: self.config.torch_dtype.clone(),
             layers: self.config.num_hidden_layers,

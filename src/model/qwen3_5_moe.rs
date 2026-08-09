@@ -13,7 +13,6 @@ use super::{CudaForwardReport, CudaModelReport};
 
 #[cfg(feature = "cuda")]
 pub(super) fn load_cuda_executor(
-    _model_id: &str,
     _model_dir: &Path,
     _device_id: usize,
     _kv_capacity_tokens: usize,
@@ -274,7 +273,6 @@ const TOKENIZER_WARMUP_TEXT: &str = concat!(
 );
 
 pub(super) struct Qwen35MoeText {
-    id: String,
     config: Config,
     tokenizer: Tokenizer,
     weights: Arc<dyn WeightSource>,
@@ -284,14 +282,13 @@ pub(super) struct Qwen35MoeText {
 impl Qwen35MoeText {
     pub(super) const ARCH_NAME: &'static str = "Qwen3_5MoeForConditionalGeneration";
 
-    pub(super) fn load(model_id: &str, model_dir: &Path) -> Result<Self, ModelError> {
+    pub(super) fn load(model_dir: &Path) -> Result<Self, ModelError> {
         let config = Config::load(model_dir)?;
         let weights: Arc<dyn WeightSource> = Arc::new(SafeTensorSource::open(model_dir)?);
         let tokenizer = Tokenizer::load(model_dir)?;
         tokenizer.warm(TOKENIZER_WARMUP_TEXT)?;
         let eos_token_ids = [config.text_config.eos_token_id];
         Ok(Self {
-            id: model_id.into(),
             config,
             tokenizer,
             weights,
@@ -301,10 +298,6 @@ impl Qwen35MoeText {
 }
 
 impl Model for Qwen35MoeText {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
     fn render_chat(&self, messages: &[ChatMessage<'_>]) -> Result<String, ModelError> {
         render_chat(messages)
     }
@@ -324,7 +317,6 @@ impl Model for Qwen35MoeText {
     fn summary(&self) -> ModelSummary {
         let text = &self.config.text_config;
         ModelSummary {
-            id: self.id.clone(),
             architecture: self.config.architectures[0].clone(),
             dtype: text.dtype.clone(),
             layers: text.num_hidden_layers,

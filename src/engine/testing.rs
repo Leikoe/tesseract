@@ -16,12 +16,16 @@ pub struct DeterministicExecutor {
     state_schema: StateSchema,
 }
 
+impl Default for DeterministicExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeterministicExecutor {
-    pub fn new(model_id: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         Self {
-            model: Arc::new(TestModel {
-                id: model_id.into(),
-            }),
+            model: Arc::new(TestModel),
             submission_delay: Duration::ZERO,
             fail_next_submission: false,
             completions: ImmediateCompletion::default(),
@@ -102,15 +106,9 @@ impl ModelExecutor for DeterministicExecutor {
     }
 }
 
-struct TestModel {
-    id: String,
-}
+struct TestModel;
 
 impl Model for TestModel {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
     fn render_chat(&self, messages: &[ChatMessage<'_>]) -> Result<String, ModelError> {
         if messages.is_empty() {
             return Err(ModelError::InvalidInput(
@@ -138,7 +136,6 @@ impl Model for TestModel {
 
     fn summary(&self) -> ModelSummary {
         ModelSummary {
-            id: self.id.clone(),
             architecture: "deterministic-test-model".into(),
             dtype: "none".into(),
             layers: 0,
@@ -166,7 +163,7 @@ mod tests {
 
     #[test]
     fn executor_rejects_slots_from_another_arena() {
-        let mut executor = DeterministicExecutor::new("test-model").with_state_capacity(8);
+        let mut executor = DeterministicExecutor::new().with_state_capacity(8);
         let foreign = StateSchema::try_flat_kv(8).unwrap();
         let request_id = crate::engine::RequestId::now_v7();
         let sequence = ForwardSequence::try_new(

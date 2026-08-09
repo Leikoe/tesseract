@@ -188,6 +188,10 @@ don't .map the model but rather Arc::new(<ModelType>::load(..)?)
 
 UnsupportedArchitecture.model_id is useless. just inline the error variant creation, it'll be simpler
 
+## User
+
+why would a model's load function need the model id ?
+
 ```text
 you will need good grouped gemm kernels (nfp4 weights loads + bf16 activations loads + bf16 tensor cores w fp32 acc + cast back to bf16 before store)
 ```

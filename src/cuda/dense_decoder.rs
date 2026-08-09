@@ -1463,6 +1463,7 @@ pub(crate) fn validate(
 }
 
 pub(crate) fn validate_next_token(
+    model_id: &str,
     artifact: DenseDecoderArtifact,
     device_id: usize,
     prompt: &str,
@@ -1504,7 +1505,7 @@ pub(crate) fn validate_next_token(
         .ok_or_else(|| ModelError::Cuda("language-model head returned no logits".into()))?;
     let next_token_text = runtime.model.decoder().push(next_token_id)?;
     Ok(CudaForwardReport {
-        model_id: runtime.model.id().into(),
+        model_id: model_id.into(),
         prompt_tokens: token_ids.len(),
         next_token_id,
         next_token_text,

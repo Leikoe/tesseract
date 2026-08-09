@@ -81,12 +81,14 @@ impl Admission {
 
 impl EngineHandle {
     pub fn spawn<B: ModelExecutor + Send>(
+        model_id: impl Into<Arc<str>>,
         executor: B,
         config: EngineConfig,
         command_capacity: usize,
         metrics: Arc<Metrics>,
     ) -> Result<Self, EngineSpawnError> {
         Self::spawn_with_factory(
+            model_id,
             move || Ok::<B, Infallible>(executor),
             config,
             command_capacity,
@@ -97,6 +99,7 @@ impl EngineHandle {
     /// Builds the executor on the dedicated engine thread, then returns only
     /// after model loading and executor initialization have succeeded.
     pub fn spawn_with_factory<B, F, E>(
+        model_id: impl Into<Arc<str>>,
         factory: F,
         config: EngineConfig,
         command_capacity: usize,
@@ -107,6 +110,7 @@ impl EngineHandle {
         F: FnOnce() -> Result<B, E> + Send + 'static,
         E: Display,
     {
+        let model_id = model_id.into();
         let output_buffer = config.output_buffer;
         let admission_limit = config.max_pending + config.max_running;
         let (commands_tx, commands_rx) = mpsc::channel(command_capacity);
@@ -134,8 +138,6 @@ impl EngineHandle {
             .recv()
             .map_err(|_| EngineSpawnError::InitializationChannelClosed)?
             .map_err(EngineSpawnError::ExecutorInitialization)?;
-        let model_id: Arc<str> = Arc::from(model.id());
-
         Ok(Self {
             commands: commands_tx,
             metrics,
@@ -932,7 +934,7 @@ mod tests {
         RequestId,
     ) {
         let metrics = Arc::new(Metrics::default());
-        let executor = DeterministicExecutor::new("test-model");
+        let executor = DeterministicExecutor::new();
         let mut worker = EngineWorker::new(executor, config(), metrics);
         let (output, receiver) = mpsc::channel(32);
         let request = request(max_tokens);
@@ -952,7 +954,8 @@ mod tests {
     fn startup_rejects_an_executor_with_insufficient_physical_state() {
         let metrics = Arc::new(Metrics::default());
         let result = EngineHandle::spawn(
-            DeterministicExecutor::new("test-model").with_state_capacity(8),
+            "test-model",
+            DeterministicExecutor::new().with_state_capacity(8),
             config(),
             8,
             metrics,
@@ -968,7 +971,8 @@ mod tests {
     async fn produces_deltas_and_length_finish() {
         let metrics = Arc::new(Metrics::default());
         let engine = EngineHandle::spawn(
-            DeterministicExecutor::new("test-model"),
+            "test-model",
+            DeterministicExecutor::new(),
             config(),
             8,
             metrics,
@@ -999,7 +1003,8 @@ mod tests {
     async fn dropping_stream_cancels_and_releases_kv() {
         let metrics = Arc::new(Metrics::default());
         let engine = EngineHandle::spawn(
-            DeterministicExecutor::new("test-model"),
+            "test-model",
+            DeterministicExecutor::new(),
             config(),
             8,
             Arc::clone(&metrics),
@@ -1027,7 +1032,8 @@ mod tests {
     async fn stop_string_is_not_emitted() {
         let metrics = Arc::new(Metrics::default());
         let engine = EngineHandle::spawn(
-            DeterministicExecutor::new("test-model"),
+            "test-model",
+            DeterministicExecutor::new(),
             config(),
             8,
             metrics,
@@ -1062,7 +1068,8 @@ mod tests {
         bounded.max_pending = 0;
         bounded.max_running = 1;
         let engine = EngineHandle::spawn(
-            DeterministicExecutor::new("test-model"),
+            "test-model",
+            DeterministicExecutor::new(),
             bounded,
             8,
             metrics,
@@ -1081,7 +1088,8 @@ mod tests {
     async fn explicit_cancellation_finishes_the_request() {
         let metrics = Arc::new(Metrics::default());
         let engine = EngineHandle::spawn(
-            DeterministicExecutor::new("test-model"),
+            "test-model",
+            DeterministicExecutor::new(),
             config(),
             8,
             metrics,
@@ -1102,8 +1110,8 @@ mod tests {
     async fn shutdown_cancels_active_requests_and_clears_readiness() {
         let metrics = Arc::new(Metrics::default());
         let engine = EngineHandle::spawn(
-            DeterministicExecutor::new("test-model")
-                .with_submission_delay(Duration::from_millis(25)),
+            "test-model",
+            DeterministicExecutor::new().with_submission_delay(Duration::from_millis(25)),
             config(),
             8,
             Arc::clone(&metrics),
@@ -1127,7 +1135,8 @@ mod tests {
         let mut single = config();
         single.max_running = 1;
         let engine = EngineHandle::spawn(
-            DeterministicExecutor::new("test-model").failing_next_submission(),
+            "test-model",
+            DeterministicExecutor::new().failing_next_submission(),
             single,
             8,
             Arc::clone(&metrics),
@@ -1173,7 +1182,7 @@ mod tests {
     #[test]
     fn duplicate_executor_outputs_fail_without_leaking_request_state() {
         let metrics = Arc::new(Metrics::default());
-        let executor = DeterministicExecutor::new("test-model");
+        let executor = DeterministicExecutor::new();
         let mut worker = EngineWorker::new(executor, config(), metrics);
         let (output, _receiver) = mpsc::channel(8);
         let request = request(1);
@@ -1257,7 +1266,7 @@ mod tests {
     #[test]
     fn cancellation_defers_kv_reclamation_until_ticket_completion() {
         let metrics = Arc::new(Metrics::default());
-        let executor = DeterministicExecutor::new("test-model");
+        let executor = DeterministicExecutor::new();
         let mut worker = EngineWorker::new(executor, config(), metrics);
         let (output, _receiver) = mpsc::channel(8);
         let request = request(1);
@@ -1294,7 +1303,7 @@ mod tests {
                 test_config.prefill_chunk_tokens = chunk;
                 test_config.kv_capacity_tokens = 256;
                 let metrics = Arc::new(Metrics::default());
-                let executor = DeterministicExecutor::new("test-model");
+                let executor = DeterministicExecutor::new();
                 let mut worker = EngineWorker::new(executor, test_config, metrics);
                 let mut receivers = Vec::new();
                 for prompt_tokens in [2usize, 5, 11] {
@@ -1332,7 +1341,7 @@ mod tests {
         let mut test_config = config();
         test_config.max_batch_tokens = 1;
         let metrics = Arc::new(Metrics::default());
-        let executor = DeterministicExecutor::new("test-model");
+        let executor = DeterministicExecutor::new();
         let mut worker = EngineWorker::new(executor, test_config, metrics);
         let (decode_output, _decode_receiver) = mpsc::channel(8);
         let decode = request(3);
@@ -1368,7 +1377,7 @@ mod tests {
         test_config.max_batch_tokens = 1;
         test_config.prefill_chunk_tokens = 1;
         let metrics = Arc::new(Metrics::default());
-        let executor = DeterministicExecutor::new("test-model");
+        let executor = DeterministicExecutor::new();
         let mut worker = EngineWorker::new(executor, test_config, metrics);
         let (first_output, _first_receiver) = mpsc::channel(8);
         let first = request(3);
@@ -1439,7 +1448,7 @@ mod tests {
             test_config.output_buffer = 128;
 
             let metrics = Arc::new(Metrics::default());
-            let executor = DeterministicExecutor::new("test-model");
+            let executor = DeterministicExecutor::new();
             let mut worker = EngineWorker::new(executor, test_config, metrics);
             let mut receivers = Vec::with_capacity(requests.len());
             let mut maximum_steps = 0usize;
