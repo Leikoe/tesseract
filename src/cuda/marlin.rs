@@ -7,7 +7,7 @@ use cuda_core::{IntoResult, Stream, sys};
 use cutile::{
     DType, api,
     core::{bf16, f16},
-    tensor::{Tensor, ToHostVec},
+    tensor::{Reshape, Tensor, ToHostVec},
 };
 use serde::Serialize;
 
@@ -399,7 +399,7 @@ fn probe_fp8(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("allocate Marlin temporary: {error:?}")))?;
     linear.execute(&input, &output, &temporary, M, stream)?;
-    verify(&output, stream, M, N, K, &input_host, |column, k| {
+    verify(output, stream, M, N, K, &input_host, |column, k| {
         decode_e4m3fn(encoded[column * K + k]) * SCALE
     })
 }
@@ -430,7 +430,7 @@ fn probe_nvfp4(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("allocate Marlin temporary: {error:?}")))?;
     linear.execute(&input, &output, &temporary, M, stream)?;
-    verify(&output, stream, M, N, K, &input_host, |column, k| {
+    verify(output, stream, M, N, K, &input_host, |column, k| {
         let byte = packed[column * (K / 2) + k / 2];
         let nibble = if k % 2 == 0 { byte & 0x0f } else { byte >> 4 };
         crate::quantization::decode_e2m1(nibble)
@@ -441,7 +441,7 @@ fn probe_nvfp4(stream: &Arc<Stream>) -> Result<f32, ModelError> {
 
 #[allow(clippy::too_many_arguments)]
 fn verify(
-    output: &Tensor<bf16>,
+    output: Tensor<bf16>,
     stream: &Arc<Stream>,
     rows: usize,
     columns: usize,
