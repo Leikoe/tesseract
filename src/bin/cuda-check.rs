@@ -1,7 +1,7 @@
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(about = "Compile and execute Tesseract's BF16 cuTile validation kernel")]
+#[command(about = "Probe Tesseract's CUDA kernel capabilities")]
 struct Args {
     #[arg(long, default_value_t = 0)]
     device: usize,
@@ -9,7 +9,7 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let report = tesseract::cuda::validate_bf16_cutile(args.device)?;
+    let report = tesseract::cuda::probe_bf16_cutile(args.device)?;
     let nvfp4 = tesseract::cuda::probe_nvfp4(args.device)?;
     println!("device_id={}", report.device_id);
     println!("dtype=bfloat16");
@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
     print_capability("nvfp4_byte_decode_mma", nvfp4.byte_decode_mma);
     print_capability("nvfp4_w4a16_linear", nvfp4.w4a16_linear);
     print_capability("nvfp4_grouped_w4a16", nvfp4.grouped_w4a16);
-    println!("cutile_validation=ok");
+    println!("cutile_probe=ok");
     Ok(())
 }
 

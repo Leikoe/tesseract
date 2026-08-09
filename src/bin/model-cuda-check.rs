@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(about = "Load and validate a complete model checkpoint on CUDA")]
+#[command(about = "Load a complete model checkpoint onto CUDA")]
 struct Args {
     #[arg(long, default_value = tesseract::config::DEFAULT_MODEL_ID)]
     model: String,
@@ -15,12 +15,12 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let report = tesseract::model::validate_cuda_model(&args.model, &args.model_path, args.device)?;
+    let report = tesseract::model::cuda_model_report(&args.model, &args.model_path, args.device)?;
     println!("model_id={}", report.model_id);
     println!("device_id={}", report.device_id);
     println!("dtype=bfloat16");
     println!("tensors={}", report.tensors);
     println!("bytes={}", report.bytes);
-    println!("cuda_model_validation=ok");
+    println!("cuda_model_load=ok");
     Ok(())
 }

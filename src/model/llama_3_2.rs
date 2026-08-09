@@ -35,13 +35,13 @@ pub(super) fn load_cuda_executor(
 }
 
 #[cfg(feature = "cuda")]
-pub(super) fn validate_cuda_model(
+pub(super) fn cuda_model_report(
     model_id: &str,
     model_dir: &Path,
     device_id: usize,
 ) -> Result<CudaModelReport, ModelError> {
     let model = Llama32::load(model_dir)?;
-    dense_decoder::validate(
+    dense_decoder::checkpoint_report(
         model_id,
         model.weights.as_ref(),
         "model.norm.weight",
@@ -50,14 +50,14 @@ pub(super) fn validate_cuda_model(
 }
 
 #[cfg(feature = "cuda")]
-pub(super) fn validate_cuda_next_token(
+pub(super) fn cuda_forward_report(
     model_id: &str,
     model_dir: &Path,
     device_id: usize,
     prompt: &str,
 ) -> Result<CudaForwardReport, ModelError> {
     let model = Arc::new(Llama32::load(model_dir)?);
-    dense_decoder::validate_next_token(model_id, model.dense_decoder_artifact()?, device_id, prompt)
+    dense_decoder::forward_report(model_id, model.dense_decoder_artifact()?, device_id, prompt)
 }
 
 #[derive(Debug, Clone, Deserialize)]

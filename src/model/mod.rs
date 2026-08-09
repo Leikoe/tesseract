@@ -143,7 +143,7 @@ pub fn load_cuda_executor(
 }
 
 #[cfg(feature = "cuda")]
-pub fn validate_cuda_model(
+pub fn cuda_model_report(
     model_id: &str,
     model_dir: &Path,
     device_id: usize,
@@ -152,10 +152,10 @@ pub fn validate_cuda_model(
     let manifest = model_manifest(model_dir)?;
     match declared_architecture(&manifest)? {
         llama_3_2::Llama32::ARCH_NAME => {
-            llama_3_2::validate_cuda_model(model_id, model_dir, device_id)
+            llama_3_2::cuda_model_report(model_id, model_dir, device_id)
         }
         qwen3_5_moe::Qwen35MoeText::ARCH_NAME => {
-            qwen3_5_moe::validate_cuda_model(model_id, model_dir, device_id)
+            qwen3_5_moe::cuda_model_report(model_id, model_dir, device_id)
         }
         _ => Err(ModelError::UnsupportedArchitecture {
             architectures: manifest.architectures,
@@ -165,7 +165,7 @@ pub fn validate_cuda_model(
 }
 
 #[cfg(feature = "cuda")]
-pub fn validate_cuda_next_token(
+pub fn cuda_forward_report(
     model_id: &str,
     model_dir: &Path,
     device_id: usize,
@@ -175,10 +175,10 @@ pub fn validate_cuda_next_token(
     let manifest = model_manifest(model_dir)?;
     match declared_architecture(&manifest)? {
         llama_3_2::Llama32::ARCH_NAME => {
-            llama_3_2::validate_cuda_next_token(model_id, model_dir, device_id, prompt)
+            llama_3_2::cuda_forward_report(model_id, model_dir, device_id, prompt)
         }
         qwen3_5_moe::Qwen35MoeText::ARCH_NAME => {
-            qwen3_5_moe::validate_cuda_next_token(model_id, model_dir, device_id, prompt)
+            qwen3_5_moe::cuda_forward_report(model_id, model_dir, device_id, prompt)
         }
         _ => Err(ModelError::UnsupportedArchitecture {
             architectures: manifest.architectures,

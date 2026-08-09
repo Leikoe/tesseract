@@ -1426,7 +1426,7 @@ pub(crate) fn load_executor(
     Ok(Box::new(CudaExecutor::new(runtime)))
 }
 
-pub(crate) fn validate(
+pub(crate) fn checkpoint_report(
     model_id: &str,
     weights: &dyn WeightSource,
     probe_name: &str,
@@ -1462,7 +1462,7 @@ pub(crate) fn validate(
     })
 }
 
-pub(crate) fn validate_next_token(
+pub(crate) fn forward_report(
     model_id: &str,
     artifact: DenseDecoderArtifact,
     device_id: usize,

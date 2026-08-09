@@ -19,7 +19,7 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let report = tesseract::model::validate_cuda_next_token(
+    let report = tesseract::model::cuda_forward_report(
         &args.model,
         &args.model_path,
         args.device,
@@ -34,6 +34,6 @@ fn main() -> anyhow::Result<()> {
     println!("next_token_id={}", report.next_token_id);
     println!("next_token_text={:?}", report.next_token_text);
     println!("top_logits={}", serde_json::to_string(&report.top_logits)?);
-    println!("cuda_forward_validation=ok");
+    println!("cuda_forward=ok");
     Ok(())
 }

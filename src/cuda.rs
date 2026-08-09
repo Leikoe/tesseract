@@ -403,7 +403,7 @@ pub fn enable_persistent_cubin_cache() -> Result<(), CudaError> {
 
 /// Compile and execute a Tesseract-owned BF16 cuTile kernel on the requested
 /// CUDA device, then copy FP32-converted results back for validation.
-pub fn validate_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaError> {
+pub fn probe_bf16_cutile(device_id: usize) -> Result<Bf16SmokeReport, CudaError> {
     enable_persistent_cubin_cache()?;
     let device = Device::new(device_id).map_err(|error| CudaError::Device {
         device_id,

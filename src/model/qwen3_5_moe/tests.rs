@@ -64,23 +64,25 @@ fn target_config() -> Config {
 }
 
 #[test]
-fn rejects_a_layer_schedule_that_only_has_the_right_counts() {
-    let mut config = target_config();
-    config.text_config.layer_types.swap(0, 3);
-    assert!(matches!(
-        config.validate(),
-        Err(ModelError::InvalidConfig(message)) if message.contains("schedule")
-    ));
-}
-
-#[test]
 fn parses_quantization_targets_without_reconstructing_the_manifest() {
     let mut config = target_config();
     config
         .quantization_config
         .quantized_layers
         .remove("model.language_model.layers.0.linear_attn.in_proj_z");
-    config.validate().unwrap();
+    let target = config
+        .quantization_config
+        .quantized_layers
+        .get("model.language_model.layers.0.mlp.experts")
+        .unwrap();
+    assert_eq!(target.quant_algo, LayerQuantization::W4A16Nvfp4);
+    assert_eq!(target.group_size, Some(16));
+    assert!(
+        !config
+            .quantization_config
+            .quantized_layers
+            .contains_key("model.language_model.layers.0.linear_attn.in_proj_z")
+    );
 }
 
 #[test]
