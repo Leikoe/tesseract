@@ -206,6 +206,7 @@ pub struct QuantizedLinearCapabilityReport {
     pub grouped_w4a16: CudaKernelCapability,
     pub moe_routing: CudaKernelCapability,
     pub gdn_decode: CudaKernelCapability,
+    pub qwen_full_attention: CudaKernelCapability,
 }
 
 #[derive(Debug, Error)]
@@ -364,6 +365,10 @@ pub fn probe_quantized_linears(
     let gdn = gdn::probe(&stream).map_err(|error| CudaError::QuantizedLinear {
         message: error.to_string(),
     })?;
+    let qwen_attention =
+        qwen_attention::probe(&stream).map_err(|error| CudaError::QuantizedLinear {
+            message: error.to_string(),
+        })?;
 
     Ok(QuantizedLinearCapabilityReport {
         device_id,
@@ -383,6 +388,9 @@ pub fn probe_quantized_linears(
         },
         gdn_decode: CudaKernelCapability::Available {
             max_abs_error: gdn.max_abs_error,
+        },
+        qwen_full_attention: CudaKernelCapability::Available {
+            max_abs_error: qwen_attention.max_abs_error,
         },
     })
 }

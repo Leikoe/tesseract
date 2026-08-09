@@ -7,7 +7,7 @@ use cuda_core::Stream;
 use cutile::{
     api,
     core::bf16,
-    tensor::{PartitionMut, Reshape, Tensor, TensorView},
+    tensor::{PartitionMut, Reshape, Tensor, TensorView, ToHostVec},
     tile_kernel::TileKernel,
 };
 
@@ -404,4 +404,123 @@ fn rope_tables(
         .reshape(&[max_positions, HALF_ROTARY])
         .map_err(|error| ModelError::Cuda(format!("reshape Qwen RoPE sine: {error:?}")))?;
     Ok((Arc::new(cosine), Arc::new(sine)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AttentionProbe {
+    pub(crate) max_abs_error: f32,
+}
+
+pub(crate) fn probe(stream: &Arc<Stream>) -> Result<AttentionProbe, ModelError> {
+    let rows = 2usize;
+    let q_gate = upload_bf16(
+        &vec![bf16::from_f32(0.0); rows * 8192],
+        &[rows, 8192],
+        stream,
+    )?;
+    let key_host = (0..rows * KV_HEADS * HEAD_DIM)
+        .map(|index| bf16::from_f32((index % 29) as f32 / 17.0 - 0.75))
+        .collect::<Vec<_>>();
+    let value_host = (0..rows * KV_HEADS * HEAD_DIM)
+        .map(|index| bf16::from_f32((index % 31) as f32 / 19.0 - 0.5))
+        .collect::<Vec<_>>();
+    let key = upload_bf16(&key_host, &[rows, 512], stream)?;
+    let value = upload_bf16(&value_host, &[rows, 512], stream)?;
+    let norm = upload_bf16(&vec![bf16::from_f32(0.0); HEAD_DIM], &[HEAD_DIM], stream)?;
+    let positions = upload_u32(&[0, 1], &[rows], stream)?;
+    let slots = upload_u32(&[0, 1], &[rows], stream)?;
+    let request_indices = upload_u32(&[0, 1], &[rows], stream)?;
+    let context_lengths = upload_i32(&[1, 1], &[rows], stream)?;
+    let context_slots = upload_u32(&[0, 1], &[rows, 1], stream)?;
+    let context_view = context_slots.view(&[rows, 1]).map_err(|error| {
+        ModelError::Cuda(format!("view Qwen attention context probe: {error:?}"))
+    })?;
+    let backend = QwenFlatKvAttention::load(1, rows, 4, 10_000_000.0, stream)?;
+    let output = backend.enqueue(AttentionInput {
+        layer: 0,
+        q_gate,
+        key,
+        value,
+        q_weight_delta: norm.clone(),
+        k_weight_delta: norm,
+        positions,
+        current_slots: slots,
+        request_indices,
+        context_slots: &context_view,
+        context_lengths,
+        rows,
+        epsilon: 1.0e-6,
+        stream,
+    })?;
+    let actual: Vec<bf16> = output
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("download Qwen attention probe: {error:?}")))?;
+    let mut max_abs_error = 0.0f32;
+    for row in 0..rows {
+        for query_head in 0..QUERY_HEADS {
+            let kv_head = query_head / (QUERY_HEADS / KV_HEADS);
+            for element in 0..HEAD_DIM {
+                let index = (row * QUERY_HEADS + query_head) * HEAD_DIM + element;
+                let expected = bf16::from_f32(
+                    value_host[(row * KV_HEADS + kv_head) * HEAD_DIM + element].to_f32() * 0.5,
+                )
+                .to_f32();
+                let error = (actual[index].to_f32() - expected).abs();
+                max_abs_error = max_abs_error.max(error);
+                if error > 0.01 || !actual[index].to_f32().is_finite() {
+                    return Err(ModelError::Cuda(format!(
+                        "Qwen full-attention mismatch at {index}: {} != {expected}",
+                        actual[index].to_f32()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(AttentionProbe { max_abs_error })
+}
+
+fn upload_bf16(
+    values: &[bf16],
+    shape: &[usize],
+    stream: &Arc<Stream>,
+) -> Result<Arc<Tensor<bf16>>, ModelError> {
+    let tensor = api::copy_host_vec_to_device(&Arc::new(values.to_vec()))
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("upload Qwen attention BF16 probe: {error:?}")))?
+        .reshape(shape)
+        .map_err(|error| {
+            ModelError::Cuda(format!("reshape Qwen attention BF16 probe: {error:?}"))
+        })?;
+    Ok(Arc::new(tensor))
+}
+
+fn upload_u32(
+    values: &[u32],
+    shape: &[usize],
+    stream: &Arc<Stream>,
+) -> Result<Arc<Tensor<u32>>, ModelError> {
+    let tensor = api::copy_host_vec_to_device(&Arc::new(values.to_vec()))
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("upload Qwen attention U32 probe: {error:?}")))?
+        .reshape(shape)
+        .map_err(|error| {
+            ModelError::Cuda(format!("reshape Qwen attention U32 probe: {error:?}"))
+        })?;
+    Ok(Arc::new(tensor))
+}
+
+fn upload_i32(
+    values: &[i32],
+    shape: &[usize],
+    stream: &Arc<Stream>,
+) -> Result<Arc<Tensor<i32>>, ModelError> {
+    let tensor = api::copy_host_vec_to_device(&Arc::new(values.to_vec()))
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("upload Qwen attention I32 probe: {error:?}")))?
+        .reshape(shape)
+        .map_err(|error| {
+            ModelError::Cuda(format!("reshape Qwen attention I32 probe: {error:?}"))
+        })?;
+    Ok(Arc::new(tensor))
 }

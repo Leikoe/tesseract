@@ -22,6 +22,7 @@ fn main() -> anyhow::Result<()> {
     print_capability("nvfp4_grouped_w4a16", quantized.grouped_w4a16);
     print_capability("moe_device_routing", quantized.moe_routing);
     print_capability("gdn_recurrent_decode", quantized.gdn_decode);
+    print_capability("qwen_full_attention", quantized.qwen_full_attention);
     println!("cutile_probe=ok");
     Ok(())
 }
