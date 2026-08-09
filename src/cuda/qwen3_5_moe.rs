@@ -253,6 +253,55 @@ impl Layer {
             + self.attention.device_bytes()
             + self.moe.device_bytes()
     }
+
+    fn forward_linear_decode(
+        &self,
+        residual: Bf16Tensor,
+        update: Option<Bf16Tensor>,
+        state: &mut GdnState,
+        state_slots: Arc<Tensor<i32>>,
+        rows: usize,
+        epsilon: f32,
+        stream: &Arc<Stream>,
+    ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
+        let (attention_input, residual) = match update {
+            Some(update) => gemma_add_rms_norm(
+                residual,
+                update,
+                self.input_norm.clone(),
+                rows,
+                epsilon,
+                stream,
+            )?,
+            None => (
+                gemma_rms_norm(
+                    residual.clone(),
+                    self.input_norm.clone(),
+                    rows,
+                    epsilon,
+                    stream,
+                )?,
+                residual,
+            ),
+        };
+        let Attention::Linear(attention) = &self.attention else {
+            return Err(ModelError::Cuda(
+                "linear decode called for a full-attention layer".into(),
+            ));
+        };
+        let attention_output =
+            attention.forward_decode(attention_input, state, state_slots, rows, epsilon, stream)?;
+        let (moe_input, residual) = gemma_add_rms_norm(
+            residual,
+            Arc::new(attention_output),
+            self.post_attention_norm.clone(),
+            rows,
+            epsilon,
+            stream,
+        )?;
+        let moe_output = self.moe.forward(moe_input, rows, stream)?;
+        Ok((residual, Arc::new(moe_output)))
+    }
 }
 
 impl Attention {
@@ -496,6 +545,84 @@ fn silu_mul(
             .map_err(|error| ModelError::Cuda(format!("execute Qwen SiLU gate: {error:?}")))?;
     drop(output_partition);
     Ok(output)
+}
+
+fn gemma_rms_norm(
+    input: Bf16Tensor,
+    weight_delta: Bf16Tensor,
+    rows: usize,
+    epsilon: f32,
+    stream: &Arc<Stream>,
+) -> Result<Bf16Tensor, ModelError> {
+    const HIDDEN_SIZE: usize = 2048;
+    const BLOCK: usize = 256;
+    if input.shape() != [rows as i32, HIDDEN_SIZE as i32]
+        || weight_delta.shape() != [HIDDEN_SIZE as i32]
+    {
+        return Err(ModelError::Cuda(
+            "invalid Qwen Gemma RMSNorm geometry".into(),
+        ));
+    }
+    let mut output = api::zeros::<bf16>(&[rows, HIDDEN_SIZE])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate Qwen normalized output: {error:?}")))?;
+    let (_, _, output_partition, _) = unsafe {
+        kernels::gemma_rms_norm_bf16(
+            input,
+            weight_delta,
+            (&mut output).partition([1, HIDDEN_SIZE]),
+            epsilon,
+        )
+    }
+    .generics(vec![HIDDEN_SIZE.to_string(), BLOCK.to_string()])
+    .sync_on(stream)
+    .map_err(|error| ModelError::Cuda(format!("execute Qwen Gemma RMSNorm: {error:?}")))?;
+    drop(output_partition);
+    Ok(Arc::new(output))
+}
+
+fn gemma_add_rms_norm(
+    residual: Bf16Tensor,
+    update: Bf16Tensor,
+    weight_delta: Bf16Tensor,
+    rows: usize,
+    epsilon: f32,
+    stream: &Arc<Stream>,
+) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
+    const HIDDEN_SIZE: usize = 2048;
+    const BLOCK: usize = 256;
+    if residual.shape() != [rows as i32, HIDDEN_SIZE as i32]
+        || update.shape() != residual.shape()
+        || weight_delta.shape() != [HIDDEN_SIZE as i32]
+    {
+        return Err(ModelError::Cuda(
+            "invalid Qwen fused add Gemma RMSNorm geometry".into(),
+        ));
+    }
+    let mut normalized = api::zeros::<bf16>(&[rows, HIDDEN_SIZE])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate Qwen normalized output: {error:?}")))?;
+    let mut combined = api::zeros::<bf16>(&[rows, HIDDEN_SIZE])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate Qwen residual output: {error:?}")))?;
+    let (_, _, _, normalized_partition, combined_partition, _) = unsafe {
+        kernels::gemma_add_rms_norm_bf16(
+            residual,
+            update,
+            weight_delta,
+            (&mut normalized).partition([1, HIDDEN_SIZE]),
+            (&mut combined).partition([1, HIDDEN_SIZE]),
+            epsilon,
+        )
+    }
+    .generics(vec![HIDDEN_SIZE.to_string(), BLOCK.to_string()])
+    .sync_on(stream)
+    .map_err(|error| {
+        ModelError::Cuda(format!("execute Qwen fused add Gemma RMSNorm: {error:?}"))
+    })?;
+    drop(normalized_partition);
+    drop(combined_partition);
+    Ok((Arc::new(normalized), Arc::new(combined)))
 }
 
 pub(crate) fn checkpoint_report(

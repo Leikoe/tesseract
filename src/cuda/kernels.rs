@@ -103,6 +103,92 @@ mod tile {
     }
 
     #[cutile::entry()]
+    unsafe fn gemma_rms_norm_bf16<const N: i32, const BLOCK: i32>(
+        input: &Tensor<bf16, { [-1, N] }>,
+        weight_delta: &Tensor<bf16, { [N] }>,
+        out: &mut Tensor<bf16, { [1, N] }>,
+        epsilon: f32,
+    ) {
+        let shape = const_shape![1, BLOCK];
+        let row = get_tile_block_id().0;
+        let input = input.partition(shape);
+        const ZERO: f32 = 0.0;
+        let mut squares: Tile<f32, { [1, BLOCK] }> = broadcast_scalar(ZERO, shape);
+        for block in 0i32..(N / BLOCK) {
+            let values: Tile<f32, { [1, BLOCK] }> = convert_tile(input.load([row, block]));
+            squares = squares + values * values;
+        }
+        let sum: Tile<f32, { [1] }> = reduce_sum(squares, 1i32);
+        let sum: Tile<f32, { [] }> = sum.reshape(const_shape![]);
+        let sum: f32 = tile_to_scalar(sum);
+        let n: f32 = convert_scalar(N);
+        let inverse: Tile<f32, { [] }> = rsqrt(scalar_to_tile(sum / n + epsilon), ftz::Disabled);
+        let inverse: f32 = tile_to_scalar(inverse);
+        let inverse: Tile<f32, { [1, BLOCK] }> = inverse.broadcast(shape);
+        let weight_delta = weight_delta.partition(const_shape![BLOCK]);
+        let mut out = unsafe { out.partition_mut(shape) };
+        const ONE: f32 = 1.0;
+        let one: Tile<f32, { [1, BLOCK] }> = broadcast_scalar(ONE, shape);
+        for block in 0i32..(N / BLOCK) {
+            let values: Tile<f32, { [1, BLOCK] }> = convert_tile(input.load([row, block]));
+            let delta: Tile<f32, { [1, BLOCK] }> =
+                convert_tile(weight_delta.load([block]).reshape(shape));
+            let normalized: Tile<bf16, { [1, BLOCK] }> =
+                ftof(values * inverse * (one + delta), rounding::NearestEven);
+            unsafe { out.store(normalized, [0i32, block]) };
+        }
+    }
+
+    #[cutile::entry()]
+    unsafe fn gemma_add_rms_norm_bf16<const N: i32, const BLOCK: i32>(
+        residual: &Tensor<bf16, { [-1, N] }>,
+        update: &Tensor<bf16, { [-1, N] }>,
+        weight_delta: &Tensor<bf16, { [N] }>,
+        normalized: &mut Tensor<bf16, { [1, N] }>,
+        combined_out: &mut Tensor<bf16, { [1, N] }>,
+        epsilon: f32,
+    ) {
+        let shape = const_shape![1, BLOCK];
+        let row = get_tile_block_id().0;
+        let residual = residual.partition(shape);
+        let update = update.partition(shape);
+        const ZERO: f32 = 0.0;
+        let mut squares: Tile<f32, { [1, BLOCK] }> = broadcast_scalar(ZERO, shape);
+        for block in 0i32..(N / BLOCK) {
+            let residual: Tile<f32, { [1, BLOCK] }> = convert_tile(residual.load([row, block]));
+            let update: Tile<f32, { [1, BLOCK] }> = convert_tile(update.load([row, block]));
+            let combined = residual + update;
+            squares = squares + combined * combined;
+        }
+        let sum: Tile<f32, { [1] }> = reduce_sum(squares, 1i32);
+        let sum: Tile<f32, { [] }> = sum.reshape(const_shape![]);
+        let sum: f32 = tile_to_scalar(sum);
+        let n: f32 = convert_scalar(N);
+        let inverse: Tile<f32, { [] }> = rsqrt(scalar_to_tile(sum / n + epsilon), ftz::Disabled);
+        let inverse: f32 = tile_to_scalar(inverse);
+        let inverse: Tile<f32, { [1, BLOCK] }> = inverse.broadcast(shape);
+        let weight_delta = weight_delta.partition(const_shape![BLOCK]);
+        let mut normalized = unsafe { normalized.partition_mut(shape) };
+        let mut combined_out = unsafe { combined_out.partition_mut(shape) };
+        const ONE: f32 = 1.0;
+        let one: Tile<f32, { [1, BLOCK] }> = broadcast_scalar(ONE, shape);
+        for block in 0i32..(N / BLOCK) {
+            let residual: Tile<f32, { [1, BLOCK] }> = convert_tile(residual.load([row, block]));
+            let update: Tile<f32, { [1, BLOCK] }> = convert_tile(update.load([row, block]));
+            let combined = residual + update;
+            let delta: Tile<f32, { [1, BLOCK] }> =
+                convert_tile(weight_delta.load([block]).reshape(shape));
+            let combined_bf16: Tile<bf16, { [1, BLOCK] }> = ftof(combined, rounding::NearestEven);
+            let normalized_bf16: Tile<bf16, { [1, BLOCK] }> =
+                ftof(combined * inverse * (one + delta), rounding::NearestEven);
+            unsafe {
+                combined_out.store(combined_bf16, [0i32, block]);
+                normalized.store(normalized_bf16, [0i32, block]);
+            }
+        }
+    }
+
+    #[cutile::entry()]
     fn silu_mul_bf16<const BLOCK: i32>(
         gate: &Tensor<bf16, { [-1, -1] }>,
         up: &Tensor<bf16, { [-1, -1] }>,
@@ -648,6 +734,6 @@ mod tile {
 pub(crate) use tile::{
     add_rms_norm_bf16, argmax_blocks_batch_bf16, argmax_blocks_bf16, argmax_reduce_batch_bf16,
     argmax_reduce_bf16, causal_attention_bf16, embedding_bf16, gather_flat_kv_bf16,
-    gather_rows_bf16, ragged_attention_bf16, rms_norm_bf16, rope_kv_write_bf16, rope_q_bf16,
-    silu_mul_bf16,
+    gather_rows_bf16, gemma_add_rms_norm_bf16, gemma_rms_norm_bf16, ragged_attention_bf16,
+    rms_norm_bf16, rope_kv_write_bf16, rope_q_bf16, silu_mul_bf16,
 };
