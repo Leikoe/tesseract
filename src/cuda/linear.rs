@@ -41,16 +41,17 @@ mod kernels {
     ) {
         let pid = get_tile_block_id();
         let k_tiles = Dim::new(K_TILES);
-        let low_mask: Tile<u8, { [16, 8] }> = constant(0x0fu8, const_shape![16, 8]);
-        let nibble_shift: Tile<u8, { [16, 8] }> = constant(4u8, const_shape![16, 8]);
+        let low_mask: Tile<i32, { [16, 8] }> = constant(0x0fi32, const_shape![16, 8]);
+        let nibble_shift: Tile<i32, { [16, 8] }> = constant(4i32, const_shape![16, 8]);
         let mut accumulator = constant(0.0f32, const_shape![16, 16]);
 
         for k_tile in k_tiles {
             let activation = input.load_tile(const_shape![16, 16], [pid.0, k_tile]);
-            let packed = packed_weight.load_tile(const_shape![16, 8], [pid.1, k_tile]);
+            let packed: Tile<i32, { [16, 8] }> =
+                convert_tile(packed_weight.load_tile(const_shape![16, 8], [pid.1, k_tile]));
             let low = andi(packed, low_mask).reshape(const_shape![16, 8, 1]);
             let high = shri(packed, nibble_shift).reshape(const_shape![16, 8, 1]);
-            let nibbles: Tile<u8, { [16, 8, 2] }> = cat(low, high, 2);
+            let nibbles: Tile<i32, { [16, 8, 2] }> = cat(low, high, 2);
             let weight = decode_fp4(nibbles.reshape(const_shape![16, 16]));
             let scale: Tile<f32, { [16, 16] }> = convert_tile(
                 weight_scale
@@ -79,8 +80,8 @@ mod kernels {
         weight_scale: &Tensor<bf16, { [-1, -1, -1] }>,
         weight_global_scale: &Tensor<f32, { [-1] }>,
     ) {
-        let low_mask: Tile<u8, { [1, 16, 8] }> = constant(0x0fu8, const_shape![1, 16, 8]);
-        let nibble_shift: Tile<u8, { [1, 16, 8] }> = constant(4u8, const_shape![1, 16, 8]);
+        let low_mask: Tile<i32, { [1, 16, 8] }> = constant(0x0fi32, const_shape![1, 16, 8]);
+        let nibble_shift: Tile<i32, { [1, 16, 8] }> = constant(4i32, const_shape![1, 16, 8]);
         let k_tiles = Dim::new(K_TILES);
 
         // `iter_indices` maps the full logical output grid onto a physical
@@ -98,11 +99,12 @@ mod kernels {
 
             for k_tile in k_tiles {
                 let activation = dispatched.load_tile(const_shape![16, 16], [row_tile, k_tile]);
-                let packed =
-                    packed_weight.load_tile(const_shape![1, 16, 8], [expert, column_tile, k_tile]);
+                let packed: Tile<i32, { [1, 16, 8] }> = convert_tile(
+                    packed_weight.load_tile(const_shape![1, 16, 8], [expert, column_tile, k_tile]),
+                );
                 let low = andi(packed, low_mask).reshape(const_shape![16, 8, 1]);
                 let high = shri(packed, nibble_shift).reshape(const_shape![16, 8, 1]);
-                let nibbles: Tile<u8, { [16, 8, 2] }> = cat(low, high, 2);
+                let nibbles: Tile<i32, { [16, 8, 2] }> = cat(low, high, 2);
                 let weight = decode_fp4(nibbles.reshape(const_shape![16, 16]));
                 let scale: Tile<f32, { [16, 16] }> = convert_tile(
                     weight_scale
@@ -119,17 +121,17 @@ mod kernels {
         }
     }
 
-    fn decode_fp4(nibbles: Tile<u8, { [16, 16] }>) -> Tile<f32, { [16, 16] }> {
-        let eight: Tile<u8, { [16, 16] }> = constant(8u8, const_shape![16, 16]);
+    fn decode_fp4(nibbles: Tile<i32, { [16, 16] }>) -> Tile<f32, { [16, 16] }> {
+        let eight: Tile<i32, { [16, 16] }> = constant(8i32, const_shape![16, 16]);
         let magnitude = nibbles % eight;
         let sign = nibbles / eight;
-        let one: Tile<u8, { [16, 16] }> = constant(1u8, const_shape![16, 16]);
-        let two: Tile<u8, { [16, 16] }> = constant(2u8, const_shape![16, 16]);
-        let three: Tile<u8, { [16, 16] }> = constant(3u8, const_shape![16, 16]);
-        let four: Tile<u8, { [16, 16] }> = constant(4u8, const_shape![16, 16]);
-        let five: Tile<u8, { [16, 16] }> = constant(5u8, const_shape![16, 16]);
-        let six: Tile<u8, { [16, 16] }> = constant(6u8, const_shape![16, 16]);
-        let seven: Tile<u8, { [16, 16] }> = constant(7u8, const_shape![16, 16]);
+        let one: Tile<i32, { [16, 16] }> = constant(1i32, const_shape![16, 16]);
+        let two: Tile<i32, { [16, 16] }> = constant(2i32, const_shape![16, 16]);
+        let three: Tile<i32, { [16, 16] }> = constant(3i32, const_shape![16, 16]);
+        let four: Tile<i32, { [16, 16] }> = constant(4i32, const_shape![16, 16]);
+        let five: Tile<i32, { [16, 16] }> = constant(5i32, const_shape![16, 16]);
+        let six: Tile<i32, { [16, 16] }> = constant(6i32, const_shape![16, 16]);
+        let seven: Tile<i32, { [16, 16] }> = constant(7i32, const_shape![16, 16]);
         let zero_f: Tile<f32, { [16, 16] }> = constant(0.0f32, const_shape![16, 16]);
         let half_f: Tile<f32, { [16, 16] }> = constant(0.5f32, const_shape![16, 16]);
         let one_f: Tile<f32, { [16, 16] }> = constant(1.0f32, const_shape![16, 16]);
