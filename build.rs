@@ -26,8 +26,13 @@ fn main() {
         })
         .unwrap_or_else(|| std::path::PathBuf::from("nvcc"));
 
+    // cc-rs reads NVCC when CUDA mode constructs its compiler wrapper. Passing
+    // nvcc through `compiler()` would misclassify it as a host compiler and
+    // omit the required `-Xcompiler` forwarding for ELF/PIC flags.
+    unsafe {
+        std::env::set_var("NVCC", nvcc);
+    }
     cc::Build::new()
-        .compiler(nvcc)
         .cuda(true)
         .cpp(true)
         .include("src/cuda/marlin/native")
