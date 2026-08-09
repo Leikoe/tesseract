@@ -96,7 +96,6 @@ mod nvfp4_probe_kernels {
         lhs_scale_bytes: &Tensor<u8, { [-1, -1] }>,
         rhs_scale_bytes: &Tensor<u8, { [-1, -1] }>,
     ) {
-        let k_tiles = Dim::new(lhs_packed.shape()[1] / 8);
         let lhs_packed = lhs_packed.partition(const_shape![16, 8]);
         let rhs_packed = rhs_packed.partition(const_shape![16, 8]);
         let lhs_scale_bytes = lhs_scale_bytes.partition(const_shape![16, 1]);
@@ -104,7 +103,7 @@ mod nvfp4_probe_kernels {
         let sixteen: Tile<u8, { [16, 8] }> = constant(16u8, const_shape![16, 8]);
         let mut accumulator = constant(0.0f32, const_shape![16, 16]);
 
-        for k_tile in k_tiles {
+        for k_tile in 0i32..8i32 {
             let lhs_packed = lhs_packed.load([0, k_tile]);
             let rhs_packed = rhs_packed.load([0, k_tile]);
             let lhs_low = (lhs_packed % sixteen).reshape(const_shape![16, 8, 1]);
