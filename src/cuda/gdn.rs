@@ -586,7 +586,7 @@ impl GdnState {
         {
             return Err(ModelError::Cuda("invalid GDN convolution geometry".into()));
         }
-        let mut output = api::zeros::<bf16>(&[rows, CONV_FEATURES])
+        let output = api::zeros::<bf16>(&[rows, CONV_FEATURES])
             .sync_on(stream)
             .map_err(|error| {
                 ModelError::Cuda(format!("allocate GDN convolution output: {error:?}"))
