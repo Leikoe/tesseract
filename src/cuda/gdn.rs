@@ -772,6 +772,282 @@ mod kernels {
         );
     }
 
+    /// Carries each request's recurrent state across its chunks, emits the
+    /// causal chunk outputs, and commits the final FP32 state exactly once.
+    #[cutile::entry()]
+    unsafe fn qwen_gdn_prefill_state_output(
+        mixed_qkv_ptr: *mut bf16,
+        log_decay_cumsum_ptr: *mut f32,
+        w: &Tensor<bf16, { [-1, 32, 2048] }>,
+        u: &Tensor<bf16, { [-1, 32, 2048] }>,
+        chunk_starts: &Tensor<i32, { [-1] }>,
+        chunk_lengths: &Tensor<i32, { [-1] }>,
+        request_chunk_offsets: &Tensor<i32, { [-1] }>,
+        state_slots: &Tensor<i32, { [-1] }>,
+        state_ptr: *mut f32,
+        output_ptr: *mut bf16,
+        completion: &mut Tensor<i32, { [1, 1, 1] }>,
+    ) {
+        const EPSILON: f32 = 1.0e-6;
+        const QUERY_SCALE: f32 = 1.0 / 11.313_708;
+        const ZERO: f32 = 0.0;
+        const ZERO_I32: i32 = 0;
+
+        let pid = get_tile_block_id();
+        let request = pid.0;
+        let value_head = pid.1;
+        let value_block = pid.2;
+        let key_head = value_head / 2i32;
+        let value_offset = value_block * 32i32;
+        let request_chunks = request_chunk_offsets.partition(const_shape![1]);
+        let first_chunk: i32 =
+            tile_to_scalar(request_chunks.load([request]).reshape(const_shape![]));
+        let end_chunk: i32 = tile_to_scalar(
+            request_chunks
+                .load([request + 1i32])
+                .reshape(const_shape![]),
+        );
+        let slot: i32 = tile_to_scalar(
+            state_slots
+                .partition(const_shape![1])
+                .load([request])
+                .reshape(const_shape![]),
+        );
+
+        let value_lane: Tile<i32, { [32] }> = iota(const_shape![32]);
+        let value_lane: Tile<i32, { [32, 1] }> =
+            (value_lane + value_offset.broadcast(const_shape![32])).reshape(const_shape![32, 1]);
+        let key_lane: Tile<i32, { [128] }> = iota(const_shape![128]);
+        let key_lane: Tile<i32, { [1, 128] }> = key_lane.reshape(const_shape![1, 128]);
+        let state_base_offset = (slot * 32i32 + value_head) * 128i32 * 128i32;
+        let state_offset = state_base_offset.broadcast(const_shape![32, 128])
+            + value_lane.broadcast(const_shape![32, 128]) * 128i32.broadcast(const_shape![32, 128])
+            + key_lane.broadcast(const_shape![32, 128]);
+        let state_base: PointerTile<*mut f32, { [] }> = pointer_to_tile(state_ptr);
+        let state_base: PointerTile<*mut f32, { [1, 1] }> = state_base.reshape(const_shape![1, 1]);
+        let state_base: PointerTile<*mut f32, { [32, 128] }> =
+            state_base.broadcast(const_shape![32, 128]);
+        let state_pointer: PointerTile<*mut f32, { [32, 128] }> =
+            state_base.offset_tile(state_offset);
+        let (mut state, state_token): (Tile<f32, { [32, 128] }>, Token) = load_ptr_tko(
+            state_pointer,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            None,
+            None,
+            Latency::<0>,
+        );
+        let mixed_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(mixed_qkv_ptr);
+        let mixed_base: PointerTile<*mut bf16, { [1, 1] }> = mixed_base.reshape(const_shape![1, 1]);
+        let mixed_base: PointerTile<*mut bf16, { [16, 128] }> =
+            mixed_base.broadcast(const_shape![16, 128]);
+        let log_base: PointerTile<*mut f32, { [] }> = pointer_to_tile(log_decay_cumsum_ptr);
+        let log_base: PointerTile<*mut f32, { [1, 1] }> = log_base.reshape(const_shape![1, 1]);
+        let log_base: PointerTile<*mut f32, { [16, 1] }> = log_base.broadcast(const_shape![16, 1]);
+        let output_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(output_ptr);
+        let output_base: PointerTile<*mut bf16, { [1, 1] }> =
+            output_base.reshape(const_shape![1, 1]);
+        let output_base: PointerTile<*mut bf16, { [16, 32] }> =
+            output_base.broadcast(const_shape![16, 32]);
+        let row: Tile<i32, { [16] }> = iota(const_shape![16]);
+        let row: Tile<i32, { [16, 1] }> = row.reshape(const_shape![16, 1]);
+        let column: Tile<i32, { [128] }> = iota(const_shape![128]);
+        let column: Tile<i32, { [1, 128] }> = column.reshape(const_shape![1, 128]);
+        let output_column: Tile<i32, { [32] }> = iota(const_shape![32]);
+        let output_column: Tile<i32, { [1, 32] }> = output_column.reshape(const_shape![1, 32]);
+        let causal_column: Tile<i32, { [16] }> = iota(const_shape![16]);
+        let causal_column: Tile<i32, { [1, 16] }> = causal_column.reshape(const_shape![1, 16]);
+        let row_shape = const_shape![16, 1];
+        let zero_16_32: Tile<f32, { [16, 32] }> = broadcast_scalar(ZERO, const_shape![16, 32]);
+        let zero_16_16: Tile<f32, { [16, 16] }> = broadcast_scalar(ZERO, const_shape![16, 16]);
+        let epsilon: Tile<f32, { [16, 1] }> = broadcast_scalar(EPSILON, const_shape![16, 1]);
+        let query_scale: Tile<f32, { [16, 32] }> =
+            broadcast_scalar(QUERY_SCALE, const_shape![16, 32]);
+
+        for chunk in first_chunk..end_chunk {
+            let start: i32 = tile_to_scalar(
+                chunk_starts
+                    .partition(const_shape![1])
+                    .load([chunk])
+                    .reshape(const_shape![]),
+            );
+            let len: i32 = tile_to_scalar(
+                chunk_lengths
+                    .partition(const_shape![1])
+                    .load([chunk])
+                    .reshape(const_shape![]),
+            );
+            let safe_row: Tile<i32, { [16, 1] }> =
+                min_tile(row, (len - 1i32).broadcast(const_shape![16, 1]));
+            let valid_row: Tile<bool, { [16, 1] }> =
+                lt_tile(row, len.broadcast(const_shape![16, 1]));
+            let valid_qk: Tile<bool, { [16, 128] }> = valid_row.broadcast(const_shape![16, 128]);
+            let packed_row = start.broadcast(row_shape) + safe_row;
+
+            let query_offset = (packed_row * 8192i32.broadcast(row_shape)
+                + (key_head * 128i32).broadcast(row_shape))
+            .broadcast(const_shape![16, 128])
+                + column.broadcast(const_shape![16, 128]);
+            let query_pointer: PointerTile<*mut bf16, { [16, 128] }> =
+                mixed_base.offset_tile(query_offset);
+            let (query, _): (Tile<bf16, { [16, 128] }>, Token) = load_ptr_tko(
+                query_pointer,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                None,
+                Latency::<0>,
+            );
+            let query: Tile<f32, { [16, 128] }> = convert_tile(query);
+            let query = select(
+                valid_qk,
+                query,
+                broadcast_scalar(ZERO, const_shape![16, 128]),
+            );
+            let query_square_sum: Tile<f32, { [16] }> = reduce_sum(query * query, 1i32);
+            let query_square_sum: Tile<f32, { [16, 1] }> =
+                query_square_sum.reshape(const_shape![16, 1]);
+            let query_inverse = rsqrt(query_square_sum + epsilon, ftz::Disabled);
+            let query: Tile<bf16, { [16, 128] }> = ftof(
+                query * query_inverse.broadcast(const_shape![16, 128]),
+                rounding::NearestEven,
+            );
+
+            let key_offset = (packed_row * 8192i32.broadcast(row_shape)
+                + ((key_head + 16i32) * 128i32).broadcast(row_shape))
+            .broadcast(const_shape![16, 128])
+                + column.broadcast(const_shape![16, 128]);
+            let key_pointer: PointerTile<*mut bf16, { [16, 128] }> =
+                mixed_base.offset_tile(key_offset);
+            let (key, _): (Tile<bf16, { [16, 128] }>, Token) = load_ptr_tko(
+                key_pointer,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                None,
+                Latency::<0>,
+            );
+            let key: Tile<f32, { [16, 128] }> = convert_tile(key);
+            let key = select(valid_qk, key, broadcast_scalar(ZERO, const_shape![16, 128]));
+            let key_square_sum: Tile<f32, { [16] }> = reduce_sum(key * key, 1i32);
+            let key_square_sum: Tile<f32, { [16, 1] }> =
+                key_square_sum.reshape(const_shape![16, 1]);
+            let key_inverse = rsqrt(key_square_sum + epsilon, ftz::Disabled);
+            let key: Tile<bf16, { [16, 128] }> = ftof(
+                key * key_inverse.broadcast(const_shape![16, 128]),
+                rounding::NearestEven,
+            );
+
+            let gate_offset =
+                packed_row * 32i32.broadcast(row_shape) + value_head.broadcast(row_shape);
+            let log_pointer: PointerTile<*mut f32, { [16, 1] }> = log_base.offset_tile(gate_offset);
+            let (log_decay, _): (Tile<f32, { [16, 1] }>, Token) = load_ptr_tko(
+                log_pointer,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                None,
+                Latency::<0>,
+            );
+            let log_decay = select(
+                valid_row,
+                log_decay,
+                broadcast_scalar(ZERO, const_shape![16, 1]),
+            );
+            let w_tile: Tile<bf16, { [16, 128] }> = w
+                .partition(const_shape![1, 1, 2048])
+                .load([chunk, value_head, 0i32])
+                .reshape(const_shape![16, 128]);
+            let u_tile: Tile<bf16, { [16, 128] }> = u
+                .partition(const_shape![1, 1, 2048])
+                .load([chunk, value_head, 0i32])
+                .reshape(const_shape![16, 128]);
+            let zero_index: Tile<i32, { [] }> = broadcast_scalar(ZERO_I32, const_shape![]);
+            let value_block_index: Tile<i32, { [] }> = value_block.broadcast(const_shape![]);
+            let u_block: Tile<bf16, { [16, 32] }> =
+                extract(u_tile, [zero_index, value_block_index]);
+            let state_bf16: Tile<bf16, { [32, 128] }> = ftof(state, rounding::NearestEven);
+            let predicted: Tile<f32, { [16, 32] }> =
+                mma(w_tile, state_bf16.transpose(), zero_16_32);
+            let u_block: Tile<f32, { [16, 32] }> = convert_tile(u_block);
+            let v_new = u_block - predicted;
+
+            let initial_output: Tile<f32, { [16, 32] }> =
+                mma(query, state_bf16.transpose(), zero_16_32);
+            let qk: Tile<f32, { [16, 16] }> = mma(query, key.transpose(), zero_16_16);
+            let valid_column: Tile<bool, { [1, 16] }> =
+                lt_tile(causal_column, len.broadcast(const_shape![1, 16]));
+            let causal = ge_tile(
+                row.broadcast(const_shape![16, 16]),
+                causal_column.broadcast(const_shape![16, 16]),
+            );
+            let valid_scores = valid_row.broadcast(const_shape![16, 16])
+                & valid_column.broadcast(const_shape![16, 16]);
+            let decay_ratio = exp(log_decay.broadcast(const_shape![16, 16])
+                - log_decay.transpose().broadcast(const_shape![16, 16]));
+            let scores = select(causal & valid_scores, qk * decay_ratio, zero_16_16);
+            let scores: Tile<bf16, { [16, 16] }> = ftof(scores, rounding::NearestEven);
+            let v_new_bf16: Tile<bf16, { [16, 32] }> = ftof(v_new, rounding::NearestEven);
+            let intra_output: Tile<f32, { [16, 32] }> = mma(scores, v_new_bf16, zero_16_32);
+            let result = (initial_output * exp(log_decay).broadcast(const_shape![16, 32])
+                + intra_output)
+                * query_scale;
+            let result: Tile<bf16, { [16, 32] }> = ftof(result, rounding::NearestEven);
+            let output_offset = ((start.broadcast(row_shape) + row) * 32i32.broadcast(row_shape)
+                + value_head.broadcast(row_shape))
+            .broadcast(const_shape![16, 32])
+                * 128i32.broadcast(const_shape![16, 32])
+                + value_offset.broadcast(const_shape![16, 32])
+                + output_column.broadcast(const_shape![16, 32]);
+            let output_pointer: PointerTile<*mut bf16, { [16, 32] }> =
+                output_base.offset_tile(output_offset);
+            let _output_store = store_ptr_tko(
+                output_pointer,
+                result,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(valid_row.broadcast(const_shape![16, 32])),
+                None,
+                Latency::<0>,
+            );
+
+            let last_row = len - 1i32;
+            let is_last = eq_tile(row, last_row.broadcast(const_shape![16, 1]));
+            let last_log: Tile<f32, { [1] }> = reduce_sum(
+                select(
+                    is_last,
+                    log_decay,
+                    broadcast_scalar(ZERO, const_shape![16, 1]),
+                ),
+                0i32,
+            );
+            let last_log: Tile<f32, { [] }> = last_log.reshape(const_shape![]);
+            let v_decay: Tile<bf16, { [16, 32] }> = ftof(
+                v_new
+                    * exp(last_log.broadcast(const_shape![16, 1]) - log_decay)
+                        .broadcast(const_shape![16, 32]),
+                rounding::NearestEven,
+            );
+            let state_decay = exp(last_log).broadcast(const_shape![32, 128]);
+            state = mma(v_decay.transpose(), key, state * state_decay);
+        }
+
+        let _state_store = store_ptr_tko(
+            state_pointer,
+            state,
+            ordering::Weak,
+            None::<scope::TileBlock>,
+            None,
+            Some(state_token),
+            Latency::<0>,
+        );
+        completion.store(broadcast_scalar(ZERO_I32, const_shape![1, 1, 1]));
+    }
+
     #[cutile::entry()]
     unsafe fn qwen_gdn_decode(
         mixed_qkv: &Tensor<bf16, { [-1, 8192] }>,
@@ -971,12 +1247,15 @@ mod kernels {
 use kernels::{
     qwen_gdn_conv_decode, qwen_gdn_conv_prefill, qwen_gdn_decode, qwen_gdn_output_gate,
     qwen_gdn_prefill_gates, qwen_gdn_prefill_kkt_solve, qwen_gdn_prefill_recompute_w_u,
+    qwen_gdn_prefill_state_output,
 };
 
 pub(crate) struct GdnPrefillPlan {
     chunk_starts: Arc<Tensor<i32>>,
     chunk_lengths: Arc<Tensor<i32>>,
+    request_chunk_offsets: Arc<Tensor<i32>>,
     chunks: usize,
+    requests: usize,
     rows: usize,
 }
 
@@ -994,11 +1273,22 @@ impl GdnPrefillPlan {
             .map(|chunk| i32::try_from(chunk.len()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ModelError::Cuda("GDN prefill chunk length exceeds i32".into()))?;
+        let requests = offsets.len().saturating_sub(1);
+        let mut request_chunk_offsets = vec![0i32; requests + 1];
+        for chunk in &chunks {
+            let next_request = chunk.request() as usize + 1;
+            request_chunk_offsets[next_request] += 1;
+        }
+        for request in 0..requests {
+            request_chunk_offsets[request + 1] += request_chunk_offsets[request];
+        }
         let rows = offsets.last().copied().unwrap_or(0) as usize;
         Ok(Self {
             chunk_starts: upload_i32(&starts, stream)?,
             chunk_lengths: upload_i32(&lengths, stream)?,
+            request_chunk_offsets: upload_i32(&request_chunk_offsets, stream)?,
             chunks: chunks.len(),
+            requests,
             rows,
         })
     }
@@ -1009,6 +1299,10 @@ impl GdnPrefillPlan {
 
     pub(crate) const fn chunks(&self) -> usize {
         self.chunks
+    }
+
+    pub(crate) const fn requests(&self) -> usize {
+        self.requests
     }
 }
 
@@ -1099,8 +1393,8 @@ fn solve_prefill_kkt(
 }
 
 struct GdnPrefillWy {
-    w: Tensor<bf16>,
-    u: Tensor<bf16>,
+    w: Arc<Tensor<bf16>>,
+    u: Arc<Tensor<bf16>>,
 }
 
 fn recompute_prefill_w_u(
@@ -1132,7 +1426,10 @@ fn recompute_prefill_w_u(
     .sync_on(stream)
     .map_err(|error| ModelError::Cuda(format!("execute GDN prefill W/U: {error:?}")))?;
     drop(w_partition);
-    Ok(GdnPrefillWy { w, u })
+    Ok(GdnPrefillWy {
+        w: Arc::new(w),
+        u: Arc::new(u),
+    })
 }
 
 pub(crate) fn output_gate(
@@ -1279,6 +1576,58 @@ impl GdnState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefill(
+        &mut self,
+        mixed_qkv: Arc<Tensor<bf16>>,
+        a: Arc<Tensor<bf16>>,
+        b: Arc<Tensor<bf16>>,
+        a_log: Arc<Tensor<f32>>,
+        dt_bias: Arc<Tensor<f32>>,
+        state_slots: Arc<Tensor<i32>>,
+        plan: &GdnPrefillPlan,
+        stream: &Arc<Stream>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        if self.slots == 0
+            || state_slots.shape() != [plan.requests() as i32]
+            || mixed_qkv.shape() != [plan.rows() as i32, CONV_FEATURES as i32]
+        {
+            return Err(ModelError::Cuda("invalid GDN prefill geometry".into()));
+        }
+        let gates = prepare_prefill_gates(a, b, a_log, dt_bias, plan, stream)?;
+        let inverse = solve_prefill_kkt(mixed_qkv.clone(), &gates, plan, stream)?;
+        let wy = recompute_prefill_w_u(mixed_qkv.clone(), &gates, inverse, plan, stream)?;
+        let output = api::zeros::<bf16>(&[plan.rows(), VALUE_HEADS, HEAD_DIM])
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("allocate GDN prefill output: {error:?}")))?;
+        let mut completion = api::zeros::<i32>(&[plan.requests(), VALUE_HEADS, 4])
+            .sync_on(stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!("allocate GDN prefill state launch grid: {error:?}"))
+            })?;
+        let (_, _, _, _, _, _, _, _, _, _, completion_partition) = unsafe {
+            qwen_gdn_prefill_state_output(
+                mixed_qkv.device_pointer(),
+                gates.log_decay_cumsum.device_pointer(),
+                wy.w,
+                wy.u,
+                plan.chunk_starts.clone(),
+                plan.chunk_lengths.clone(),
+                plan.request_chunk_offsets.clone(),
+                state_slots,
+                self.tensor.device_pointer(),
+                output.device_pointer(),
+                (&mut completion).partition([1, 1, 1]),
+            )
+        }
+        .sync_on(stream)
+        .map_err(|error| {
+            ModelError::Cuda(format!("execute GDN prefill state/output: {error:?}"))
+        })?;
+        drop(completion_partition);
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode(
         &mut self,
         mixed_qkv: Arc<Tensor<bf16>>,
@@ -1333,6 +1682,7 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
     let conv_max_abs_error = probe_conv(stream)?;
     let prefill_gate_max_abs_error = probe_prefill_gates(stream)?;
     let prefill_kkt_max_abs_error = probe_prefill_kkt(stream)?;
+    let prefill_recurrence_max_abs_error = probe_prefill_recurrence(stream)?;
     let output_gate_max_abs_error = probe_output_gate(stream)?;
     let rows = 2usize;
     let query_host = host_bf16(rows * KEY_HEADS * HEAD_DIM, 17, 8.0);
@@ -1393,6 +1743,7 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
     let mut max_abs_error = conv_max_abs_error
         .max(prefill_gate_max_abs_error)
         .max(prefill_kkt_max_abs_error)
+        .max(prefill_recurrence_max_abs_error)
         .max(output_gate_max_abs_error);
     for row in 0..rows {
         for value_head in 0..VALUE_HEADS {
@@ -1443,6 +1794,186 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
         }
     }
     Ok(GdnProbe { max_abs_error })
+}
+
+fn probe_prefill_recurrence(stream: &Arc<Stream>) -> Result<f32, ModelError> {
+    let offsets = [0u32, 17, 22];
+    let requests = offsets.len() - 1;
+    let rows = *offsets.last().unwrap() as usize;
+    let mixed_qkv_host = host_bf16(rows * CONV_FEATURES, 37, 23.0);
+    let a_host = host_bf16(rows * VALUE_HEADS, 19, 17.0);
+    let b_host = host_bf16(rows * VALUE_HEADS, 29, 19.0);
+    let continuation_qkv = host_bf16(requests * CONV_FEATURES, 41, 29.0);
+    let continuation_a = host_bf16(requests * VALUE_HEADS, 13, 11.0);
+    let continuation_b = host_bf16(requests * VALUE_HEADS, 17, 13.0);
+    let a_log = (0..VALUE_HEADS)
+        .map(|index| -2.0 + index as f32 / 64.0)
+        .collect::<Vec<_>>();
+    let dt_bias = (0..VALUE_HEADS)
+        .map(|index| -0.5 + index as f32 / 64.0)
+        .collect::<Vec<_>>();
+    let plan = GdnPrefillPlan::from_offsets(&offsets, stream)?;
+    let state_slots = upload_i32(&[1i32, 0i32], stream)?;
+    let a_log_device = upload_f32(&a_log, &[VALUE_HEADS], stream)?;
+    let dt_bias_device = upload_f32(&dt_bias, &[VALUE_HEADS], stream)?;
+    let mut state = GdnState::zeros(requests, stream)?;
+    let output = state.prefill(
+        upload_bf16(&mixed_qkv_host, &[rows, CONV_FEATURES], stream)?,
+        upload_bf16(&a_host, &[rows, VALUE_HEADS], stream)?,
+        upload_bf16(&b_host, &[rows, VALUE_HEADS], stream)?,
+        a_log_device.clone(),
+        dt_bias_device.clone(),
+        state_slots.clone(),
+        &plan,
+        stream,
+    )?;
+    let actual: Vec<bf16> = output
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("download GDN prefill recurrence: {error:?}")))?;
+    let continuation = state.decode(
+        upload_bf16(&continuation_qkv, &[requests, CONV_FEATURES], stream)?,
+        upload_bf16(&continuation_a, &[requests, VALUE_HEADS], stream)?,
+        upload_bf16(&continuation_b, &[requests, VALUE_HEADS], stream)?,
+        a_log_device,
+        dt_bias_device,
+        state_slots,
+        requests,
+        stream,
+    )?;
+    let continuation_actual: Vec<bf16> =
+        continuation
+            .to_host_vec()
+            .sync_on(stream)
+            .map_err(|error| {
+                ModelError::Cuda(format!("download GDN prefill continuation: {error:?}"))
+            })?;
+
+    let mut reference_state = vec![0.0f32; requests * VALUE_HEADS * HEAD_DIM * HEAD_DIM];
+    let mut max_abs_error = 0.0f32;
+    for request in 0..requests {
+        for row in offsets[request] as usize..offsets[request + 1] as usize {
+            for value_head in 0..VALUE_HEADS {
+                let expected = host_gdn_step(
+                    &mixed_qkv_host[row * CONV_FEATURES..(row + 1) * CONV_FEATURES],
+                    a_host[row * VALUE_HEADS + value_head],
+                    b_host[row * VALUE_HEADS + value_head],
+                    a_log[value_head],
+                    dt_bias[value_head],
+                    value_head,
+                    &mut reference_state[(request * VALUE_HEADS + value_head) * HEAD_DIM * HEAD_DIM
+                        ..(request * VALUE_HEADS + value_head + 1) * HEAD_DIM * HEAD_DIM],
+                );
+                for element in 0..HEAD_DIM {
+                    let index = (row * VALUE_HEADS + value_head) * HEAD_DIM + element;
+                    let error = (actual[index].to_f32() - expected[element]).abs();
+                    max_abs_error = max_abs_error.max(error);
+                    if error > 0.06 || !actual[index].to_f32().is_finite() {
+                        return Err(ModelError::Cuda(format!(
+                            "GDN chunk prefill mismatch at {index}: {} != {}",
+                            actual[index].to_f32(),
+                            expected[element]
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    for request in 0..requests {
+        for value_head in 0..VALUE_HEADS {
+            let expected = host_gdn_step(
+                &continuation_qkv[request * CONV_FEATURES..(request + 1) * CONV_FEATURES],
+                continuation_a[request * VALUE_HEADS + value_head],
+                continuation_b[request * VALUE_HEADS + value_head],
+                a_log[value_head],
+                dt_bias[value_head],
+                value_head,
+                &mut reference_state[(request * VALUE_HEADS + value_head) * HEAD_DIM * HEAD_DIM
+                    ..(request * VALUE_HEADS + value_head + 1) * HEAD_DIM * HEAD_DIM],
+            );
+            for element in 0..HEAD_DIM {
+                let index = (request * VALUE_HEADS + value_head) * HEAD_DIM + element;
+                let error = (continuation_actual[index].to_f32() - expected[element]).abs();
+                max_abs_error = max_abs_error.max(error);
+                if error > 0.06 || !continuation_actual[index].to_f32().is_finite() {
+                    return Err(ModelError::Cuda(format!(
+                        "GDN prefill/decode continuation mismatch at {index}: {} != {}",
+                        continuation_actual[index].to_f32(),
+                        expected[element]
+                    )));
+                }
+            }
+        }
+    }
+    Ok(max_abs_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn host_gdn_step(
+    mixed_qkv: &[bf16],
+    a: bf16,
+    b: bf16,
+    a_log: f32,
+    dt_bias: f32,
+    value_head: usize,
+    state: &mut [f32],
+) -> [f32; HEAD_DIM] {
+    const EPSILON: f32 = 1.0e-6;
+    const QUERY_SCALE: f32 = 1.0 / 11.313_708;
+    let key_head = value_head / 2;
+    let query = &mixed_qkv[key_head * HEAD_DIM..(key_head + 1) * HEAD_DIM];
+    let key = &mixed_qkv[(KEY_HEADS + key_head) * HEAD_DIM..(KEY_HEADS + key_head + 1) * HEAD_DIM];
+    let value = &mixed_qkv
+        [(2 * KEY_HEADS + value_head) * HEAD_DIM..(2 * KEY_HEADS + value_head + 1) * HEAD_DIM];
+    let query_norm = (query
+        .iter()
+        .map(|element| element.to_f32().powi(2))
+        .sum::<f32>()
+        + EPSILON)
+        .sqrt();
+    let key_norm = (key
+        .iter()
+        .map(|element| element.to_f32().powi(2))
+        .sum::<f32>()
+        + EPSILON)
+        .sqrt();
+    let gate = a.to_f32() + dt_bias;
+    let softplus = if gate <= 20.0 {
+        (1.0 + gate.exp()).ln()
+    } else {
+        gate
+    };
+    let decay = (-a_log.exp() * softplus).exp();
+    let beta = bf16::from_f32(1.0 / (1.0 + (-b.to_f32()).exp())).to_f32();
+    let normalized_key = (0..HEAD_DIM)
+        .map(|element| key[element].to_f32() / key_norm)
+        .collect::<Vec<_>>();
+    let mut output = [0.0f32; HEAD_DIM];
+    for value_element in 0..HEAD_DIM {
+        let state_row = &mut state[value_element * HEAD_DIM..(value_element + 1) * HEAD_DIM];
+        for state_element in state_row.iter_mut() {
+            *state_element *= decay;
+        }
+        let predicted = state_row
+            .iter()
+            .zip(&normalized_key)
+            .map(|(state, key)| state * key)
+            .sum::<f32>();
+        let delta = beta * (value[value_element].to_f32() - predicted);
+        for (state_element, key_element) in state_row.iter_mut().zip(&normalized_key) {
+            *state_element += delta * key_element;
+        }
+        output[value_element] = bf16::from_f32(
+            state_row
+                .iter()
+                .zip(query)
+                .map(|(state, query)| state * query.to_f32() / query_norm)
+                .sum::<f32>()
+                * QUERY_SCALE,
+        )
+        .to_f32();
+    }
+    output
 }
 
 fn probe_prefill_kkt(stream: &Arc<Stream>) -> Result<f32, ModelError> {
