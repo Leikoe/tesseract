@@ -131,6 +131,7 @@ cuTile compilation but includes prefill, decode, sampling, and HTTP handling.
 | --- | --- | ---: | ---: |
 | `8142294` | logical-row routing, 16×16×16 grouped tile | 1.134 s | 3.981 s |
 | `fefb38a` | logical-row routing, 16×64×16 grouped tile | 0.921 s | 3.421 s |
+| `69e9827` | stream-ordered MoE pipeline, one sync per layer | 0.780 s | 2.866 s |
 
 Both measured revisions returned the same eight-token continuation as SGLang:
 
@@ -140,8 +141,18 @@ Here's a thinking process:
 1
 ```
 
-The wider grouped tile improves these warm samples by 18.8% and 14.1%,
-respectively. The 32-token result is 2.67 ms per layer-forward end to end, or
-about 9.4 generated tokens/s after amortizing its one prefill forward. The
-remaining kernel profile points next to the dense FP8 and shared-expert NVFP4
-leaves, followed by reusable workspaces/CUDA graph capture for CPU launch gaps.
+The wider grouped tile improves the first two warm samples by 18.8% and 14.1%,
+respectively. Stream-ordering the complete MoE pipeline then improves them by a
+further 15.3% and 16.2%. The final 32-token result is 2.24 ms per
+layer-forward end to end, or about 11.2 generated tokens/s after amortizing its
+one prefill forward.
+
+The motivation for the stream-ordering change is direct profile evidence, not
+an assumed launch-cost model. The `8142294` trace contained 81,255
+`cuStreamSynchronize` calls, which occupied 52.6% of traced CUDA API time, plus
+45,420 `cuMemAllocAsync` calls. Quantized projections and routing now enqueue
+their allocation and kernel dependencies on the executor-owned stream; the
+final shared-expert combine synchronizes once per layer, so an executor ticket
+still cannot complete while device work is in flight. The next engine-level
+step is a reusable workspace and explicit stream execution scope, followed by
+decode graph capture. The remaining GPU-kernel target is the dense FP8 leaf.
