@@ -572,7 +572,7 @@ impl Program {
             self.checkpoint.final_norm.clone(),
             rows,
             self.config.rms_norm_eps,
-            stream,
+            &mut execution,
         )?;
         self.sample(final_hidden, batch, &mut execution)
     }
@@ -590,21 +590,21 @@ impl Program {
         let mut padded_sample_rows = batch.sample_rows.clone();
         padded_sample_rows.resize(sample_rows, batch.sample_rows[0]);
         let sample_rows_device = upload_u32(&padded_sample_rows, &self.stream, "Qwen sample rows")?;
-        let mut sampled_hidden = api::zeros::<bf16>(&[sample_rows, HIDDEN_SIZE])
-            .sync_on(&self.stream)
-            .map_err(|error| {
-                ModelError::Cuda(format!("allocate Qwen sampled hidden states: {error:?}"))
-            })?;
-        let (_, _, sampled_partition) = unsafe {
-            kernels::gather_rows_bf16(
-                final_hidden.device_pointer(),
-                &sample_rows_device,
-                (&mut sampled_hidden).partition([1, EMBEDDING_BLOCK]),
-            )
-        }
-        .generics(vec![HIDDEN_SIZE.to_string(), EMBEDDING_BLOCK.to_string()])
-        .sync_on(&self.stream)
-        .map_err(|error| ModelError::Cuda(format!("gather Qwen sample rows: {error:?}")))?;
+        let mut sampled_hidden = execution.enqueue(
+            api::zeros::<bf16>(&[sample_rows, HIDDEN_SIZE]),
+            "allocate Qwen sampled hidden states",
+        )?;
+        let (_, _, sampled_partition) = execution.enqueue(
+            unsafe {
+                kernels::gather_rows_bf16(
+                    final_hidden.device_pointer(),
+                    &sample_rows_device,
+                    (&mut sampled_hidden).partition([1, EMBEDDING_BLOCK]),
+                )
+            }
+            .generics(vec![HIDDEN_SIZE.to_string(), EMBEDDING_BLOCK.to_string()]),
+            "gather Qwen sample rows",
+        )?;
         drop(sampled_partition);
         let logits =
             self.checkpoint
@@ -612,40 +612,40 @@ impl Program {
                 .enqueue(Arc::new(sampled_hidden), sample_rows, execution)?;
         if batch.all_samples_greedy {
             let blocks = self.config.vocab_size.div_ceil(ARGMAX_BLOCK);
-            let mut block_max = api::zeros::<f32>(&[sample_rows, blocks])
-                .sync_on(&self.stream)
-                .map_err(|error| ModelError::Cuda(format!("allocate Qwen argmax: {error:?}")))?;
-            let mut block_index = api::zeros::<u32>(&[sample_rows, blocks])
-                .sync_on(&self.stream)
-                .map_err(|error| {
-                    ModelError::Cuda(format!("allocate Qwen argmax indices: {error:?}"))
-                })?;
-            let (_, block_max_partition, block_index_partition, _) =
+            let mut block_max = execution.enqueue(
+                api::zeros::<f32>(&[sample_rows, blocks]),
+                "allocate Qwen argmax",
+            )?;
+            let mut block_index = execution.enqueue(
+                api::zeros::<u32>(&[sample_rows, blocks]),
+                "allocate Qwen argmax indices",
+            )?;
+            let (_, block_max_partition, block_index_partition, _) = execution.enqueue(
                 kernels::argmax_blocks_batch_bf16(
                     Arc::new(logits),
                     (&mut block_max).partition([1, 1]),
                     (&mut block_index).partition([1, 1]),
                     self.config.vocab_size as i32,
                 )
-                .generics(vec![ARGMAX_BLOCK.to_string()])
-                .sync_on(&self.stream)
-                .map_err(|error| ModelError::Cuda(format!("execute Qwen argmax: {error:?}")))?;
+                .generics(vec![ARGMAX_BLOCK.to_string()]),
+                "execute Qwen argmax",
+            )?;
             drop(block_max_partition);
             drop(block_index_partition);
-            let mut sampled = api::zeros::<u32>(&[sample_rows])
-                .sync_on(&self.stream)
-                .map_err(|error| {
-                    ModelError::Cuda(format!("allocate Qwen sampled tokens: {error:?}"))
-                })?;
-            let (_, _, sampled_partition, _) = kernels::argmax_reduce_batch_bf16(
-                Arc::new(block_max),
-                Arc::new(block_index),
-                (&mut sampled).partition([1]),
-                blocks as i32,
-            )
-            .generics(vec![ARGMAX_REDUCE_BLOCK.to_string()])
-            .sync_on(&self.stream)
-            .map_err(|error| ModelError::Cuda(format!("reduce Qwen argmax: {error:?}")))?;
+            let mut sampled = execution.enqueue(
+                api::zeros::<u32>(&[sample_rows]),
+                "allocate Qwen sampled tokens",
+            )?;
+            let (_, _, sampled_partition, _) = execution.enqueue(
+                kernels::argmax_reduce_batch_bf16(
+                    Arc::new(block_max),
+                    Arc::new(block_index),
+                    (&mut sampled).partition([1]),
+                    blocks as i32,
+                )
+                .generics(vec![ARGMAX_REDUCE_BLOCK.to_string()]),
+                "reduce Qwen argmax",
+            )?;
             drop(sampled_partition);
             let mut sampled = sampled
                 .to_host_vec()
@@ -813,7 +813,6 @@ impl Layer {
         epsilon: f32,
         execution: &mut StreamExecution<'_>,
     ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
-        let stream = execution.stream().clone();
         let (attention_input, residual) = match update {
             Some(update) => gemma_add_rms_norm(
                 residual,
@@ -821,7 +820,7 @@ impl Layer {
                 self.input_norm.clone(),
                 rows,
                 epsilon,
-                &stream,
+                execution,
             )?,
             None => (
                 gemma_rms_norm(
@@ -829,7 +828,7 @@ impl Layer {
                     self.input_norm.clone(),
                     rows,
                     epsilon,
-                    &stream,
+                    execution,
                 )?,
                 residual,
             ),
@@ -854,7 +853,7 @@ impl Layer {
             self.post_attention_norm.clone(),
             rows,
             epsilon,
-            &stream,
+            execution,
         )?;
         let moe_output = self.moe.forward(moe_input, rows, logical_rows, execution)?;
         Ok((residual, Arc::new(moe_output)))
@@ -877,7 +876,6 @@ impl Layer {
         epsilon: f32,
         execution: &mut StreamExecution<'_>,
     ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
-        let stream = execution.stream().clone();
         let (attention_input, residual) = match update {
             Some(update) => gemma_add_rms_norm(
                 residual,
@@ -885,7 +883,7 @@ impl Layer {
                 self.input_norm.clone(),
                 rows,
                 epsilon,
-                &stream,
+                execution,
             )?,
             None => (
                 gemma_rms_norm(
@@ -893,7 +891,7 @@ impl Layer {
                     self.input_norm.clone(),
                     rows,
                     epsilon,
-                    &stream,
+                    execution,
                 )?,
                 residual,
             ),
@@ -922,7 +920,7 @@ impl Layer {
             self.post_attention_norm.clone(),
             rows,
             epsilon,
-            &stream,
+            execution,
         )?;
         let moe_output = self.moe.forward(moe_input, rows, logical_rows, execution)?;
         Ok((residual, Arc::new(moe_output)))
@@ -994,7 +992,7 @@ impl LinearAttention {
             rows,
             HIDDEN_SIZE,
             "Qwen GDN a projection",
-            &stream,
+            execution,
         )?;
         let b = bf16_gemm(
             self.input_b.clone(),
@@ -1003,7 +1001,7 @@ impl LinearAttention {
             rows,
             HIDDEN_SIZE,
             "Qwen GDN b projection",
-            &stream,
+            execution,
         )?;
         let recurrent = Arc::new(match prefill {
             Some(plan) => state.prefill(
@@ -1123,7 +1121,6 @@ impl Moe {
             return Err(ModelError::Cuda("invalid Qwen MoE input geometry".into()));
         }
 
-        let stream = execution.stream().clone();
         let router_logits = bf16_gemm(
             self.router.clone(),
             hidden.clone(),
@@ -1131,7 +1128,7 @@ impl Moe {
             rows,
             HIDDEN_SIZE,
             "Qwen routed-expert logits",
-            &stream,
+            execution,
         )?;
         let routing = RoutingPlan::build(router_logits, logical_rows, execution)?;
         let dispatched = routing.dispatch(hidden.clone(), logical_rows, HIDDEN_SIZE, execution)?;
@@ -1153,7 +1150,7 @@ impl Moe {
             Arc::new(routed_up),
             dispatched_rows,
             self.routed_gate.output_size(),
-            &stream,
+            execution,
         )?;
         let routed_down = self.routed_down.enqueue_device_plan(
             Arc::new(routed_activated),
@@ -1176,7 +1173,7 @@ impl Moe {
             Arc::new(shared_up),
             rows,
             self.shared_gate.output_size(),
-            &stream,
+            execution,
         )?;
         let shared = self
             .shared_down
@@ -1188,7 +1185,7 @@ impl Moe {
             rows,
             HIDDEN_SIZE,
             "Qwen shared-expert gate",
-            &stream,
+            execution,
         )?;
         moe_backend::combine_shared(
             Arc::new(routed),
@@ -1207,17 +1204,18 @@ fn bf16_gemm(
     output_size: usize,
     rows: usize,
     input_size: usize,
-    operation: &'static str,
-    stream: &Arc<Stream>,
+    operation_name: &'static str,
+    execution: &mut StreamExecution<'_>,
 ) -> Result<Bf16Tensor, ModelError> {
-    let output = api::zeros::<bf16>(&[rows, output_size])
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("allocate {operation} output: {error:?}")))?;
-    let output = cublas::gemm_bf16(weight, input, output, output_size, rows, input_size)
-        .map_err(|error| ModelError::Cuda(format!("prepare {operation}: {error}")))?
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("schedule {operation}: {error:?}")))?
-        .map_err(|error| ModelError::Cuda(format!("execute {operation}: {error}")))?;
+    let output = execution.enqueue(
+        api::zeros::<bf16>(&[rows, output_size]),
+        "allocate Qwen BF16 GEMM output",
+    )?;
+    let operation = cublas::gemm_bf16(weight, input, output, output_size, rows, input_size)
+        .map_err(|error| ModelError::Cuda(format!("prepare {operation_name}: {error}")))?;
+    let output = execution
+        .enqueue(operation, "execute Qwen BF16 GEMM")?
+        .map_err(|error| ModelError::Cuda(format!("execute {operation_name}: {error}")))?;
     Ok(Arc::new(output))
 }
 
@@ -1226,7 +1224,7 @@ fn silu_mul(
     up: Bf16Tensor,
     rows: usize,
     width: usize,
-    stream: &Arc<Stream>,
+    execution: &mut StreamExecution<'_>,
 ) -> Result<Tensor<bf16>, ModelError> {
     const BLOCK: usize = 256;
     if width == 0
@@ -1236,14 +1234,15 @@ fn silu_mul(
     {
         return Err(ModelError::Cuda("invalid Qwen SiLU gate geometry".into()));
     }
-    let mut output = api::zeros::<bf16>(&[rows, width])
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("allocate Qwen SiLU output: {error:?}")))?;
-    let (_, _, output_partition) =
+    let mut output = execution.enqueue(
+        api::zeros::<bf16>(&[rows, width]),
+        "allocate Qwen SiLU output",
+    )?;
+    let (_, _, output_partition) = execution.enqueue(
         kernels::silu_mul_bf16(gate, up, (&mut output).partition([1, BLOCK]))
-            .generics(vec![BLOCK.to_string()])
-            .sync_on(stream)
-            .map_err(|error| ModelError::Cuda(format!("execute Qwen SiLU gate: {error:?}")))?;
+            .generics(vec![BLOCK.to_string()]),
+        "execute Qwen SiLU gate",
+    )?;
     drop(output_partition);
     Ok(output)
 }
@@ -1253,7 +1252,7 @@ fn gemma_rms_norm(
     weight_delta: Bf16Tensor,
     rows: usize,
     epsilon: f32,
-    stream: &Arc<Stream>,
+    execution: &mut StreamExecution<'_>,
 ) -> Result<Bf16Tensor, ModelError> {
     const HIDDEN_SIZE: usize = 2048;
     const BLOCK: usize = 256;
@@ -1264,20 +1263,22 @@ fn gemma_rms_norm(
             "invalid Qwen Gemma RMSNorm geometry".into(),
         ));
     }
-    let mut output = api::zeros::<bf16>(&[rows, HIDDEN_SIZE])
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("allocate Qwen normalized output: {error:?}")))?;
-    let (_, _, output_partition, _) = unsafe {
-        kernels::gemma_rms_norm_bf16(
-            input,
-            weight_delta,
-            (&mut output).partition([1, HIDDEN_SIZE]),
-            epsilon,
-        )
-    }
-    .generics(vec![HIDDEN_SIZE.to_string(), BLOCK.to_string()])
-    .sync_on(stream)
-    .map_err(|error| ModelError::Cuda(format!("execute Qwen Gemma RMSNorm: {error:?}")))?;
+    let mut output = execution.enqueue(
+        api::zeros::<bf16>(&[rows, HIDDEN_SIZE]),
+        "allocate Qwen normalized output",
+    )?;
+    let (_, _, output_partition, _) = execution.enqueue(
+        unsafe {
+            kernels::gemma_rms_norm_bf16(
+                input,
+                weight_delta,
+                (&mut output).partition([1, HIDDEN_SIZE]),
+                epsilon,
+            )
+        }
+        .generics(vec![HIDDEN_SIZE.to_string(), BLOCK.to_string()]),
+        "execute Qwen Gemma RMSNorm",
+    )?;
     drop(output_partition);
     Ok(Arc::new(output))
 }
@@ -1288,7 +1289,7 @@ fn gemma_add_rms_norm(
     weight_delta: Bf16Tensor,
     rows: usize,
     epsilon: f32,
-    stream: &Arc<Stream>,
+    execution: &mut StreamExecution<'_>,
 ) -> Result<(Bf16Tensor, Bf16Tensor), ModelError> {
     const HIDDEN_SIZE: usize = 2048;
     const BLOCK: usize = 256;
@@ -1300,27 +1301,28 @@ fn gemma_add_rms_norm(
             "invalid Qwen fused add Gemma RMSNorm geometry".into(),
         ));
     }
-    let mut normalized = api::zeros::<bf16>(&[rows, HIDDEN_SIZE])
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("allocate Qwen normalized output: {error:?}")))?;
-    let mut combined = api::zeros::<bf16>(&[rows, HIDDEN_SIZE])
-        .sync_on(stream)
-        .map_err(|error| ModelError::Cuda(format!("allocate Qwen residual output: {error:?}")))?;
-    let (_, _, _, normalized_partition, combined_partition, _) = unsafe {
-        kernels::gemma_add_rms_norm_bf16(
-            residual,
-            update,
-            weight_delta,
-            (&mut normalized).partition([1, HIDDEN_SIZE]),
-            (&mut combined).partition([1, HIDDEN_SIZE]),
-            epsilon,
-        )
-    }
-    .generics(vec![HIDDEN_SIZE.to_string(), BLOCK.to_string()])
-    .sync_on(stream)
-    .map_err(|error| {
-        ModelError::Cuda(format!("execute Qwen fused add Gemma RMSNorm: {error:?}"))
-    })?;
+    let mut normalized = execution.enqueue(
+        api::zeros::<bf16>(&[rows, HIDDEN_SIZE]),
+        "allocate Qwen normalized output",
+    )?;
+    let mut combined = execution.enqueue(
+        api::zeros::<bf16>(&[rows, HIDDEN_SIZE]),
+        "allocate Qwen residual output",
+    )?;
+    let (_, _, _, normalized_partition, combined_partition, _) = execution.enqueue(
+        unsafe {
+            kernels::gemma_add_rms_norm_bf16(
+                residual,
+                update,
+                weight_delta,
+                (&mut normalized).partition([1, HIDDEN_SIZE]),
+                (&mut combined).partition([1, HIDDEN_SIZE]),
+                epsilon,
+            )
+        }
+        .generics(vec![HIDDEN_SIZE.to_string(), BLOCK.to_string()]),
+        "execute Qwen fused add Gemma RMSNorm",
+    )?;
     drop(normalized_partition);
     drop(combined_partition);
     Ok((Arc::new(normalized), Arc::new(combined)))
