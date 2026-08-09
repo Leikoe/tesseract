@@ -27,6 +27,7 @@ use super::{
     linear::{ExpertProjection, Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear},
     moe::{self as moe_backend, RoutingPlan},
     qwen_attention::{AttentionInput, QwenFlatKvAttention},
+    workspace::ExecutionWorkspace,
 };
 
 type Bf16Tensor = Arc<Tensor<bf16>>;
@@ -91,6 +92,7 @@ struct Program {
     kv_capacity: usize,
     recurrent_capacity: usize,
     max_batch_tokens: usize,
+    workspace: ExecutionWorkspace,
 }
 
 struct PaddedBatch {
@@ -447,6 +449,12 @@ impl Program {
         }
         let state_schema = StateSchema::try_hybrid(kv_capacity, max_running)
             .map_err(|error| ModelError::InvalidConfig(error.to_string()))?;
+        const MIN_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
+        const MAX_WORKSPACE_BYTES: usize = 1024 * 1024 * 1024;
+        const WORKSPACE_BYTES_PER_TOKEN: usize = 2 * 1024 * 1024;
+        let workspace_bytes = max_batch_tokens
+            .saturating_mul(WORKSPACE_BYTES_PER_TOKEN)
+            .clamp(MIN_WORKSPACE_BYTES, MAX_WORKSPACE_BYTES);
         Ok(Self {
             model: artifact.model,
             config: artifact.config,
@@ -458,6 +466,7 @@ impl Program {
             kv_capacity,
             recurrent_capacity: max_running,
             max_batch_tokens,
+            workspace: ExecutionWorkspace::new(workspace_bytes),
         })
     }
 
@@ -574,11 +583,20 @@ impl Program {
             self.config.rms_norm_eps,
             &mut execution,
         )?;
-        self.sample(final_hidden, batch, &mut execution)
+        Self::sample(
+            &self.checkpoint,
+            &self.config,
+            &mut self.workspace,
+            final_hidden,
+            batch,
+            &mut execution,
+        )
     }
 
     fn sample(
-        &self,
+        checkpoint: &Checkpoint,
+        config: &Config,
+        workspace: &mut ExecutionWorkspace,
         final_hidden: Bf16Tensor,
         batch: &CudaBatch,
         execution: &mut StreamExecution<'_>,
@@ -589,9 +607,12 @@ impl Program {
         let sample_rows = samples.div_ceil(ROW_ALIGNMENT) * ROW_ALIGNMENT;
         let mut padded_sample_rows = batch.sample_rows.clone();
         padded_sample_rows.resize(sample_rows, batch.sample_rows[0]);
-        let sample_rows_device = upload_u32(&padded_sample_rows, &self.stream, "Qwen sample rows")?;
-        let mut sampled_hidden = execution.enqueue(
-            api::zeros::<bf16>(&[sample_rows, HIDDEN_SIZE]),
+        let sample_rows_device =
+            upload_u32(&padded_sample_rows, execution.stream(), "Qwen sample rows")?;
+        execution.mark_synchronized();
+        let mut sampled_hidden = workspace.take_bf16(
+            &[sample_rows, HIDDEN_SIZE],
+            execution,
             "allocate Qwen sampled hidden states",
         )?;
         let (_, _, sampled_partition) = execution.enqueue(
@@ -606,18 +627,17 @@ impl Program {
             "gather Qwen sample rows",
         )?;
         drop(sampled_partition);
-        let logits =
-            self.checkpoint
-                .lm_head
-                .enqueue(Arc::new(sampled_hidden), sample_rows, execution)?;
+        let sampled_hidden = Arc::new(sampled_hidden);
+        let logits = checkpoint
+            .lm_head
+            .enqueue(sampled_hidden.clone(), sample_rows, execution)?;
         if batch.all_samples_greedy {
-            let blocks = self.config.vocab_size.div_ceil(ARGMAX_BLOCK);
-            let mut block_max = execution.enqueue(
-                api::zeros::<f32>(&[sample_rows, blocks]),
-                "allocate Qwen argmax",
-            )?;
-            let mut block_index = execution.enqueue(
-                api::zeros::<u32>(&[sample_rows, blocks]),
+            let blocks = config.vocab_size.div_ceil(ARGMAX_BLOCK);
+            let mut block_max =
+                workspace.take_f32(&[sample_rows, blocks], execution, "allocate Qwen argmax")?;
+            let mut block_index = workspace.take_u32(
+                &[sample_rows, blocks],
+                execution,
                 "allocate Qwen argmax indices",
             )?;
             let (_, block_max_partition, block_index_partition, _) = execution.enqueue(
@@ -625,21 +645,21 @@ impl Program {
                     Arc::new(logits),
                     (&mut block_max).partition([1, 1]),
                     (&mut block_index).partition([1, 1]),
-                    self.config.vocab_size as i32,
+                    config.vocab_size as i32,
                 )
                 .generics(vec![ARGMAX_BLOCK.to_string()]),
                 "execute Qwen argmax",
             )?;
             drop(block_max_partition);
             drop(block_index_partition);
-            let mut sampled = execution.enqueue(
-                api::zeros::<u32>(&[sample_rows]),
-                "allocate Qwen sampled tokens",
-            )?;
+            let block_max = Arc::new(block_max);
+            let block_index = Arc::new(block_index);
+            let mut sampled =
+                workspace.take_u32(&[sample_rows], execution, "allocate Qwen sampled tokens")?;
             let (_, _, sampled_partition, _) = execution.enqueue(
                 kernels::argmax_reduce_batch_bf16(
-                    Arc::new(block_max),
-                    Arc::new(block_index),
+                    block_max.clone(),
+                    block_index.clone(),
                     (&mut sampled).partition([1]),
                     blocks as i32,
                 )
@@ -647,28 +667,43 @@ impl Program {
                 "reduce Qwen argmax",
             )?;
             drop(sampled_partition);
-            let mut sampled = sampled
+            let sampled = Arc::new(sampled);
+            let mut sampled_host = sampled
+                .clone()
                 .to_host_vec()
-                .sync_on(&self.stream)
+                .sync_on(execution.stream())
                 .map_err(|error| {
                     ModelError::Cuda(format!("download Qwen sampled tokens: {error:?}"))
                 })?;
             execution.mark_synchronized();
-            sampled.truncate(samples);
+            workspace.retire_shared_bf16(sampled_hidden, "sampled hidden states")?;
+            workspace.retire_f32(Arc::try_unwrap(block_max).map_err(|_| {
+                ModelError::Cuda("Qwen argmax maxima still have host aliases".into())
+            })?);
+            workspace.retire_u32(Arc::try_unwrap(block_index).map_err(|_| {
+                ModelError::Cuda("Qwen argmax indices still have host aliases".into())
+            })?);
+            workspace.retire_u32(Arc::try_unwrap(sampled).map_err(|_| {
+                ModelError::Cuda("Qwen sampled tokens still have host aliases".into())
+            })?);
+            workspace.reclaim(execution)?;
+            sampled_host.truncate(samples);
             return Ok(ProgramOutput::Tokens(
-                sampled.into_iter().map(TokenId::new).collect(),
+                sampled_host.into_iter().map(TokenId::new).collect(),
             ));
         }
         let logits = logits
             .to_host_vec()
-            .sync_on(&self.stream)
+            .sync_on(execution.stream())
             .map_err(|error| ModelError::Cuda(format!("download Qwen logits: {error:?}")))?;
         execution.mark_synchronized();
+        workspace.retire_shared_bf16(sampled_hidden, "sampled hidden states")?;
+        workspace.reclaim(execution)?;
         let mut logits = logits.into_iter().map(bf16::to_f32).collect::<Vec<_>>();
-        logits.truncate(samples * self.config.vocab_size);
+        logits.truncate(samples * config.vocab_size);
         Ok(ProgramOutput::HostLogits {
             values: logits,
-            vocab_size: self.config.vocab_size,
+            vocab_size: config.vocab_size,
         })
     }
 }

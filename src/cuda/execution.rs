@@ -29,6 +29,10 @@ impl<'a> StreamExecution<'a> {
         self.stream
     }
 
+    pub(crate) const fn is_synchronized(&self) -> bool {
+        self.synchronized
+    }
+
     pub(crate) fn mark_pending(&mut self) {
         self.synchronized = false;
     }
