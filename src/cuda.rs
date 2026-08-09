@@ -180,10 +180,10 @@ pub fn probe_nvfp4_scaled_mma(device_id: usize) -> Result<Nvfp4ScaledMmaReport, 
             .sync_on(&stream)
             .map_err(|error| nvfp4_kernel_error("upload rhs scales", error))?
             .into();
-    let out = api::zeros::<f32>(&[TILE, TILE])
+    let mut out_tensor = api::zeros::<f32>(&[TILE, TILE])
         .sync_on(&stream)
-        .map_err(|error| nvfp4_kernel_error("allocate output", error))?
-        .partition([TILE, TILE]);
+        .map_err(|error| nvfp4_kernel_error("allocate output", error))?;
+    let out = (&mut out_tensor).partition([TILE, TILE]);
 
     let launch = scaled_mma(out, lhs, rhs, lhs_scales, rhs_scales)
         .generics(vec![
@@ -205,8 +205,9 @@ pub fn probe_nvfp4_scaled_mma(device_id: usize) -> Result<Nvfp4ScaledMmaReport, 
             });
         }
     };
+    drop(out);
 
-    let host: Vec<f32> = Arc::new(out.unpartition())
+    let host: Vec<f32> = out_tensor
         .to_host_vec()
         .sync_on(&stream)
         .map_err(|error| nvfp4_kernel_error("copy output to host", error))?;
