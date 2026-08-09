@@ -28,6 +28,8 @@ const TILE_M: usize = 16;
 const TILE_N: usize = 16;
 const DENSE_TILE_N: usize = 64;
 const GROUP_K: usize = 16;
+const GROUPED_SMALL_TILE_M: usize = 16;
+const GROUPED_LARGE_TILE_M: usize = 64;
 const GROUPED_TILE_N: usize = 64;
 const GROUPED_TILE_K: usize = GROUP_K;
 
@@ -115,8 +117,8 @@ mod kernels {
     /// no output tile crosses an expert boundary and no per-expert launch is
     /// required.
     #[cutile::entry(unchecked_accesses = false)]
-    fn grouped_nvfp4_w4a16<const K_TILES: i32>(
-        mut output: MappedPartitionMut<bf16, { [16, 64] }, { [8, 1] }>,
+    fn grouped_nvfp4_w4a16<const K_TILES: i32, const ROW_TILE: i32>(
+        mut output: MappedPartitionMut<bf16, { [ROW_TILE, 64] }, { [8, 1] }>,
         dispatched: &Tensor<bf16, { [-1, -1] }>,
         expert_by_row_tile: &Tensor<i32, { [-1] }>,
         packed_weight: &Tensor<u8, { [-1, -1, -1] }>,
@@ -149,10 +151,11 @@ mod kernels {
                 .reshape(const_shape![1, 1])
                 .broadcast(const_shape![64, 16]);
             const ZERO_F32: f32 = 0.0;
-            let mut accumulator = broadcast_scalar(ZERO_F32, const_shape![16, 64]);
+            let mut accumulator = broadcast_scalar(ZERO_F32, const_shape![ROW_TILE, 64]);
 
             for k_tile in k_tiles {
-                let activation = dispatched.load_tile(const_shape![16, 16], [row_tile, k_tile]);
+                let activation =
+                    dispatched.load_tile(const_shape![ROW_TILE, 16], [row_tile, k_tile]);
                 let packed: Tile<i32, { [1, 64, 8] }> = exti(
                     packed_weight.load_tile(const_shape![1, 64, 8], [expert, column_tile, k_tile]),
                 );
@@ -171,7 +174,8 @@ mod kernels {
                     ftof(weight * scale * global, rounding::NearestEven);
                 accumulator = mma(activation, weight.transpose(), accumulator);
             }
-            let output_tile: Tile<bf16, { [16, 64] }> = ftof(accumulator, rounding::NearestEven);
+            let output_tile: Tile<bf16, { [ROW_TILE, 64] }> =
+                ftof(accumulator, rounding::NearestEven);
             output.store(output_tile, out_idx);
         }
     }
@@ -181,8 +185,8 @@ mod kernels {
     /// register-resident SwiGLU epilogue. Only the activated BF16 down-input
     /// reaches global memory.
     #[cutile::entry(unchecked_accesses = false)]
-    fn grouped_nvfp4_w4a16_silu_mul<const K_TILES: i32>(
-        mut output: MappedPartitionMut<bf16, { [16, 64] }, { [8, 1] }>,
+    fn grouped_nvfp4_w4a16_silu_mul<const K_TILES: i32, const ROW_TILE: i32>(
+        mut output: MappedPartitionMut<bf16, { [ROW_TILE, 64] }, { [8, 1] }>,
         dispatched: &Tensor<bf16, { [-1, -1] }>,
         expert_by_row_tile: &Tensor<i32, { [-1] }>,
         gate_packed_weight: &Tensor<u8, { [-1, -1, -1] }>,
@@ -219,11 +223,12 @@ mod kernels {
                 .reshape(const_shape![1, 1])
                 .broadcast(const_shape![64, 16]);
             const ZERO_F32: f32 = 0.0;
-            let mut gate_accumulator = broadcast_scalar(ZERO_F32, const_shape![16, 64]);
-            let mut up_accumulator = broadcast_scalar(ZERO_F32, const_shape![16, 64]);
+            let mut gate_accumulator = broadcast_scalar(ZERO_F32, const_shape![ROW_TILE, 64]);
+            let mut up_accumulator = broadcast_scalar(ZERO_F32, const_shape![ROW_TILE, 64]);
 
             for k_tile in k_tiles {
-                let activation = dispatched.load_tile(const_shape![16, 16], [row_tile, k_tile]);
+                let activation =
+                    dispatched.load_tile(const_shape![ROW_TILE, 16], [row_tile, k_tile]);
 
                 let gate_packed: Tile<i32, { [1, 64, 8] }> = exti(
                     gate_packed_weight
@@ -275,14 +280,17 @@ mod kernels {
             }
 
             const ONE_F32: f32 = 1.0;
-            let one = broadcast_scalar(ONE_F32, const_shape![16, 64]);
+            let one = broadcast_scalar(ONE_F32, const_shape![ROW_TILE, 64]);
             let activated = gate_accumulator
                 * true_div(
                     one,
-                    one + exp(broadcast_scalar(ZERO_F32, const_shape![16, 64]) - gate_accumulator),
+                    one + exp(
+                        broadcast_scalar(ZERO_F32, const_shape![ROW_TILE, 64]) - gate_accumulator
+                    ),
                 )
                 * up_accumulator;
-            let output_tile: Tile<bf16, { [16, 64] }> = ftof(activated, rounding::NearestEven);
+            let output_tile: Tile<bf16, { [ROW_TILE, 64] }> =
+                ftof(activated, rounding::NearestEven);
             output.store(output_tile, out_idx);
         }
     }
@@ -982,8 +990,9 @@ impl GroupedNvfp4W4A16 {
         self.device_bytes
     }
 
-    /// `expert_by_row_tile` has one entry per 16-row dispatched tile. Routing
-    /// must pad each expert segment to that boundary before calling this leaf.
+    /// Host-supplied expert maps use the small 16-row dispatch geometry. The
+    /// production device-resident path additionally supports 64-row prefill
+    /// tiles.
     pub(crate) fn enqueue(
         &self,
         dispatched: Arc<Tensor<bf16>>,
@@ -1038,7 +1047,10 @@ impl GroupedNvfp4W4A16 {
                 self.weight_scale.clone(),
                 self.weight_global_scale.clone(),
             )
-            .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()]),
+            .generics(vec![
+                (self.input_size / GROUPED_TILE_K).to_string(),
+                GROUPED_SMALL_TILE_M.to_string(),
+            ]),
             "execute grouped NVFP4 W4A16",
         )?;
         Ok(output)
@@ -1052,39 +1064,70 @@ impl GroupedNvfp4W4A16 {
         mut output: Tensor<bf16>,
         execution: &mut StreamExecution<'_>,
     ) -> Result<Tensor<bf16>, ModelError> {
+        let map_rows = expert_by_row_tile
+            .shape()
+            .first()
+            .copied()
+            .and_then(|rows| usize::try_from(rows).ok())
+            .ok_or_else(|| ModelError::Cuda("invalid grouped expert row-map shape".into()))?;
+        let tile_rows = grouped_tile_rows(rows, map_rows)?;
         if rows == 0
-            || !rows.is_multiple_of(TILE_M)
             || dispatched.shape() != [rows as i32, self.input_size as i32]
-            || expert_by_row_tile.shape() != [(rows / TILE_M) as i32]
+            || expert_by_row_tile.shape() != [map_rows as i32]
             || output.shape() != [rows as i32, self.output_size as i32]
         {
             return Err(ModelError::Cuda(
                 "invalid device-resident grouped NVFP4 dispatch/output plan".into(),
             ));
         }
-        let logical_tiles = (rows / TILE_M)
+        let logical_tiles = map_rows
             .checked_mul(self.output_size / GROUPED_TILE_N)
             .ok_or_else(|| ModelError::Cuda("grouped output tile count overflowed".into()))?;
         let workers = logical_tiles.min(device_sm_count(execution.stream())?);
-        let output_partition = (&mut output).partition([TILE_M, GROUPED_TILE_N]).map(
-            [8, 1],
-            u32::try_from(workers).map_err(|_| {
-                ModelError::Cuda("persistent grouped worker count overflowed u32".into())
-            })?,
-        );
-        let (output_partition, ..) = execution.enqueue(
-            grouped_nvfp4_w4a16(
-                output_partition,
-                dispatched,
-                expert_by_row_tile,
-                self.packed_weight.clone(),
-                self.weight_scale.clone(),
-                self.weight_global_scale.clone(),
-            )
-            .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()]),
-            "execute grouped NVFP4 W4A16",
-        )?;
-        drop(output_partition);
+        let workers = u32::try_from(workers).map_err(|_| {
+            ModelError::Cuda("persistent grouped worker count overflowed u32".into())
+        })?;
+        if tile_rows == GROUPED_LARGE_TILE_M {
+            let output_partition = (&mut output)
+                .partition([GROUPED_LARGE_TILE_M, GROUPED_TILE_N])
+                .map([8, 1], workers);
+            let (output_partition, ..) = execution.enqueue(
+                grouped_nvfp4_w4a16(
+                    output_partition,
+                    dispatched,
+                    expert_by_row_tile,
+                    self.packed_weight.clone(),
+                    self.weight_scale.clone(),
+                    self.weight_global_scale.clone(),
+                )
+                .generics(vec![
+                    (self.input_size / GROUPED_TILE_K).to_string(),
+                    GROUPED_LARGE_TILE_M.to_string(),
+                ]),
+                "execute large-tile grouped NVFP4 W4A16",
+            )?;
+            drop(output_partition);
+        } else {
+            let output_partition = (&mut output)
+                .partition([GROUPED_SMALL_TILE_M, GROUPED_TILE_N])
+                .map([8, 1], workers);
+            let (output_partition, ..) = execution.enqueue(
+                grouped_nvfp4_w4a16(
+                    output_partition,
+                    dispatched,
+                    expert_by_row_tile,
+                    self.packed_weight.clone(),
+                    self.weight_scale.clone(),
+                    self.weight_global_scale.clone(),
+                )
+                .generics(vec![
+                    (self.input_size / GROUPED_TILE_K).to_string(),
+                    GROUPED_SMALL_TILE_M.to_string(),
+                ]),
+                "execute small-tile grouped NVFP4 W4A16",
+            )?;
+            drop(output_partition);
+        }
         Ok(output)
     }
 
@@ -1107,43 +1150,91 @@ impl GroupedNvfp4W4A16 {
                 "fused grouped NVFP4 gate/up banks have incompatible geometry".into(),
             ));
         }
+        let map_rows = expert_by_row_tile
+            .shape()
+            .first()
+            .copied()
+            .and_then(|rows| usize::try_from(rows).ok())
+            .ok_or_else(|| ModelError::Cuda("invalid fused expert row-map shape".into()))?;
+        let tile_rows = grouped_tile_rows(rows, map_rows)?;
         if rows == 0
-            || !rows.is_multiple_of(TILE_M)
             || dispatched.shape() != [rows as i32, self.input_size as i32]
-            || expert_by_row_tile.shape() != [(rows / TILE_M) as i32]
+            || expert_by_row_tile.shape() != [map_rows as i32]
             || output.shape() != [rows as i32, self.output_size as i32]
         {
             return Err(ModelError::Cuda(
                 "invalid fused grouped NVFP4 gate/up dispatch/output plan".into(),
             ));
         }
-        let logical_tiles = (rows / TILE_M)
+        let logical_tiles = map_rows
             .checked_mul(self.output_size / GROUPED_TILE_N)
             .ok_or_else(|| ModelError::Cuda("grouped output tile count overflowed".into()))?;
         let workers = logical_tiles.min(device_sm_count(execution.stream())?);
-        let output_partition = (&mut output).partition([TILE_M, GROUPED_TILE_N]).map(
-            [8, 1],
-            u32::try_from(workers).map_err(|_| {
-                ModelError::Cuda("persistent grouped worker count overflowed u32".into())
-            })?,
-        );
-        let (output_partition, ..) = execution.enqueue(
-            grouped_nvfp4_w4a16_silu_mul(
-                output_partition,
-                dispatched,
-                expert_by_row_tile,
-                self.packed_weight.clone(),
-                self.weight_scale.clone(),
-                self.weight_global_scale.clone(),
-                up.packed_weight.clone(),
-                up.weight_scale.clone(),
-                up.weight_global_scale.clone(),
-            )
-            .generics(vec![(self.input_size / GROUPED_TILE_K).to_string()]),
-            "execute fused grouped NVFP4 gate/up SwiGLU",
-        )?;
-        drop(output_partition);
+        let workers = u32::try_from(workers).map_err(|_| {
+            ModelError::Cuda("persistent grouped worker count overflowed u32".into())
+        })?;
+        if tile_rows == GROUPED_LARGE_TILE_M {
+            let output_partition = (&mut output)
+                .partition([GROUPED_LARGE_TILE_M, GROUPED_TILE_N])
+                .map([8, 1], workers);
+            let (output_partition, ..) = execution.enqueue(
+                grouped_nvfp4_w4a16_silu_mul(
+                    output_partition,
+                    dispatched,
+                    expert_by_row_tile,
+                    self.packed_weight.clone(),
+                    self.weight_scale.clone(),
+                    self.weight_global_scale.clone(),
+                    up.packed_weight.clone(),
+                    up.weight_scale.clone(),
+                    up.weight_global_scale.clone(),
+                )
+                .generics(vec![
+                    (self.input_size / GROUPED_TILE_K).to_string(),
+                    GROUPED_LARGE_TILE_M.to_string(),
+                ]),
+                "execute large-tile fused grouped NVFP4 gate/up SwiGLU",
+            )?;
+            drop(output_partition);
+        } else {
+            let output_partition = (&mut output)
+                .partition([GROUPED_SMALL_TILE_M, GROUPED_TILE_N])
+                .map([8, 1], workers);
+            let (output_partition, ..) = execution.enqueue(
+                grouped_nvfp4_w4a16_silu_mul(
+                    output_partition,
+                    dispatched,
+                    expert_by_row_tile,
+                    self.packed_weight.clone(),
+                    self.weight_scale.clone(),
+                    self.weight_global_scale.clone(),
+                    up.packed_weight.clone(),
+                    up.weight_scale.clone(),
+                    up.weight_global_scale.clone(),
+                )
+                .generics(vec![
+                    (self.input_size / GROUPED_TILE_K).to_string(),
+                    GROUPED_SMALL_TILE_M.to_string(),
+                ]),
+                "execute small-tile fused grouped NVFP4 gate/up SwiGLU",
+            )?;
+            drop(output_partition);
+        }
         Ok(output)
+    }
+}
+
+fn grouped_tile_rows(rows: usize, map_rows: usize) -> Result<usize, ModelError> {
+    let tile_rows = rows
+        .checked_div(map_rows)
+        .filter(|tile_rows| rows % map_rows == 0)
+        .ok_or_else(|| ModelError::Cuda("invalid grouped expert row-map geometry".into()))?;
+    if matches!(tile_rows, GROUPED_SMALL_TILE_M | GROUPED_LARGE_TILE_M) {
+        Ok(tile_rows)
+    } else {
+        Err(ModelError::Cuda(format!(
+            "unsupported grouped row tile {tile_rows}"
+        )))
     }
 }
 
@@ -1419,7 +1510,7 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
             "grouped NVFP4 device-byte accounting mismatch".into(),
         ));
     }
-    let rows = TILE_M * EXPERTS;
+    let rows = GROUPED_LARGE_TILE_M * EXPERTS;
     let input_host = (0..rows * input_size)
         .map(|index| bf16::from_f32((index % 9) as f32 - 4.0))
         .collect::<Vec<_>>();
@@ -1430,14 +1521,24 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         .map_err(|error| ModelError::Cuda(format!("reshape grouped test input: {error:?}")))?;
     let expert_by_row_tile = [1i32, 0i32];
     let input = Arc::new(input);
-    let output =
-        Arc::new(grouped.enqueue(input.clone(), rows, &expert_by_row_tile, &mut execution)?);
     let expert_by_row_tile_device =
         api::copy_host_vec_to_device(&Arc::new(expert_by_row_tile.to_vec()))
             .sync_on(stream)
             .map_err(|error| {
                 ModelError::Cuda(format!("upload fused grouped expert map: {error:?}"))
             })?;
+    let expert_by_row_tile_device = Arc::new(expert_by_row_tile_device);
+    let output_buffer = execution.enqueue(
+        api::zeros::<bf16>(&[rows, output_size]),
+        "allocate large-tile grouped probe output",
+    )?;
+    let output = Arc::new(grouped.enqueue_device_plan_into(
+        input.clone(),
+        rows,
+        expert_by_row_tile_device.clone(),
+        output_buffer,
+        &mut execution,
+    )?);
     let fused_output = execution.enqueue(
         api::zeros::<bf16>(&[rows, output_size]),
         "allocate fused grouped probe output",
@@ -1446,7 +1547,7 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         &up_grouped,
         input,
         rows,
-        Arc::new(expert_by_row_tile_device),
+        expert_by_row_tile_device,
         fused_output,
         &mut execution,
     )?);
@@ -1462,7 +1563,7 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
 
     let mut max_abs_error = 0.0f32;
     for row in 0..rows {
-        let expert = expert_by_row_tile[row / TILE_M] as usize;
+        let expert = expert_by_row_tile[row / GROUPED_LARGE_TILE_M] as usize;
         for column in 0..output_size {
             let scale_index = (expert * output_size + column) * (input_size / GROUP_K);
             let scale = decode_e4m3fn(scale_bytes[scale_index]) * global_scales[expert];

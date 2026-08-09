@@ -19,6 +19,8 @@ use crate::{
 const TOP_K: usize = 8;
 const EXPERTS: usize = 256;
 const TILE_M: usize = 16;
+const LARGE_PREFILL_TILE_M: usize = 64;
+const LARGE_PREFILL_ROWS: usize = 1024;
 
 #[cutile::module]
 mod kernels {
@@ -97,17 +99,15 @@ mod kernels {
     }
 
     #[cutile::entry()]
-    fn aligned_expert_prefix(
+    fn aligned_expert_prefix<const ALIGNMENT: i32>(
         counts: &Tensor<i32, { [256] }>,
         starts: &mut Tensor<i32, { [256] }>,
         cursors: &mut Tensor<i32, { [256] }>,
     ) {
-        const ALIGNMENT_MINUS_ONE: i32 = 15;
-        const ALIGNMENT: i32 = 16;
         const SCAN_IDENTITY: i32 = 0;
         let counts = counts.load_tile(const_shape![256], [0i32]);
         let alignment_minus_one: Tile<i32, { [256] }> =
-            broadcast_scalar(ALIGNMENT_MINUS_ONE, const_shape![256]);
+            broadcast_scalar(ALIGNMENT - 1i32, const_shape![256]);
         let alignment: Tile<i32, { [256] }> = broadcast_scalar(ALIGNMENT, const_shape![256]);
         let padded = ((counts + alignment_minus_one) / alignment) * alignment;
         let inclusive = scan_sum(padded, 0i32, reverse::Forward, SCAN_IDENTITY);
@@ -178,14 +178,13 @@ mod kernels {
     }
 
     #[cutile::entry()]
-    fn expert_by_row_tile(
+    fn expert_by_row_tile<const ROW_TILE: i32>(
         starts: &Tensor<i32, { [256] }>,
         ends: &Tensor<i32, { [256] }>,
         expert_by_tile: &mut Tensor<i32, { [1] }>,
     ) {
-        const TILE_M: i32 = 16;
         const ZERO: i32 = 0;
-        let row = get_tile_block_id().0 * TILE_M;
+        let row = get_tile_block_id().0 * ROW_TILE;
         let row: Tile<i32, { [256] }> = row.broadcast(const_shape![256]);
         let starts = starts.load_tile(const_shape![256], [0i32]);
         let ends = ends.load_tile(const_shape![256], [0i32]);
@@ -335,6 +334,7 @@ pub(crate) struct RoutingPlan {
     pub(crate) ends: Arc<Tensor<i32>>,
     pub(crate) positions: Arc<Tensor<i32>>,
     pub(crate) max_dispatched_rows: usize,
+    pub(crate) dispatch_tile_rows: usize,
 }
 
 pub(crate) struct Dispatched {
@@ -361,12 +361,17 @@ impl RoutingPlan {
                 logits.shape()
             )));
         }
+        let dispatch_tile_rows = if rows >= LARGE_PREFILL_ROWS {
+            LARGE_PREFILL_TILE_M
+        } else {
+            TILE_M
+        };
         let active_experts = EXPERTS.min(rows.saturating_mul(TOP_K));
         let max_dispatched_rows = rows
             .checked_mul(TOP_K)
-            .and_then(|replicas| replicas.checked_add(active_experts * (TILE_M - 1)))
+            .and_then(|replicas| replicas.checked_add(active_experts * (dispatch_tile_rows - 1)))
             .ok_or_else(|| ModelError::Cuda("MoE dispatch capacity overflowed".into()))?
-            .next_multiple_of(TILE_M);
+            .next_multiple_of(dispatch_tile_rows);
         // SAFETY: all routing operations are ordered on the model-owned stream
         // and remain device-only until the layer boundary synchronization.
         let counts = workspace.take_zeroed_i32(
@@ -420,6 +425,7 @@ impl RoutingPlan {
                 (&mut starts).partition([EXPERTS]),
                 (&mut cursors).partition([EXPERTS]),
             )
+            .generics(vec![dispatch_tile_rows.to_string()])
             .async_on(&stream)
         }
         .map_err(|error| ModelError::Cuda(format!("scan expert counts: {error:?}")))?;
@@ -447,6 +453,7 @@ impl RoutingPlan {
             ends: Arc::new(cursors),
             positions: Arc::new(positions),
             max_dispatched_rows,
+            dispatch_tile_rows,
         })
     }
 
@@ -498,7 +505,7 @@ impl RoutingPlan {
         drop(tickets_partition);
         workspace.retire_i32(tickets);
 
-        let row_tiles = self.max_dispatched_rows.div_ceil(TILE_M);
+        let row_tiles = self.max_dispatched_rows / self.dispatch_tile_rows;
         let mut expert_by_tile =
             workspace.take_i32(&[row_tiles], execution, "allocate expert row map")?;
         // SAFETY: prefix metadata and this map construction share `stream`.
@@ -508,6 +515,7 @@ impl RoutingPlan {
                 self.ends.clone(),
                 (&mut expert_by_tile).partition([1]),
             )
+            .generics(vec![self.dispatch_tile_rows.to_string()])
             .async_on(&stream)
         }
         .map_err(|error| ModelError::Cuda(format!("build expert row map: {error:?}")))?;
@@ -658,7 +666,9 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<RoutingProbe, ModelError> {
         let actual = &dispatched_host
             [position as usize * hidden_size..(position as usize + 1) * hidden_size];
         let expected = &hidden_host[row * hidden_size..(row + 1) * hidden_size];
-        if actual != expected || expert_by_tile[position as usize / TILE_M] != expert {
+        if actual != expected
+            || expert_by_tile[position as usize / plan.dispatch_tile_rows] != expert
+        {
             return Err(ModelError::Cuda(format!(
                 "dispatched assignment {assignment} does not preserve its activation/expert"
             )));
