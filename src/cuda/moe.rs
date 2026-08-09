@@ -221,12 +221,82 @@ mod kernels {
         let output_tile: Tile<bf16, { [1, BLOCK] }> = ftof(accumulator, rounding::NearestEven);
         output.store(output_tile);
     }
+
+    #[cutile::entry()]
+    fn combine_shared_expert_bf16<const HIDDEN: i32, const BLOCK: i32>(
+        routed: &Tensor<bf16, { [-1, HIDDEN] }>,
+        shared: &Tensor<bf16, { [-1, HIDDEN] }>,
+        gate_logits: &Tensor<bf16, { [-1, 1] }>,
+        output: &mut Tensor<bf16, { [1, BLOCK] }>,
+    ) {
+        let pid = get_tile_block_id();
+        let routed: Tile<f32, { [1, BLOCK] }> = convert_tile(
+            routed
+                .partition(const_shape![1, BLOCK])
+                .load([pid.0, pid.1]),
+        );
+        let shared: Tile<f32, { [1, BLOCK] }> = convert_tile(
+            shared
+                .partition(const_shape![1, BLOCK])
+                .load([pid.0, pid.1]),
+        );
+        let gate: Tile<f32, { [1] }> = convert_tile(
+            gate_logits
+                .partition(const_shape![1, 1])
+                .load([pid.0, 0i32]),
+        );
+        let gate = gate.broadcast(const_shape![1, BLOCK]);
+        const ONE: f32 = 1.0;
+        const ZERO: f32 = 0.0;
+        let one: Tile<f32, { [1, BLOCK] }> = broadcast_scalar(ONE, const_shape![1, BLOCK]);
+        let zero: Tile<f32, { [1, BLOCK] }> = broadcast_scalar(ZERO, const_shape![1, BLOCK]);
+        let scale = true_div(one, one + exp(zero - gate));
+        let result: Tile<bf16, { [1, BLOCK] }> =
+            ftof(routed + shared * scale, rounding::NearestEven);
+        output.store(result);
+    }
 }
 
 use kernels::{
-    aligned_expert_prefix, assign_dispatch_rows, combine_top8_bf16, dispatch_bf16,
-    expert_by_row_tile, renormalize_top8, top8_router_256,
+    aligned_expert_prefix, assign_dispatch_rows, combine_shared_expert_bf16, combine_top8_bf16,
+    dispatch_bf16, expert_by_row_tile, renormalize_top8, top8_router_256,
 };
+
+pub(crate) fn combine_shared(
+    routed: Arc<Tensor<bf16>>,
+    shared: Arc<Tensor<bf16>>,
+    gate_logits: Arc<Tensor<bf16>>,
+    rows: usize,
+    hidden_size: usize,
+    stream: &Arc<Stream>,
+) -> Result<Tensor<bf16>, ModelError> {
+    const BLOCK: usize = 256;
+    if rows == 0
+        || hidden_size == 0
+        || !hidden_size.is_multiple_of(BLOCK)
+        || routed.shape() != [rows as i32, hidden_size as i32]
+        || shared.shape() != routed.shape()
+        || gate_logits.shape() != [rows as i32, 1]
+    {
+        return Err(ModelError::Cuda(
+            "invalid shared-expert combine geometry".into(),
+        ));
+    }
+    let mut output = api::zeros::<bf16>(&[rows, hidden_size])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate shared-expert output: {error:?}")))?;
+    let (_, _, _, output_partition) = combine_shared_expert_bf16(
+        routed,
+        shared,
+        gate_logits,
+        (&mut output).partition([1, BLOCK]),
+    )
+    .generics(vec![hidden_size.to_string(), BLOCK.to_string()])
+    .sync_on(stream)
+    .map_err(|error| ModelError::Cuda(format!("combine shared expert: {error:?}")))?;
+    drop(output_partition);
+    Ok(output)
+}
 
 pub(crate) struct RoutingPlan {
     pub(crate) expert_ids: Arc<Tensor<i32>>,
@@ -342,7 +412,7 @@ impl RoutingPlan {
         {
             return Err(ModelError::Cuda("invalid MoE dispatch geometry".into()));
         }
-        let mut dispatched = api::zeros::<bf16>(&[self.max_dispatched_rows, hidden_size])
+        let dispatched = api::zeros::<bf16>(&[self.max_dispatched_rows, hidden_size])
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("allocate dispatched rows: {error:?}")))?;
         let mut tickets = api::zeros::<i32>(&[rows, TOP_K])

@@ -5,7 +5,8 @@ use cuda_core::{Device, Stream};
 use cutile::{
     api,
     core::bf16,
-    tensor::{Reshape, Tensor},
+    tensor::{PartitionMut, Reshape, Tensor},
+    tile_kernel::TileKernel,
 };
 
 use crate::model::{
@@ -13,7 +14,11 @@ use crate::model::{
     weights::{WeightDtype, WeightSource},
 };
 
-use super::linear::{ExpertProjection, Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear};
+use super::{
+    cublas, kernels,
+    linear::{ExpertProjection, Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear},
+    moe::{self as moe_backend, RoutingPlan},
+};
 
 type Bf16Tensor = Arc<Tensor<bf16>>;
 type F32Tensor = Arc<Tensor<f32>>;
@@ -265,6 +270,134 @@ impl Moe {
             + self.shared_down.device_bytes()
             + self.shared_router.num_bytes()
     }
+
+    fn forward(
+        &self,
+        hidden: Bf16Tensor,
+        rows: usize,
+        stream: &Arc<Stream>,
+    ) -> Result<Tensor<bf16>, ModelError> {
+        const HIDDEN_SIZE: usize = 2048;
+        if !rows.is_multiple_of(16) || hidden.shape() != [rows as i32, HIDDEN_SIZE as i32] {
+            return Err(ModelError::Cuda("invalid Qwen MoE input geometry".into()));
+        }
+
+        let router_logits = bf16_gemm(
+            self.router.clone(),
+            hidden.clone(),
+            256,
+            rows,
+            HIDDEN_SIZE,
+            "Qwen routed-expert logits",
+            stream,
+        )?;
+        let routing = RoutingPlan::build(router_logits, rows, stream)?;
+        let dispatched = routing.dispatch(hidden.clone(), rows, HIDDEN_SIZE, stream)?;
+        let dispatched_rows = routing.max_dispatched_rows;
+        let routed_gate = self.routed_gate.enqueue_device_plan(
+            dispatched.hidden.clone(),
+            dispatched_rows,
+            dispatched.expert_by_row_tile.clone(),
+            stream,
+        )?;
+        let routed_up = self.routed_up.enqueue_device_plan(
+            dispatched.hidden,
+            dispatched_rows,
+            dispatched.expert_by_row_tile.clone(),
+            stream,
+        )?;
+        let routed_activated = silu_mul(
+            Arc::new(routed_gate),
+            Arc::new(routed_up),
+            dispatched_rows,
+            self.routed_gate.output_size(),
+            stream,
+        )?;
+        let routed_down = self.routed_down.enqueue_device_plan(
+            Arc::new(routed_activated),
+            dispatched_rows,
+            dispatched.expert_by_row_tile,
+            stream,
+        )?;
+        let routed = routing.combine(Arc::new(routed_down), rows, HIDDEN_SIZE, stream)?;
+
+        let shared_gate = self.shared_gate.enqueue(hidden.clone(), rows, stream)?;
+        let shared_up = self.shared_up.enqueue(hidden.clone(), rows, stream)?;
+        let shared_activated = silu_mul(
+            Arc::new(shared_gate),
+            Arc::new(shared_up),
+            rows,
+            self.shared_gate.output_size(),
+            stream,
+        )?;
+        let shared = self
+            .shared_down
+            .enqueue(Arc::new(shared_activated), rows, stream)?;
+        let shared_logits = bf16_gemm(
+            self.shared_router.clone(),
+            hidden,
+            1,
+            rows,
+            HIDDEN_SIZE,
+            "Qwen shared-expert gate",
+            stream,
+        )?;
+        moe_backend::combine_shared(
+            Arc::new(routed),
+            Arc::new(shared),
+            shared_logits,
+            rows,
+            HIDDEN_SIZE,
+            stream,
+        )
+    }
+}
+
+fn bf16_gemm(
+    weight: Bf16Tensor,
+    input: Bf16Tensor,
+    output_size: usize,
+    rows: usize,
+    input_size: usize,
+    operation: &'static str,
+    stream: &Arc<Stream>,
+) -> Result<Bf16Tensor, ModelError> {
+    let output = api::zeros::<bf16>(&[rows, output_size])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate {operation} output: {error:?}")))?;
+    let output = cublas::gemm_bf16(weight, input, output, output_size, rows, input_size)
+        .map_err(|error| ModelError::Cuda(format!("prepare {operation}: {error}")))?
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("schedule {operation}: {error:?}")))?
+        .map_err(|error| ModelError::Cuda(format!("execute {operation}: {error}")))?;
+    Ok(Arc::new(output))
+}
+
+fn silu_mul(
+    gate: Bf16Tensor,
+    up: Bf16Tensor,
+    rows: usize,
+    width: usize,
+    stream: &Arc<Stream>,
+) -> Result<Tensor<bf16>, ModelError> {
+    const BLOCK: usize = 256;
+    if width == 0
+        || !width.is_multiple_of(BLOCK)
+        || gate.shape() != [rows as i32, width as i32]
+        || up.shape() != gate.shape()
+    {
+        return Err(ModelError::Cuda("invalid Qwen SiLU gate geometry".into()));
+    }
+    let mut output = api::zeros::<bf16>(&[rows, width])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate Qwen SiLU output: {error:?}")))?;
+    let (_, _, output_partition) =
+        kernels::silu_mul_bf16(gate, up, (&mut output).partition([1, BLOCK]))
+            .generics(vec![BLOCK.to_string()])
+            .sync_on(stream)
+            .map_err(|error| ModelError::Cuda(format!("execute Qwen SiLU gate: {error:?}")))?;
+    drop(output_partition);
+    Ok(output)
 }
 
 pub(crate) fn checkpoint_report(
