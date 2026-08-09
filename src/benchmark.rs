@@ -149,29 +149,50 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
         .context("build benchmark HTTP client")?;
 
     let samples = prepare(&config)?;
-    for index in 0..config.warmup_requests {
-        let sample = &samples[index % samples.len()];
-        request_once(
-            &client,
-            RequestSpec {
-                endpoint: &endpoint,
-                api: config.api,
-                model: &config.model,
-                prompt: &sample.prompt,
-                generated_prompt_tokens: sample.generated_prompt_tokens,
-                output_len: sample.output_tokens.min(32),
-                seed: config.seed.wrapping_add(index as u64),
-                index,
-            },
-        )
-        .await
-        .with_context(|| format!("warmup request {index}"))?;
-    }
-
     let max_concurrency = config
         .max_concurrency
         .unwrap_or(config.num_prompts)
         .min(config.num_prompts);
+    let warmup_permits = Arc::new(Semaphore::new(max_concurrency));
+    let mut warmups = JoinSet::new();
+    for index in 0..config.warmup_requests {
+        let sample = &samples[index % samples.len()];
+        let client = client.clone();
+        let endpoint = endpoint.clone();
+        let api = config.api;
+        let model = config.model.clone();
+        let prompt = sample.prompt.clone();
+        let generated_prompt_tokens = sample.generated_prompt_tokens;
+        let output_len = sample.output_tokens.min(32);
+        let seed = config.seed.wrapping_add(index as u64);
+        let permits = Arc::clone(&warmup_permits);
+        warmups.spawn(async move {
+            let _permit = permits
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow!("warmup concurrency limiter closed"))?;
+            request_once(
+                &client,
+                RequestSpec {
+                    endpoint: &endpoint,
+                    api,
+                    model: &model,
+                    prompt: &prompt,
+                    generated_prompt_tokens,
+                    output_len,
+                    seed,
+                    index,
+                },
+            )
+            .await
+            .with_context(|| format!("warmup request {index}"))?;
+            Ok::<_, anyhow::Error>(())
+        });
+    }
+    while let Some(result) = warmups.join_next().await {
+        result.context("warmup task panicked")??;
+    }
+
     let arrivals = arrival_offsets(config.num_prompts, config.request_rate, config.seed);
     let started = Instant::now();
     let permits = Arc::new(Semaphore::new(max_concurrency));
