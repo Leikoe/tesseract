@@ -232,6 +232,10 @@ You should extract and benchmark the marlin kernel yourself.
 ```
 
 ```text
+always assume nvcc is in path OR CUDA_HOME is properly set OR CUDA is at /usr/local/cuda/ . no need to match all versions !
+```
+
+```text
 did you read sglang's kernels ? (or tokenspeed's)
 ```
 

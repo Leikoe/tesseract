@@ -11,6 +11,7 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let report = tesseract::cuda::probe_bf16_cutile(args.device)?;
     let quantized = tesseract::cuda::probe_quantized_linears(args.device)?;
+    let marlin = tesseract::cuda::probe_marlin(args.device)?;
     println!("device_id={}", report.device_id);
     println!("dtype=bfloat16");
     println!("elements={}", report.elements);
@@ -23,6 +24,8 @@ fn main() -> anyhow::Result<()> {
     print_capability("moe_device_routing", quantized.moe_routing);
     print_capability("gdn_recurrent_decode", quantized.gdn_decode);
     print_capability("qwen_full_attention", quantized.qwen_full_attention);
+    println!("marlin_fp8_max_abs_error={}", marlin.fp8_max_abs_error);
+    println!("marlin_nvfp4_max_abs_error={}", marlin.nvfp4_max_abs_error);
     println!("cutile_probe=ok");
     Ok(())
 }

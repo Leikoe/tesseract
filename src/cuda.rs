@@ -25,6 +25,7 @@ pub(crate) mod gdn;
 pub(crate) mod kernel_plan;
 pub(crate) mod kernels;
 pub(crate) mod linear;
+pub mod marlin;
 pub(crate) mod moe;
 pub(crate) mod qwen3_5_moe;
 pub(crate) mod qwen_attention;
@@ -394,6 +395,22 @@ pub fn probe_quantized_linears(
         qwen_full_attention: CudaKernelCapability::Available {
             max_abs_error: qwen_attention.max_abs_error,
         },
+    })
+}
+
+/// Numerically validates the extracted native Marlin W8A16 and W4A16 paths.
+pub fn probe_marlin(device_id: usize) -> Result<marlin::MarlinProbe, CudaError> {
+    enable_persistent_cubin_cache()?;
+    let device = Device::new(device_id).map_err(|error| CudaError::Device {
+        device_id,
+        message: format!("{error:?}"),
+    })?;
+    let stream = device.new_stream().map_err(|error| CudaError::Device {
+        device_id,
+        message: format!("failed to create stream: {error:?}"),
+    })?;
+    marlin::probe(&stream).map_err(|error| CudaError::QuantizedLinear {
+        message: error.to_string(),
     })
 }
 
