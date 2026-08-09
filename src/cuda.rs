@@ -102,8 +102,9 @@ mod nvfp4_probe_kernels {
         let rhs_scale_bytes = rhs_scale_bytes.partition(const_shape![16, 1]);
         let sixteen: Tile<u8, { [16, 8] }> = constant(16u8, const_shape![16, 8]);
         let mut accumulator = constant(0.0f32, const_shape![16, 16]);
+        let k_tiles = num_tiles(&lhs_packed, 1);
 
-        for k_tile in 0i32..8i32 {
+        for k_tile in 0i32..k_tiles {
             let lhs_packed = lhs_packed.load([0, k_tile]);
             let rhs_packed = rhs_packed.load([0, k_tile]);
             let lhs_low = (lhs_packed % sixteen).reshape(const_shape![16, 8, 1]);
