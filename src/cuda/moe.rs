@@ -8,6 +8,7 @@ use cutile::{
     api,
     core::bf16,
     tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
+    tile_kernel::TileKernel,
 };
 
 use crate::model::ModelError;
@@ -154,8 +155,11 @@ mod kernels {
         let lane: Tile<i32, { [BLOCK] }> = iota(const_shape![BLOCK]);
         let lane: Tile<i32, { [1, BLOCK] }> = lane.reshape(const_shape![1, BLOCK]);
         for block in 0i32..(HIDDEN / BLOCK) {
+            let hidden_stride: Tile<i32, { [1, 1] }> = broadcast_scalar(HIDDEN, const_shape![1, 1]);
+            let block_offset = block * BLOCK;
+            let block_offset: Tile<i32, { [1, 1] }> = block_offset.broadcast(const_shape![1, 1]);
             let offset =
-                (position * HIDDEN + block * BLOCK).broadcast(const_shape![1, BLOCK]) + lane;
+                (position * hidden_stride + block_offset).broadcast(const_shape![1, BLOCK]) + lane;
             let pointer = base.offset_tile(offset);
             let values = hidden.load([pid.0, block]);
             let _token = store_ptr_tko(
