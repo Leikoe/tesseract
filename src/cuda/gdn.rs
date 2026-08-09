@@ -10,7 +10,7 @@ use cutile::{
     tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
 };
 
-use crate::model::ModelError;
+use crate::{chunking::plan_packed_queries, model::ModelError};
 
 const KEY_HEADS: usize = 16;
 const VALUE_HEADS: usize = 32;
@@ -20,6 +20,7 @@ const CONV_FEATURES: usize = 8192;
 const CONV_WIDTH: usize = 4;
 const CONV_STATE_WIDTH: usize = CONV_WIDTH - 1;
 const CONV_BLOCK: usize = 256;
+const PREFILL_CHUNK: usize = 16;
 
 #[cutile::module]
 mod kernels {
@@ -318,6 +319,93 @@ mod kernels {
         completion.store(broadcast_scalar(ZERO_I32, const_shape![1, 1]));
     }
 
+    /// Computes the chunk-local cumulative log decay and BF16-rounded update
+    /// rate used by both the triangular solve and recurrent state update.
+    #[cutile::entry()]
+    unsafe fn qwen_gdn_prefill_gates(
+        a: &Tensor<bf16, { [-1, 32] }>,
+        b: &Tensor<bf16, { [-1, 32] }>,
+        a_log: &Tensor<f32, { [32] }>,
+        dt_bias: &Tensor<f32, { [32] }>,
+        chunk_starts: &Tensor<i32, { [-1] }>,
+        chunk_lengths: &Tensor<i32, { [-1] }>,
+        log_decay_cumsum_ptr: *mut f32,
+        beta_ptr: *mut bf16,
+        completion: &mut Tensor<i32, { [1, 1] }>,
+    ) {
+        const SOFTPLUS_THRESHOLD: f32 = 20.0;
+        const ONE: f32 = 1.0;
+        const ZERO: f32 = 0.0;
+        const ZERO_I32: i32 = 0;
+
+        let pid = get_tile_block_id();
+        let chunk = pid.0;
+        let head = pid.1;
+        let start: i32 = tile_to_scalar(
+            chunk_starts
+                .partition(const_shape![1])
+                .load([chunk])
+                .reshape(const_shape![]),
+        );
+        let len: i32 = tile_to_scalar(
+            chunk_lengths
+                .partition(const_shape![1])
+                .load([chunk])
+                .reshape(const_shape![]),
+        );
+        let a_log: Tile<f32, { [] }> = a_log
+            .partition(const_shape![1])
+            .load([head])
+            .reshape(const_shape![]);
+        let dt_bias: Tile<f32, { [] }> = dt_bias
+            .partition(const_shape![1])
+            .load([head])
+            .reshape(const_shape![]);
+        let threshold: Tile<f32, { [] }> = broadcast_scalar(SOFTPLUS_THRESHOLD, const_shape![]);
+        let one: Tile<f32, { [] }> = broadcast_scalar(ONE, const_shape![]);
+        let zero: Tile<f32, { [] }> = broadcast_scalar(ZERO, const_shape![]);
+        let a = a.partition(const_shape![1, 1]);
+        let b = b.partition(const_shape![1, 1]);
+        let log_decay_base: PointerTile<*mut f32, { [] }> = pointer_to_tile(log_decay_cumsum_ptr);
+        let beta_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(beta_ptr);
+        let mut cumulative_log_decay: Tile<f32, { [] }> = broadcast_scalar(ZERO, const_shape![]);
+
+        for local_row in 0i32..len {
+            let row = start + local_row;
+            let gate_input: Tile<f32, { [] }> =
+                convert_tile(a.load([row, head]).reshape(const_shape![])) + dt_bias;
+            let softplus = select(
+                le_tile(gate_input, threshold),
+                log(one + exp(gate_input)),
+                gate_input,
+            );
+            cumulative_log_decay = cumulative_log_decay - exp(a_log) * softplus;
+            let beta: Tile<f32, { [] }> = convert_tile(b.load([row, head]).reshape(const_shape![]));
+            let beta = true_div(one, one + exp(zero - beta));
+            let beta: Tile<bf16, { [] }> = ftof(beta, rounding::NearestEven);
+            let offset: Tile<i32, { [] }> = (row * 32i32 + head).broadcast(const_shape![]);
+            let _log_decay_store = store_ptr_tko(
+                log_decay_base.offset_tile(offset),
+                cumulative_log_decay,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                Latency::<0>,
+            );
+            let _beta_store = store_ptr_tko(
+                beta_base.offset_tile(offset),
+                beta,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                Latency::<0>,
+            );
+        }
+        completion.store(broadcast_scalar(ZERO_I32, const_shape![1, 1]));
+    }
+
     #[cutile::entry()]
     unsafe fn qwen_gdn_decode(
         mixed_qkv: &Tensor<bf16, { [-1, 8192] }>,
@@ -514,7 +602,104 @@ mod kernels {
     }
 }
 
-use kernels::{qwen_gdn_conv_decode, qwen_gdn_conv_prefill, qwen_gdn_decode, qwen_gdn_output_gate};
+use kernels::{
+    qwen_gdn_conv_decode, qwen_gdn_conv_prefill, qwen_gdn_decode, qwen_gdn_output_gate,
+    qwen_gdn_prefill_gates,
+};
+
+pub(crate) struct GdnPrefillPlan {
+    chunk_starts: Arc<Tensor<i32>>,
+    chunk_lengths: Arc<Tensor<i32>>,
+    chunks: usize,
+    rows: usize,
+}
+
+impl GdnPrefillPlan {
+    pub(crate) fn from_offsets(offsets: &[u32], stream: &Arc<Stream>) -> Result<Self, ModelError> {
+        let chunks = plan_packed_queries(offsets, PREFILL_CHUNK as u32)
+            .map_err(|error| ModelError::Cuda(format!("plan packed GDN prefill: {error}")))?;
+        let starts = chunks
+            .iter()
+            .map(|chunk| i32::try_from(chunk.start()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ModelError::Cuda("GDN prefill row exceeds i32".into()))?;
+        let lengths = chunks
+            .iter()
+            .map(|chunk| i32::try_from(chunk.len()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ModelError::Cuda("GDN prefill chunk length exceeds i32".into()))?;
+        let rows = offsets.last().copied().unwrap_or(0) as usize;
+        Ok(Self {
+            chunk_starts: upload_i32(&starts, stream)?,
+            chunk_lengths: upload_i32(&lengths, stream)?,
+            chunks: chunks.len(),
+            rows,
+        })
+    }
+
+    pub(crate) const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub(crate) const fn chunks(&self) -> usize {
+        self.chunks
+    }
+}
+
+struct GdnPrefillGates {
+    log_decay_cumsum: Tensor<f32>,
+    beta: Tensor<bf16>,
+}
+
+fn prepare_prefill_gates(
+    a: Arc<Tensor<bf16>>,
+    b: Arc<Tensor<bf16>>,
+    a_log: Arc<Tensor<f32>>,
+    dt_bias: Arc<Tensor<f32>>,
+    plan: &GdnPrefillPlan,
+    stream: &Arc<Stream>,
+) -> Result<GdnPrefillGates, ModelError> {
+    let rows = plan.rows();
+    if plan.chunks() == 0
+        || a.shape() != [rows as i32, VALUE_HEADS as i32]
+        || b.shape() != a.shape()
+        || a_log.shape() != [VALUE_HEADS as i32]
+        || dt_bias.shape() != [VALUE_HEADS as i32]
+    {
+        return Err(ModelError::Cuda("invalid GDN prefill gate geometry".into()));
+    }
+    let log_decay_cumsum = api::zeros::<f32>(&[rows, VALUE_HEADS])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate GDN prefill log gates: {error:?}")))?;
+    let beta = api::zeros::<bf16>(&[rows, VALUE_HEADS])
+        .sync_on(stream)
+        .map_err(|error| {
+            ModelError::Cuda(format!("allocate GDN prefill update gates: {error:?}"))
+        })?;
+    let mut completion = api::zeros::<i32>(&[plan.chunks(), VALUE_HEADS])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate GDN gate launch grid: {error:?}")))?;
+    let (_, _, _, _, _, _, _, _, completion_partition) = unsafe {
+        qwen_gdn_prefill_gates(
+            a,
+            b,
+            a_log,
+            dt_bias,
+            plan.chunk_starts.clone(),
+            plan.chunk_lengths.clone(),
+            log_decay_cumsum.device_pointer(),
+            beta.device_pointer(),
+            (&mut completion).partition([1, 1]),
+        )
+    }
+    .sync_on(stream)
+    .map_err(|error| ModelError::Cuda(format!("execute GDN prefill gates: {error:?}")))?;
+    drop(completion_partition);
+    Ok(GdnPrefillGates {
+        log_decay_cumsum,
+        beta,
+    })
+}
 
 pub(crate) fn output_gate(
     input: Arc<Tensor<bf16>>,
@@ -712,6 +897,7 @@ pub(crate) struct GdnProbe {
 
 pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
     let conv_max_abs_error = probe_conv(stream)?;
+    let prefill_gate_max_abs_error = probe_prefill_gates(stream)?;
     let output_gate_max_abs_error = probe_output_gate(stream)?;
     let rows = 2usize;
     let query_host = host_bf16(rows * KEY_HEADS * HEAD_DIM, 17, 8.0);
@@ -769,7 +955,9 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("download GDN probe: {error:?}")))?;
-    let mut max_abs_error = conv_max_abs_error.max(output_gate_max_abs_error);
+    let mut max_abs_error = conv_max_abs_error
+        .max(prefill_gate_max_abs_error)
+        .max(output_gate_max_abs_error);
     for row in 0..rows {
         for value_head in 0..VALUE_HEADS {
             let key_head = value_head / 2;
@@ -819,6 +1007,69 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
         }
     }
     Ok(GdnProbe { max_abs_error })
+}
+
+fn probe_prefill_gates(stream: &Arc<Stream>) -> Result<f32, ModelError> {
+    let offsets = [0u32, 17, 38];
+    let rows = *offsets.last().unwrap() as usize;
+    let a_host = host_bf16(rows * VALUE_HEADS, 23, 13.0);
+    let b_host = host_bf16(rows * VALUE_HEADS, 29, 17.0);
+    let a_log = (0..VALUE_HEADS)
+        .map(|index| -2.0 + index as f32 / 64.0)
+        .collect::<Vec<_>>();
+    let dt_bias = (0..VALUE_HEADS)
+        .map(|index| -0.5 + index as f32 / 64.0)
+        .collect::<Vec<_>>();
+    let plan = GdnPrefillPlan::from_offsets(&offsets, stream)?;
+    let gates = prepare_prefill_gates(
+        upload_bf16(&a_host, &[rows, VALUE_HEADS], stream)?,
+        upload_bf16(&b_host, &[rows, VALUE_HEADS], stream)?,
+        upload_f32(&a_log, &[VALUE_HEADS], stream)?,
+        upload_f32(&dt_bias, &[VALUE_HEADS], stream)?,
+        &plan,
+        stream,
+    )?;
+    let actual_log_decay: Vec<f32> = gates
+        .log_decay_cumsum
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("download GDN prefill log gates: {error:?}")))?;
+    let actual_beta: Vec<bf16> = gates.beta.to_host_vec().sync_on(stream).map_err(|error| {
+        ModelError::Cuda(format!("download GDN prefill update gates: {error:?}"))
+    })?;
+
+    let chunks = plan_packed_queries(&offsets, PREFILL_CHUNK as u32)
+        .map_err(|error| ModelError::Cuda(format!("plan GDN gate reference: {error}")))?;
+    let mut max_abs_error = 0.0f32;
+    for chunk in chunks {
+        for head in 0..VALUE_HEADS {
+            let mut cumulative = 0.0f32;
+            for row in chunk.start() as usize..(chunk.start() + chunk.len()) as usize {
+                let index = row * VALUE_HEADS + head;
+                let gate = a_host[index].to_f32() + dt_bias[head];
+                let softplus = if gate <= 20.0 {
+                    (1.0 + gate.exp()).ln()
+                } else {
+                    gate
+                };
+                cumulative -= a_log[head].exp() * softplus;
+                let expected_beta =
+                    bf16::from_f32(1.0 / (1.0 + (-b_host[index].to_f32()).exp())).to_f32();
+                let log_error = (actual_log_decay[index] - cumulative).abs();
+                let beta_error = (actual_beta[index].to_f32() - expected_beta).abs();
+                max_abs_error = max_abs_error.max(log_error).max(beta_error);
+                if log_error > 1.0e-5 || beta_error > 1.0e-5 || !actual_log_decay[index].is_finite()
+                {
+                    return Err(ModelError::Cuda(format!(
+                        "GDN prefill gate mismatch at {index}: ({}, {}) != ({cumulative}, {expected_beta})",
+                        actual_log_decay[index],
+                        actual_beta[index].to_f32(),
+                    )));
+                }
+            }
+        }
+    }
+    Ok(max_abs_error)
 }
 
 fn probe_conv(stream: &Arc<Stream>) -> Result<f32, ModelError> {
