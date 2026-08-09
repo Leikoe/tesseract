@@ -1205,4 +1205,6 @@ can we have serious benchmarks ?
 long context is more like 50%+ of the context of the model
 
 save everything, the A100 node is gonna shutdown
+
+here is a new machine: "ssh ubuntu@216.81.248.167" you can continue
 ```
