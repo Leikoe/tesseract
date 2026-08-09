@@ -182,9 +182,8 @@ impl Qwen35MoeText {
 
 #[cfg(feature = "cuda")]
 impl Qwen35MoeText {
-    fn cuda_artifact(self: &Arc<Self>) -> Artifact {
+    fn cuda_artifact(&self) -> Artifact {
         Artifact {
-            model: self.clone(),
             config: CudaConfig {
                 layers: self
                     .config

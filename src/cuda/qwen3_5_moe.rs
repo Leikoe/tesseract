@@ -9,7 +9,7 @@ use cutile::{
 };
 
 use crate::model::{
-    CudaModelReport, Model, ModelError,
+    CudaModelReport, ModelError,
     weights::{WeightDtype, WeightSource},
 };
 
@@ -31,7 +31,6 @@ pub(crate) struct Config {
 }
 
 pub(crate) struct Artifact {
-    pub(crate) model: Arc<dyn Model>,
     pub(crate) config: Config,
     pub(crate) weights: Arc<dyn WeightSource>,
 }
