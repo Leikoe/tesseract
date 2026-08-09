@@ -30,7 +30,6 @@ const DENSE_TILE_N: usize = 64;
 const GROUP_K: usize = 16;
 const GROUPED_TILE_N: usize = 64;
 const GROUPED_TILE_K: usize = GROUP_K;
-const FP8_SUBNORMAL_SCALE: f32 = 1.0 / 512.0;
 
 #[cutile::module]
 mod kernels {
@@ -432,7 +431,7 @@ mod kernels {
     }
 }
 
-use kernels::{fp8_w8a16, grouped_nvfp4_w4a16, grouped_nvfp4_w4a16_silu_mul, nvfp4_w4a16};
+use kernels::{grouped_nvfp4_w4a16, grouped_nvfp4_w4a16_silu_mul, nvfp4_w4a16};
 
 /// Scalar-scaled ModelOpt FP8 projection expanded once to BF16 on SM80. This
 /// backend trades device memory for native BF16 tensor-core execution and
