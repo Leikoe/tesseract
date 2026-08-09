@@ -378,8 +378,8 @@ pub fn probe(stream: &Arc<Stream>) -> Result<MarlinProbe, ModelError> {
 
 fn probe_fp8(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     const M: usize = 16;
-    const N: usize = 64;
-    const K: usize = 64;
+    const N: usize = 128;
+    const K: usize = 128;
     const SCALE: f32 = 0.25;
     let encoded = (0..N * K)
         .map(|index| [0x01, 0x20, 0x38, 0x3c, 0x40, 0x60, 0x80, 0xb8][index % 8])
@@ -406,8 +406,8 @@ fn probe_fp8(stream: &Arc<Stream>) -> Result<f32, ModelError> {
 
 fn probe_nvfp4(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     const M: usize = 16;
-    const N: usize = 64;
-    const K: usize = 64;
+    const N: usize = 128;
+    const K: usize = 128;
     const GLOBAL: f32 = 0.5;
     let packed = (0..N * K / 2)
         .map(|index| ((index * 2) % 16) as u8 | ((((index * 2 + 1) % 16) as u8) << 4))
