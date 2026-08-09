@@ -162,8 +162,11 @@ mod qwen_kernels {
                 value_base.reshape(const_shape![1, 1]);
             let value_base: PointerTile<*mut bf16, { [1, 32] }> =
                 value_base.broadcast(const_shape![1, 32]);
+            let key_pointer: PointerTile<*mut bf16, { [1, 32] }> = key_base.offset_tile(offsets);
+            let value_pointer: PointerTile<*mut bf16, { [1, 32] }> =
+                value_base.offset_tile(offsets);
             let _key_store = store_ptr_tko(
-                key_base.offset_tile(offsets),
+                key_pointer,
                 k,
                 ordering::Weak,
                 None::<scope::TileBlock>,
@@ -172,7 +175,7 @@ mod qwen_kernels {
                 Latency::<0>,
             );
             let _value_store = store_ptr_tko(
-                value_base.offset_tile(offsets),
+                value_pointer,
                 v,
                 ordering::Weak,
                 None::<scope::TileBlock>,
