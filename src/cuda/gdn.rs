@@ -384,8 +384,11 @@ mod kernels {
             let beta = true_div(one, one + exp(zero - beta));
             let beta: Tile<bf16, { [] }> = ftof(beta, rounding::NearestEven);
             let offset: Tile<i32, { [] }> = (row * 32i32 + head).broadcast(const_shape![]);
+            let log_decay_pointer: PointerTile<*mut f32, { [] }> =
+                log_decay_base.offset_tile(offset);
+            let beta_pointer: PointerTile<*mut bf16, { [] }> = beta_base.offset_tile(offset);
             let _log_decay_store = store_ptr_tko(
-                log_decay_base.offset_tile(offset),
+                log_decay_pointer,
                 cumulative_log_decay,
                 ordering::Weak,
                 None::<scope::TileBlock>,
@@ -394,7 +397,7 @@ mod kernels {
                 Latency::<0>,
             );
             let _beta_store = store_ptr_tko(
-                beta_base.offset_tile(offset),
+                beta_pointer,
                 beta,
                 ordering::Weak,
                 None::<scope::TileBlock>,
