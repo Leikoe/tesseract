@@ -124,8 +124,9 @@ mod kernels {
         let cursors: PointerTile<*mut i32, { [] }> = pointer_to_tile(cursors_ptr);
         let cursors: PointerTile<*mut i32, { [1, 1] }> = cursors.reshape(const_shape![1, 1]);
         let one: Tile<i32, { [1, 1] }> = broadcast_scalar(ONE_I32, const_shape![1, 1]);
+        let expert_ptr: PointerTile<*mut i32, { [1, 1] }> = cursors.offset_tile(expert);
         let (position, _token): (Tile<i32, { [1, 1] }>, Token) = atomic_rmw_tko(
-            cursors.offset_tile(expert),
+            expert_ptr,
             one,
             atomic::Add,
             ordering::Relaxed,
