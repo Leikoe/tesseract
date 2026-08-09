@@ -468,9 +468,10 @@ mod kernels {
             None,
             Latency::<0>,
         );
+        let key_f32: Tile<f32, { [16, 128] }> = convert_tile(key);
         let key_f32: Tile<f32, { [16, 128] }> = select(
             valid_key,
-            convert_tile(key),
+            key_f32,
             broadcast_scalar(ZERO, const_shape![16, 128]),
         );
         let key_square_sum: Tile<f32, { [16, 1] }> = reduce_sum(key_f32 * key_f32, 1i32);
@@ -517,11 +518,9 @@ mod kernels {
             None,
             Latency::<0>,
         );
-        let beta: Tile<f32, { [16, 1] }> = select(
-            valid_row,
-            convert_tile(beta),
-            broadcast_scalar(ZERO, const_shape![16, 1]),
-        );
+        let beta: Tile<f32, { [16, 1] }> = convert_tile(beta);
+        let beta: Tile<f32, { [16, 1] }> =
+            select(valid_row, beta, broadcast_scalar(ZERO, const_shape![16, 1]));
 
         let causal_column: Tile<i32, { [16] }> = iota(const_shape![16]);
         let causal_column: Tile<i32, { [1, 16] }> = causal_column.reshape(const_shape![1, 16]);
