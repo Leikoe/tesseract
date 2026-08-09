@@ -9,7 +9,7 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use cuda_core::DType;
-use cutile::{api, tensor::Tensor};
+use cutile::{api, core::bf16, tensor::Tensor};
 
 use crate::{cuda::execution::StreamExecution, model::ModelError};
 
@@ -123,7 +123,7 @@ impl<T: DType> TensorPool<T> {
 /// byte limit is shared proportionally across supported activation dtypes and
 /// bounds retained storage when serving a changing mix of batch shapes.
 pub(crate) struct ExecutionWorkspace {
-    bf16: TensorPool<cuda_core::bf16>,
+    bf16: TensorPool<bf16>,
     f32: TensorPool<f32>,
     i32: TensorPool<i32>,
     u32: TensorPool<u32>,
@@ -145,7 +145,7 @@ impl ExecutionWorkspace {
         shape: &[usize],
         execution: &mut StreamExecution<'_>,
         name: &'static str,
-    ) -> Result<Tensor<cuda_core::bf16>, ModelError> {
+    ) -> Result<Tensor<bf16>, ModelError> {
         self.bf16.take(shape, execution, name)
     }
 
@@ -155,7 +155,7 @@ impl ExecutionWorkspace {
         execution: &mut StreamExecution<'_>,
         allocation_name: &'static str,
         clear_name: &'static str,
-    ) -> Result<Tensor<cuda_core::bf16>, ModelError> {
+    ) -> Result<Tensor<bf16>, ModelError> {
         self.bf16
             .take_zeroed(shape, execution, allocation_name, clear_name)
     }
@@ -189,13 +189,13 @@ impl ExecutionWorkspace {
         self.u32.take(shape, execution, name)
     }
 
-    pub(crate) fn retire_bf16(&mut self, tensor: Tensor<cuda_core::bf16>) {
+    pub(crate) fn retire_bf16(&mut self, tensor: Tensor<bf16>) {
         self.bf16.retire(tensor);
     }
 
     pub(crate) fn retire_shared_bf16(
         &mut self,
-        tensor: Arc<Tensor<cuda_core::bf16>>,
+        tensor: Arc<Tensor<bf16>>,
         name: &'static str,
     ) -> Result<(), ModelError> {
         self.bf16.retire_shared(tensor, name)
