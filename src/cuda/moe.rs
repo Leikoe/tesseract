@@ -33,7 +33,8 @@ mod kernels {
         let row = get_tile_block_id().0;
         let mut available: Tile<f32, { [1, 256] }> =
             convert_tile(logits.partition(const_shape![1, 256]).load([row, 0i32]));
-        let expert: Tile<i32, { [1, 256] }> = iota(const_shape![256]).reshape(const_shape![1, 256]);
+        let expert: Tile<i32, { [256] }> = iota(const_shape![256]);
+        let expert: Tile<i32, { [1, 256] }> = expert.reshape(const_shape![1, 256]);
         let negative_infinity: Tile<f32, { [1, 256] }> =
             constant(NEGATIVE_INFINITY, const_shape![1, 256]);
         let invalid_expert: Tile<i32, { [1, 256] }> =
