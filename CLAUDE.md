@@ -164,6 +164,10 @@ you should look at how sglang handles loading a quantized model (and how they ge
 
 great ! why do we have factories ? can't we just have a match on architecture from the model's config json which calls the model's ::load(...) constructor and returns a dyn Model ?
 
+## User
+
+we now have both an Architecture value and a Model type for each arch.. why not <Model>::ARCH_NAME ?
+
 ```text
 you will need good grouped gemm kernels (nfp4 weights loads + bf16 activations loads + bf16 tensor cores w fp32 acc + cast back to bf16 before store)
 ```

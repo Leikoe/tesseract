@@ -50,7 +50,7 @@ single-stage causal-LM decoding. Source review required six material revisions:
 | Sampling | runner-owned sampler | runner-owned sampler | executor-owned sampler |
 | Cache | cache groups/coordinator/block pool | radix cache + pool allocators | `StateSchema`, coordinator/arena pair |
 | Graphs | model runner/graph manager | model runner/graph runners | executor-owned graph cache |
-| Model registry | architecture registry | `EntryClass` registry | exhaustive `Architecture` dispatch |
+| Model registry | architecture registry | `EntryClass` registry | match on model-owned `ARCH_NAME` constants |
 | Weight loading | independent format loaders | independent format loaders | independent `WeightSource` |
 
 ## Request authority and executor mirrors
@@ -202,9 +202,10 @@ Both projects separate architecture selection from checkpoint format:
 - SGLang loader base and selection:
   `references/sglang/python/sglang/srt/model_loader/loader.py:342` and `:4104`
 
-Tesseract preserves the split with an exhaustive `Architecture` match and an
-independent `WeightSource`. Architectures are a closed, statically linked set,
-so a factory trait and registry add no useful extension point.
+Tesseract preserves the split with a direct match on architecture strings owned
+by the concrete model types and an independent `WeightSource`. Architectures
+are a closed, statically linked set, so a second architecture enum, factory
+trait, and registry add no useful extension point.
 
 ## Sampling and operational invariants
 

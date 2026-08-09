@@ -16,10 +16,6 @@ use crate::cuda::dense_decoder::{
     Llama3RopeConfig,
 };
 
-pub(super) fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
-    Llama32::load(model_id, model_dir).map(|model| Arc::new(model) as Arc<dyn Model>)
-}
-
 #[cfg(feature = "cuda")]
 pub(super) fn load_cuda_executor(
     model_id: &str,
@@ -202,7 +198,9 @@ pub(super) struct Llama32 {
 }
 
 impl Llama32 {
-    fn load(model_id: &str, model_dir: &Path) -> Result<Self, ModelError> {
+    pub(super) const ARCH_NAME: &'static str = "LlamaForCausalLM";
+
+    pub(super) fn load(model_id: &str, model_dir: &Path) -> Result<Self, ModelError> {
         let config = Config::load(model_dir)?;
         let weights: Arc<dyn WeightSource> = Arc::new(SafeTensorSource::open(model_dir)?);
         validate_weights(weights.as_ref(), &config)?;

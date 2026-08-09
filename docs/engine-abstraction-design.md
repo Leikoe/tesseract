@@ -252,9 +252,9 @@ Operation-family backends are statically composed by shared program types.
 Architecture selection and checkpoint transport are independent startup axes:
 
 ```rust
-enum Architecture {
-    Llama,
-    Qwen35MoeText,
+impl Llama32 {
+    const ARCH_NAME: &'static str = "LlamaForCausalLM";
+    fn load(model_id: &str, model_dir: &Path) -> Result<Self, LoadError>;
 }
 
 pub trait WeightSource {
@@ -269,8 +269,9 @@ pub struct LoadedModel {
 }
 ```
 
-One parser maps `config.json` architecture metadata to the closed enum, and an
-exhaustive match calls the selected model module's constructor. SafeTensors,
+One parser reads `config.json` architecture metadata, and a direct match
+against concrete models' `ARCH_NAME` constants calls the selected model's
+constructor. SafeTensors,
 sharded, remote, quantized, and test-generated weight sources feed the same
 named-tensor interface. The Llama constructor parses its private configuration,
 maps tensors, and constructs a shared `DenseDecoder` program. Only

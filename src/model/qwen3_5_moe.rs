@@ -11,10 +11,6 @@ use super::{
 #[cfg(feature = "cuda")]
 use super::{CudaForwardReport, CudaModelReport};
 
-pub(super) fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
-    Qwen35MoeText::load(model_id, model_dir).map(|model| Arc::new(model) as Arc<dyn Model>)
-}
-
 #[cfg(feature = "cuda")]
 pub(super) fn load_cuda_executor(
     _model_id: &str,
@@ -277,7 +273,7 @@ const TOKENIZER_WARMUP_TEXT: &str = concat!(
     "<|im_start|>assistant\n<think>\n",
 );
 
-struct Qwen35MoeText {
+pub(super) struct Qwen35MoeText {
     id: String,
     config: Config,
     tokenizer: Tokenizer,
@@ -286,7 +282,9 @@ struct Qwen35MoeText {
 }
 
 impl Qwen35MoeText {
-    fn load(model_id: &str, model_dir: &Path) -> Result<Self, ModelError> {
+    pub(super) const ARCH_NAME: &'static str = "Qwen3_5MoeForConditionalGeneration";
+
+    pub(super) fn load(model_id: &str, model_dir: &Path) -> Result<Self, ModelError> {
         let config = Config::load(model_dir)?;
         let weights: Arc<dyn WeightSource> = Arc::new(SafeTensorSource::open(model_dir)?);
         let tokenizer = Tokenizer::load(model_dir)?;
