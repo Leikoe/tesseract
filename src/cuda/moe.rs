@@ -243,9 +243,11 @@ mod kernels {
         let gate: Tile<f32, { [1] }> = convert_tile(
             gate_logits
                 .partition(const_shape![1, 1])
-                .load([pid.0, 0i32]),
+                .load([pid.0, 0i32])
+                .reshape(const_shape![1]),
         );
-        let gate = gate.broadcast(const_shape![1, BLOCK]);
+        let gate: Tile<f32, { [1, 1] }> = gate.reshape(const_shape![1, 1]);
+        let gate: Tile<f32, { [1, BLOCK] }> = gate.broadcast(const_shape![1, BLOCK]);
         const ONE: f32 = 1.0;
         const ZERO: f32 = 0.0;
         let one: Tile<f32, { [1, BLOCK] }> = broadcast_scalar(ONE, const_shape![1, BLOCK]);

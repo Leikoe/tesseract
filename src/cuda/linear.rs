@@ -549,6 +549,14 @@ impl ExpertProjection {
 }
 
 impl GroupedNvfp4W4A16 {
+    pub(crate) const fn input_size(&self) -> usize {
+        self.input_size
+    }
+
+    pub(crate) const fn output_size(&self) -> usize {
+        self.output_size
+    }
+
     /// Loads one projection from every individually named checkpoint expert
     /// into a single packed device bank. The temporary host staging vectors
     /// are exact-sized and released after upload; packed weights are never
