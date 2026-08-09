@@ -58,8 +58,10 @@ mod kernels {
                 .load([row, key_head, 0i32])
                 .reshape(const_shape![128]),
         );
-        let query_norm: Tile<f32, { [] }> = reduce_sum(query * query, 0i32).reshape(const_shape![]);
-        let key_norm: Tile<f32, { [] }> = reduce_sum(key * key, 0i32).reshape(const_shape![]);
+        let query_norm: Tile<f32, { [1] }> = reduce_sum(query * query, 0i32);
+        let query_norm: Tile<f32, { [] }> = query_norm.reshape(const_shape![]);
+        let key_norm: Tile<f32, { [1] }> = reduce_sum(key * key, 0i32);
+        let key_norm: Tile<f32, { [] }> = key_norm.reshape(const_shape![]);
         let epsilon: Tile<f32, { [] }> = broadcast_scalar(EPSILON, const_shape![]);
         let query_inverse = rsqrt(query_norm + epsilon, ftz::Disabled);
         let key_inverse = rsqrt(key_norm + epsilon, ftz::Disabled);
@@ -114,6 +116,7 @@ mod kernels {
         let slot = state_slots.partition(const_shape![1]).load([row]);
         let slot: i32 = tile_to_scalar(slot.reshape(const_shape![]));
         let v_lane: Tile<i32, { [32] }> = iota(const_shape![32]);
+        let value_offset: Tile<i32, { [32] }> = value_offset.broadcast(const_shape![32]);
         let v_lane: Tile<i32, { [32, 1] }> = (v_lane + value_offset).reshape(const_shape![32, 1]);
         let k_lane: Tile<i32, { [128] }> = iota(const_shape![128]);
         let k_lane: Tile<i32, { [1, 128] }> = k_lane.reshape(const_shape![1, 128]);
@@ -143,6 +146,7 @@ mod kernels {
             .reshape(const_shape![1, 128])
             .broadcast(const_shape![32, 128]);
         let predicted: Tile<f32, { [32] }> = reduce_sum(state * key_matrix, 1i32);
+        let beta: Tile<f32, { [1] }> = beta.reshape(const_shape![1]);
         let delta = (value - predicted) * beta.broadcast(const_shape![32]);
         state = state
             + delta
@@ -244,11 +248,11 @@ pub(crate) struct GdnProbe {
 
 pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
     let rows = 2usize;
-    let query = host_bf16(rows * KEY_HEADS * HEAD_DIM, 17, 8.0);
-    let key = host_bf16(rows * KEY_HEADS * HEAD_DIM, 19, 9.0);
-    let value = host_bf16(rows * VALUE_HEADS * HEAD_DIM, 23, 11.0);
-    let a = host_bf16(rows * VALUE_HEADS, 7, 5.0);
-    let b = host_bf16(rows * VALUE_HEADS, 11, 6.0);
+    let query_host = host_bf16(rows * KEY_HEADS * HEAD_DIM, 17, 8.0);
+    let key_host = host_bf16(rows * KEY_HEADS * HEAD_DIM, 19, 9.0);
+    let value_host = host_bf16(rows * VALUE_HEADS * HEAD_DIM, 23, 11.0);
+    let a_host = host_bf16(rows * VALUE_HEADS, 7, 5.0);
+    let b_host = host_bf16(rows * VALUE_HEADS, 11, 6.0);
     let a_log = (0..VALUE_HEADS)
         .map(|index| -2.0 + index as f32 / 64.0)
         .collect::<Vec<_>>();
@@ -257,11 +261,11 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
         .collect::<Vec<_>>();
     let state_slots = vec![1i32, 0i32];
     let mut state = RecurrentState::zeros(2, stream)?;
-    let query = upload_bf16(&query, &[rows, KEY_HEADS, HEAD_DIM], stream)?;
-    let key = upload_bf16(&key, &[rows, KEY_HEADS, HEAD_DIM], stream)?;
-    let value = upload_bf16(&value, &[rows, VALUE_HEADS, HEAD_DIM], stream)?;
-    let a = upload_bf16(&a, &[rows, VALUE_HEADS], stream)?;
-    let b = upload_bf16(&b, &[rows, VALUE_HEADS], stream)?;
+    let query = upload_bf16(&query_host, &[rows, KEY_HEADS, HEAD_DIM], stream)?;
+    let key = upload_bf16(&key_host, &[rows, KEY_HEADS, HEAD_DIM], stream)?;
+    let value = upload_bf16(&value_host, &[rows, VALUE_HEADS, HEAD_DIM], stream)?;
+    let a = upload_bf16(&a_host, &[rows, VALUE_HEADS], stream)?;
+    let b = upload_bf16(&b_host, &[rows, VALUE_HEADS], stream)?;
     let a_log_device = upload_f32(&a_log, &[VALUE_HEADS], stream)?;
     let dt_bias_device = upload_f32(&dt_bias, &[VALUE_HEADS], stream)?;
     let state_slots = upload_i32(&state_slots, stream)?;
@@ -297,23 +301,24 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
     for row in 0..rows {
         for value_head in 0..VALUE_HEADS {
             let key_head = value_head / 2;
-            let q = &query[(row * KEY_HEADS + key_head) * HEAD_DIM
+            let q = &query_host[(row * KEY_HEADS + key_head) * HEAD_DIM
                 ..(row * KEY_HEADS + key_head + 1) * HEAD_DIM];
-            let k = &key[(row * KEY_HEADS + key_head) * HEAD_DIM
+            let k = &key_host[(row * KEY_HEADS + key_head) * HEAD_DIM
                 ..(row * KEY_HEADS + key_head + 1) * HEAD_DIM];
             let q_norm = (q.iter().map(|x| x.to_f32().powi(2)).sum::<f32>() + 1.0e-6).sqrt();
             let k_norm = (k.iter().map(|x| x.to_f32().powi(2)).sum::<f32>() + 1.0e-6).sqrt();
-            let gate = a[row * VALUE_HEADS + value_head].to_f32() + dt_bias[value_head];
+            let gate = a_host[row * VALUE_HEADS + value_head].to_f32() + dt_bias[value_head];
             let softplus = if gate <= 20.0 {
                 (1.0 + gate.exp()).ln()
             } else {
                 gate
             };
             let decay = (-a_log[value_head].exp() * softplus).exp();
-            let beta =
-                bf16::from_f32(1.0 / (1.0 + (-b[row * VALUE_HEADS + value_head].to_f32()).exp()))
-                    .to_f32();
-            let v = &value[(row * VALUE_HEADS + value_head) * HEAD_DIM
+            let beta = bf16::from_f32(
+                1.0 / (1.0 + (-b_host[row * VALUE_HEADS + value_head].to_f32()).exp()),
+            )
+            .to_f32();
+            let v = &value_host[(row * VALUE_HEADS + value_head) * HEAD_DIM
                 ..(row * VALUE_HEADS + value_head + 1) * HEAD_DIM];
             let normalized_key_squared = k
                 .iter()
