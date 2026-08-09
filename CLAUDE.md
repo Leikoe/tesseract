@@ -168,6 +168,14 @@ great ! why do we have factories ? can't we just have a match on architecture fr
 
 we now have both an Architecture value and a Model type for each arch.. why not <Model>::ARCH_NAME ?
 
+## User
+
+supported_architecture is stupid. just match the manifest.architectures[0] (I don't know of any model with more than 1 lenth architectures array). _ => unsupported model arch
+
+## User
+
+sorry, use .get(0).ok_or(NoArchitecture) to distinguish the case where the manifest doesn't have any architectures.
+
 ```text
 you will need good grouped gemm kernels (nfp4 weights loads + bf16 activations loads + bf16 tensor cores w fp32 acc + cast back to bf16 before store)
 ```
