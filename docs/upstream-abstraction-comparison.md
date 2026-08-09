@@ -50,7 +50,7 @@ single-stage causal-LM decoding. Source review required six material revisions:
 | Sampling | runner-owned sampler | runner-owned sampler | executor-owned sampler |
 | Cache | cache groups/coordinator/block pool | radix cache + pool allocators | `StateSchema`, coordinator/arena pair |
 | Graphs | model runner/graph manager | model runner/graph runners | executor-owned graph cache |
-| Model registry | architecture registry | `EntryClass` registry | `ArchitectureFactory` registry |
+| Model registry | architecture registry | `EntryClass` registry | exhaustive `Architecture` dispatch |
 | Weight loading | independent format loaders | independent format loaders | independent `WeightSource` |
 
 ## Request authority and executor mirrors
@@ -202,8 +202,9 @@ Both projects separate architecture selection from checkpoint format:
 - SGLang loader base and selection:
   `references/sglang/python/sglang/srt/model_loader/loader.py:342` and `:4104`
 
-Tesseract follows this proven split with `ArchitectureFactory` and
-`WeightSource`, avoiding an architecture-by-storage-format matrix.
+Tesseract preserves the split with an exhaustive `Architecture` match and an
+independent `WeightSource`. Architectures are a closed, statically linked set,
+so a factory trait and registry add no useful extension point.
 
 ## Sampling and operational invariants
 
@@ -238,7 +239,7 @@ Sealed, statically dispatched executor boundaries:
 
 Cold-path boundaries:
 
-1. `ArchitectureFactory`
+1. exhaustive architecture dispatch from parsed config metadata
 2. `WeightSource`
 3. executor administration for adapter load/unload/pin/reset
 

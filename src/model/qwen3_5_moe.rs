@@ -3,8 +3,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 use serde::Deserialize;
 
 use super::{
-    ArchitectureFactory, ChatMessage, ChatRole, IncrementalDecoder, Model, ModelError,
-    ModelManifest, ModelSummary, read_file,
+    ChatMessage, ChatRole, IncrementalDecoder, Model, ModelError, ModelSummary, read_file,
     tokenizer::Tokenizer,
     weights::{SafeTensorSource, WeightSource},
 };
@@ -12,60 +11,39 @@ use super::{
 #[cfg(feature = "cuda")]
 use super::{CudaForwardReport, CudaModelReport};
 
-pub(super) static FACTORY: Factory = Factory;
+pub(super) fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
+    Qwen35MoeText::load(model_id, model_dir).map(|model| Arc::new(model) as Arc<dyn Model>)
+}
 
-pub(super) struct Factory;
+#[cfg(feature = "cuda")]
+pub(super) fn load_cuda_executor(
+    _model_id: &str,
+    _model_dir: &Path,
+    _device_id: usize,
+    _kv_capacity_tokens: usize,
+    _max_batch_tokens: usize,
+    _max_running: usize,
+) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError> {
+    Err(runtime_pending())
+}
 
-impl ArchitectureFactory for Factory {
-    fn name(&self) -> &'static str {
-        "qwen3_5_moe_text"
-    }
+#[cfg(feature = "cuda")]
+pub(super) fn validate_cuda_model(
+    _model_id: &str,
+    _model_dir: &Path,
+    _device_id: usize,
+) -> Result<CudaModelReport, ModelError> {
+    Err(runtime_pending())
+}
 
-    fn probe(&self, manifest: &ModelManifest) -> bool {
-        manifest.model_type == "qwen3_5_moe"
-            && manifest
-                .architectures
-                .iter()
-                .any(|architecture| architecture == "Qwen3_5MoeForConditionalGeneration")
-    }
-
-    fn load(&self, model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
-        Qwen35MoeText::load(model_id, model_dir).map(|model| Arc::new(model) as Arc<dyn Model>)
-    }
-
-    #[cfg(feature = "cuda")]
-    fn load_cuda_executor(
-        &self,
-        _model_id: &str,
-        _model_dir: &Path,
-        _device_id: usize,
-        _kv_capacity_tokens: usize,
-        _max_batch_tokens: usize,
-        _max_running: usize,
-    ) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError> {
-        Err(runtime_pending())
-    }
-
-    #[cfg(feature = "cuda")]
-    fn validate_cuda_model(
-        &self,
-        _model_id: &str,
-        _model_dir: &Path,
-        _device_id: usize,
-    ) -> Result<CudaModelReport, ModelError> {
-        Err(runtime_pending())
-    }
-
-    #[cfg(feature = "cuda")]
-    fn validate_cuda_next_token(
-        &self,
-        _model_id: &str,
-        _model_dir: &Path,
-        _device_id: usize,
-        _prompt: &str,
-    ) -> Result<CudaForwardReport, ModelError> {
-        Err(runtime_pending())
-    }
+#[cfg(feature = "cuda")]
+pub(super) fn validate_cuda_next_token(
+    _model_id: &str,
+    _model_dir: &Path,
+    _device_id: usize,
+    _prompt: &str,
+) -> Result<CudaForwardReport, ModelError> {
+    Err(runtime_pending())
 }
 
 #[cfg(feature = "cuda")]

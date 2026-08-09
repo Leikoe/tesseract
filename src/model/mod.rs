@@ -84,46 +84,22 @@ struct ModelManifest {
     model_type: String,
 }
 
-trait ArchitectureFactory: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn probe(&self, manifest: &ModelManifest) -> bool;
-    fn load(&self, model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError>;
-
-    #[cfg(feature = "cuda")]
-    fn load_cuda_executor(
-        &self,
-        model_id: &str,
-        model_dir: &Path,
-        device_id: usize,
-        kv_capacity_tokens: usize,
-        max_batch_tokens: usize,
-        max_running: usize,
-    ) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError>;
-
-    #[cfg(feature = "cuda")]
-    fn validate_cuda_model(
-        &self,
-        model_id: &str,
-        model_dir: &Path,
-        device_id: usize,
-    ) -> Result<CudaModelReport, ModelError>;
-
-    #[cfg(feature = "cuda")]
-    fn validate_cuda_next_token(
-        &self,
-        model_id: &str,
-        model_dir: &Path,
-        device_id: usize,
-        prompt: &str,
-    ) -> Result<CudaForwardReport, ModelError>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Architecture {
+    Llama,
+    Qwen35MoeText,
 }
 
-static ARCHITECTURES: [&dyn ArchitectureFactory; 2] = [&llama_3_2::FACTORY, &qwen3_5_moe::FACTORY];
+impl Architecture {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Llama => "llama",
+            Self::Qwen35MoeText => "qwen3_5_moe_text",
+        }
+    }
+}
 
-fn architecture_factory(
-    model_id: &str,
-    model_dir: &Path,
-) -> Result<&'static dyn ArchitectureFactory, ModelError> {
+fn architecture(model_id: &str, model_dir: &Path) -> Result<Architecture, ModelError> {
     let path = model_dir.join("config.json");
     let text = read_file(&path)?;
     let manifest: ModelManifest =
@@ -131,29 +107,41 @@ fn architecture_factory(
             path: path.clone(),
             source,
         })?;
-    let factory =
+    let architecture =
         resolve_architecture(&manifest).ok_or_else(|| ModelError::UnsupportedArchitecture {
             model_id: model_id.into(),
             architectures: manifest.architectures,
             model_type: manifest.model_type,
         })?;
     tracing::debug!(
-        architecture = factory.name(),
+        architecture = architecture.name(),
         model_id,
         "resolved model architecture"
     );
-    Ok(factory)
+    Ok(architecture)
 }
 
-fn resolve_architecture(manifest: &ModelManifest) -> Option<&'static dyn ArchitectureFactory> {
-    ARCHITECTURES
-        .iter()
-        .copied()
-        .find(|factory| factory.probe(manifest))
+fn resolve_architecture(manifest: &ModelManifest) -> Option<Architecture> {
+    let declares = |name: &str| {
+        manifest
+            .architectures
+            .iter()
+            .any(|architecture| architecture == name)
+    };
+    match manifest.model_type.as_str() {
+        "llama" if declares("LlamaForCausalLM") => Some(Architecture::Llama),
+        "qwen3_5_moe" if declares("Qwen3_5MoeForConditionalGeneration") => {
+            Some(Architecture::Qwen35MoeText)
+        }
+        _ => None,
+    }
 }
 
 pub fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
-    architecture_factory(model_id, model_dir)?.load(model_id, model_dir)
+    match architecture(model_id, model_dir)? {
+        Architecture::Llama => llama_3_2::load(model_id, model_dir),
+        Architecture::Qwen35MoeText => qwen3_5_moe::load(model_id, model_dir),
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -166,14 +154,24 @@ pub fn load_cuda_executor(
     max_running: usize,
 ) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError> {
     crate::cuda::enable_persistent_cubin_cache()?;
-    architecture_factory(model_id, model_dir)?.load_cuda_executor(
-        model_id,
-        model_dir,
-        device_id,
-        kv_capacity_tokens,
-        max_batch_tokens,
-        max_running,
-    )
+    match architecture(model_id, model_dir)? {
+        Architecture::Llama => llama_3_2::load_cuda_executor(
+            model_id,
+            model_dir,
+            device_id,
+            kv_capacity_tokens,
+            max_batch_tokens,
+            max_running,
+        ),
+        Architecture::Qwen35MoeText => qwen3_5_moe::load_cuda_executor(
+            model_id,
+            model_dir,
+            device_id,
+            kv_capacity_tokens,
+            max_batch_tokens,
+            max_running,
+        ),
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -183,7 +181,12 @@ pub fn validate_cuda_model(
     device_id: usize,
 ) -> Result<CudaModelReport, ModelError> {
     crate::cuda::enable_persistent_cubin_cache()?;
-    architecture_factory(model_id, model_dir)?.validate_cuda_model(model_id, model_dir, device_id)
+    match architecture(model_id, model_dir)? {
+        Architecture::Llama => llama_3_2::validate_cuda_model(model_id, model_dir, device_id),
+        Architecture::Qwen35MoeText => {
+            qwen3_5_moe::validate_cuda_model(model_id, model_dir, device_id)
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -194,8 +197,14 @@ pub fn validate_cuda_next_token(
     prompt: &str,
 ) -> Result<CudaForwardReport, ModelError> {
     crate::cuda::enable_persistent_cubin_cache()?;
-    architecture_factory(model_id, model_dir)?
-        .validate_cuda_next_token(model_id, model_dir, device_id, prompt)
+    match architecture(model_id, model_dir)? {
+        Architecture::Llama => {
+            llama_3_2::validate_cuda_next_token(model_id, model_dir, device_id, prompt)
+        }
+        Architecture::Qwen35MoeText => {
+            qwen3_5_moe::validate_cuda_next_token(model_id, model_dir, device_id, prompt)
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -267,28 +276,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_resolves_architecture_without_model_id_checks() {
+    fn dispatch_resolves_architecture_without_model_id_checks() {
         let manifest = ModelManifest {
             architectures: vec!["LlamaForCausalLM".into()],
             model_type: "llama".into(),
         };
-        assert_eq!(resolve_architecture(&manifest).unwrap().name(), "llama");
+        assert_eq!(resolve_architecture(&manifest), Some(Architecture::Llama));
     }
 
     #[test]
-    fn registry_resolves_qwen_text_from_the_outer_conditional_architecture() {
+    fn dispatch_resolves_qwen_text_from_the_outer_conditional_architecture() {
         let manifest = ModelManifest {
             architectures: vec!["Qwen3_5MoeForConditionalGeneration".into()],
             model_type: "qwen3_5_moe".into(),
         };
         assert_eq!(
-            resolve_architecture(&manifest).unwrap().name(),
-            "qwen3_5_moe_text"
+            resolve_architecture(&manifest),
+            Some(Architecture::Qwen35MoeText)
         );
     }
 
     #[test]
-    fn registry_rejects_unknown_architectures() {
+    fn dispatch_rejects_unknown_architectures() {
         let manifest = ModelManifest {
             architectures: vec!["UnknownForCausalLM".into()],
             model_type: "unknown".into(),

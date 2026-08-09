@@ -3,8 +3,7 @@ use std::{path::Path, sync::Arc};
 use serde::Deserialize;
 
 use super::{
-    ArchitectureFactory, ChatMessage, ChatRole, IncrementalDecoder, Model, ModelError,
-    ModelManifest, ModelSummary, read_file,
+    ChatMessage, ChatRole, IncrementalDecoder, Model, ModelError, ModelSummary, read_file,
     tokenizer::Tokenizer,
     weights::{SafeTensorSource, WeightSource},
 };
@@ -17,74 +16,53 @@ use crate::cuda::dense_decoder::{
     Llama3RopeConfig,
 };
 
-pub(super) static FACTORY: Factory = Factory;
+pub(super) fn load(model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
+    Llama32::load(model_id, model_dir).map(|model| Arc::new(model) as Arc<dyn Model>)
+}
 
-pub(super) struct Factory;
+#[cfg(feature = "cuda")]
+pub(super) fn load_cuda_executor(
+    model_id: &str,
+    model_dir: &Path,
+    device_id: usize,
+    kv_capacity_tokens: usize,
+    max_batch_tokens: usize,
+    max_running: usize,
+) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError> {
+    let model = Arc::new(Llama32::load(model_id, model_dir)?);
+    dense_decoder::load_executor(
+        model.dense_decoder_artifact()?,
+        device_id,
+        kv_capacity_tokens,
+        max_batch_tokens,
+        max_running,
+    )
+}
 
-impl ArchitectureFactory for Factory {
-    fn name(&self) -> &'static str {
-        "llama"
-    }
+#[cfg(feature = "cuda")]
+pub(super) fn validate_cuda_model(
+    model_id: &str,
+    model_dir: &Path,
+    device_id: usize,
+) -> Result<CudaModelReport, ModelError> {
+    let model = Llama32::load(model_id, model_dir)?;
+    dense_decoder::validate(
+        model.id(),
+        model.weights.as_ref(),
+        "model.norm.weight",
+        device_id,
+    )
+}
 
-    fn probe(&self, manifest: &ModelManifest) -> bool {
-        manifest.model_type == "llama"
-            && manifest
-                .architectures
-                .iter()
-                .any(|architecture| architecture == "LlamaForCausalLM")
-    }
-
-    fn load(&self, model_id: &str, model_dir: &Path) -> Result<Arc<dyn Model>, ModelError> {
-        Llama32::load(model_id, model_dir).map(|model| Arc::new(model) as Arc<dyn Model>)
-    }
-
-    #[cfg(feature = "cuda")]
-    fn load_cuda_executor(
-        &self,
-        model_id: &str,
-        model_dir: &Path,
-        device_id: usize,
-        kv_capacity_tokens: usize,
-        max_batch_tokens: usize,
-        max_running: usize,
-    ) -> Result<Box<dyn crate::engine::ModelExecutor>, ModelError> {
-        let model = Arc::new(Llama32::load(model_id, model_dir)?);
-        dense_decoder::load_executor(
-            model.dense_decoder_artifact()?,
-            device_id,
-            kv_capacity_tokens,
-            max_batch_tokens,
-            max_running,
-        )
-    }
-
-    #[cfg(feature = "cuda")]
-    fn validate_cuda_model(
-        &self,
-        model_id: &str,
-        model_dir: &Path,
-        device_id: usize,
-    ) -> Result<CudaModelReport, ModelError> {
-        let model = Llama32::load(model_id, model_dir)?;
-        dense_decoder::validate(
-            model.id(),
-            model.weights.as_ref(),
-            "model.norm.weight",
-            device_id,
-        )
-    }
-
-    #[cfg(feature = "cuda")]
-    fn validate_cuda_next_token(
-        &self,
-        model_id: &str,
-        model_dir: &Path,
-        device_id: usize,
-        prompt: &str,
-    ) -> Result<CudaForwardReport, ModelError> {
-        let model = Arc::new(Llama32::load(model_id, model_dir)?);
-        dense_decoder::validate_next_token(model.dense_decoder_artifact()?, device_id, prompt)
-    }
+#[cfg(feature = "cuda")]
+pub(super) fn validate_cuda_next_token(
+    model_id: &str,
+    model_dir: &Path,
+    device_id: usize,
+    prompt: &str,
+) -> Result<CudaForwardReport, ModelError> {
+    let model = Arc::new(Llama32::load(model_id, model_dir)?);
+    dense_decoder::validate_next_token(model.dense_decoder_artifact()?, device_id, prompt)
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -49,7 +49,7 @@ api -> ModelFrontend -> authoritative engine request state
           Attention/MoE backends + immutable KernelPlan
                               ^
                               |
-       architecture factory + KernelCatalog + independent weight source
+       architecture match + KernelCatalog + independent weight source
 ```
 
 Dependencies only point downward. The scheduler cannot import CUDA or model
@@ -252,13 +252,9 @@ Operation-family backends are statically composed by shared program types.
 Architecture selection and checkpoint transport are independent startup axes:
 
 ```rust
-pub trait ArchitectureFactory: Send + Sync {
-    fn probe(&self, manifest: &ModelManifest) -> Probe;
-    fn instantiate(
-        &self,
-        config: &ModelConfig,
-        target: &ExecutionTarget,
-    ) -> Result<UnloadedProgram, LoadError>;
+enum Architecture {
+    Llama,
+    Qwen35MoeText,
 }
 
 pub trait WeightSource {
@@ -273,11 +269,12 @@ pub struct LoadedModel {
 }
 ```
 
-The registry contains architecture factories, not model-name checks scattered
-through the engine. SafeTensors, sharded, remote, quantized, and test-generated
-weight sources feed the same named-tensor interface. A Llama factory parses its
-private configuration, validates and maps tensors, and constructs a shared
-`DenseDecoder` program. Only `ModelFrontend` and `ModelExecutor` reach the
+One parser maps `config.json` architecture metadata to the closed enum, and an
+exhaustive match calls the selected model module's constructor. SafeTensors,
+sharded, remote, quantized, and test-generated weight sources feed the same
+named-tensor interface. The Llama constructor parses its private configuration,
+maps tensors, and constructs a shared `DenseDecoder` program. Only
+`ModelFrontend` and `ModelExecutor` reach the
 engine.
 
 Adapter identity participates in request and prefix-cache identity. Loading,
@@ -408,7 +405,6 @@ pub trait ExecutorFactory: Send + Sync {
 }
 
 pub struct RegistryBuilder {
-    architectures: BTreeMap<ArchitectureName, Arc<dyn ArchitectureFactory>>,
     weight_sources: BTreeMap<FormatName, Arc<dyn WeightSourceFactory>>,
     executors: BTreeMap<BackendName, Arc<dyn ExecutorFactory>>,
     frontends: BTreeMap<ProcessorName, Arc<dyn FrontendFactory>>,
@@ -763,7 +759,7 @@ src/
     batch.rs            mode-aware validated ForwardBatch
     executor.rs         ModelExecutor submission/completion contract
   model/
-    registry.rs         ArchitectureFactory registry
+    mod.rs              config-driven exhaustive architecture dispatch
     frontend.rs         ModelFrontend, TokenDecoder, processor types
     weight_source.rs    format/transport-independent named tensors
     programs/
@@ -832,9 +828,9 @@ The refactor should remain runnable after every step:
    `AttentionBackend` and fixed-shape graph policy live in separate decoder
    submodules rather than in either the architecture adapter or transformer
    program.
-9. **Implemented:** the startup registry probes `config.json` architecture
-   metadata rather than deployment/model IDs, then delegates construction to a
-   registered `ArchitectureFactory`. The format-neutral, read-only
+9. **Implemented:** startup parses `config.json` architecture metadata rather
+   than deployment/model IDs, then exhaustively dispatches to the selected
+   model module's constructor. The format-neutral, read-only
    `WeightSource` exposes named tensor metadata and bytes; sharded or monolithic
    SafeTensors is its first implementation, while CUDA materialization now
    belongs to the decoder runtime. Neither boundary dispatches in the token hot

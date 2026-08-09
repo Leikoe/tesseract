@@ -160,6 +160,10 @@ why are we validating ? you should parse and not validate.
 
 you should look at how sglang handles loading a quantized model (and how they get the info that it's quantized in the first place)
 
+## User
+
+great ! why do we have factories ? can't we just have a match on architecture from the model's config json which calls the model's ::load(...) constructor and returns a dyn Model ?
+
 ```text
 you will need good grouped gemm kernels (nfp4 weights loads + bf16 activations loads + bf16 tensor cores w fp32 acc + cast back to bf16 before store)
 ```
