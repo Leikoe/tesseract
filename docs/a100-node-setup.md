@@ -63,7 +63,9 @@ Start the CUDA server, then run the backend-independent benchmark client:
 cd /home/ubuntu/tesseract
 cargo build --release --features cuda --bin tesseract
 target/release/tesseract --model-path /home/ubuntu/models/Llama-3.2-1B-Instruct &
-target/release/tesseract bench --num-prompts 1000 --max-concurrency 32 \
+target/release/tesseract bench \
+  --tokenizer /home/ubuntu/models/Llama-3.2-1B-Instruct/tokenizer.json \
+  --num-prompts 1000 --max-concurrency 32 \
   --output /tmp/tesseract-a100.json
 ```
 

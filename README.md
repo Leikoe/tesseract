@@ -70,14 +70,18 @@ client-side concurrency limit:
 cargo run --bin tesseract -- bench \
   --base-url http://127.0.0.1:8000 \
   --model meta-llama/Llama-3.2-1B-Instruct \
+  --tokenizer /path/to/model/tokenizer.json \
+  --input-len 1024 \
+  --output-len 128 \
   --num-prompts 1000 \
   --max-concurrency 32 \
   --output results.json
 ```
 
-Streaming is enabled so the report includes request throughput, output-token
-throughput, TTFT, and inter-token latency. Use `tesseract bench --help` for
-arrival-rate, warmup, prompt, header, endpoint, timeout, and output controls.
+The default random dataset constructs deterministic token-length prompts with a
+local tokenizer, including optional length variation and a shared prefix.
+Streaming is enabled so the report includes request and token throughput, TTFT,
+and inter-token latency. Use `tesseract bench --help` for all controls.
 
 
 ## Research notes

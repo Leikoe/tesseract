@@ -17,21 +17,16 @@ use tokio::{sync::Semaphore, task::JoinSet};
 
 use crate::config::{BenchmarkApi, BenchmarkConfig};
 
-const PROMPTS: &[&str] = &[
-    "What is the capital of France? Answer briefly.",
-    "Count from one to ten, one number per line.",
-    "In two sentences, explain why the sky appears blue.",
-    "Write a short Rust function that adds two i32 values.",
-    "Name three practical uses for a priority queue.",
-    "Summarize the difference between TCP and UDP in one paragraph.",
-    "Give four tips for debugging a production service.",
-    "What is 17 multiplied by 23? Show the result only.",
-];
+mod dataset;
+
+use dataset::prepare;
 
 #[derive(Debug, Serialize)]
 struct RequestResult {
     index: usize,
     prompt: String,
+    expected_input_tokens: Option<usize>,
+    requested_output_tokens: usize,
     latency_seconds: f64,
     ttft_seconds: f64,
     mean_inter_token_seconds: f64,
@@ -46,6 +41,7 @@ struct RequestSpec<'a> {
     api: BenchmarkApi,
     model: &'a str,
     prompt: &'a str,
+    expected_input_tokens: Option<usize>,
     output_len: usize,
     seed: u64,
     index: usize,
@@ -62,10 +58,13 @@ struct Distribution {
 #[derive(Debug, Serialize)]
 struct Summary {
     requests: usize,
+    prompt_tokens: usize,
     completion_tokens: usize,
     wall_seconds: f64,
     request_throughput: f64,
+    prompt_tokens_per_second: f64,
     completion_tokens_per_second: f64,
+    total_tokens_per_second: f64,
     request_latency_seconds: Distribution,
     ttft_seconds: Distribution,
     inter_token_seconds: Distribution,
@@ -79,6 +78,10 @@ struct Report<'a> {
     api: &'a str,
     endpoint: &'a str,
     model: &'a str,
+    dataset: &'a str,
+    input_len: usize,
+    length_variation: f64,
+    shared_prefix_len: usize,
     num_prompts: usize,
     max_concurrency: usize,
     request_rate: Option<f64>,
@@ -99,16 +102,18 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
         .build()
         .context("build benchmark HTTP client")?;
 
-    let prompts = prompts(&config);
+    let samples = prepare(&config)?;
     for index in 0..config.warmup_requests {
+        let sample = &samples[index % samples.len()];
         request_once(
             &client,
             RequestSpec {
                 endpoint: &endpoint,
                 api: config.api,
                 model: &config.model,
-                prompt: prompts[index % prompts.len()],
-                output_len: config.output_len.min(32),
+                prompt: &sample.prompt,
+                expected_input_tokens: sample.expected_input_tokens,
+                output_len: sample.output_tokens.min(32),
                 seed: config.seed.wrapping_add(index as u64),
                 index,
             },
@@ -130,10 +135,12 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
         let endpoint = endpoint.clone();
         let api = config.api;
         let model = config.model.clone();
-        let prompt = prompts[index % prompts.len()].to_owned();
+        let sample = &samples[index];
+        let prompt = sample.prompt.clone();
+        let expected_input_tokens = sample.expected_input_tokens;
         let permits = Arc::clone(&permits);
         let due = started + arrivals[index];
-        let output_len = config.output_len;
+        let output_len = sample.output_tokens;
         let seed = config.seed.wrapping_add(index as u64);
         tasks.spawn(async move {
             tokio::time::sleep_until(due.into()).await;
@@ -148,6 +155,7 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
                     api,
                     model: &model,
                     prompt: &prompt,
+                    expected_input_tokens,
                     output_len,
                     seed,
                     index,
@@ -182,6 +190,10 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
         summary.request_throughput
     );
     println!(
+        "Input token throughput: {:.2} tok/s",
+        summary.prompt_tokens_per_second
+    );
+    println!(
         "Output token throughput: {:.2} tok/s",
         summary.completion_tokens_per_second
     );
@@ -203,6 +215,10 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
             api: config.api.name(),
             endpoint: endpoint.as_str(),
             model: &config.model,
+            dataset: config.dataset.name(),
+            input_len: config.input_len,
+            length_variation: config.length_variation,
+            shared_prefix_len: config.shared_prefix_len,
             num_prompts: config.num_prompts,
             max_concurrency,
             request_rate: config
@@ -224,6 +240,10 @@ pub async fn run(config: BenchmarkConfig) -> Result<()> {
 fn validate(config: &BenchmarkConfig) -> Result<()> {
     ensure!(config.num_prompts > 0, "num-prompts must be positive");
     ensure!(config.output_len > 0, "output-len must be positive");
+    ensure!(
+        config.length_variation.is_finite() && (0.0..1.0).contains(&config.length_variation),
+        "length-variation must be finite and in [0, 1)"
+    );
     if let Some(concurrency) = config.max_concurrency {
         ensure!(concurrency > 0, "max-concurrency must be positive");
     }
@@ -264,13 +284,6 @@ fn headers(values: &[String]) -> Result<HeaderMap> {
         headers.append(name, value);
     }
     Ok(headers)
-}
-
-fn prompts(config: &BenchmarkConfig) -> Vec<&str> {
-    match config.prompt.as_deref() {
-        Some(prompt) => vec![prompt],
-        None => PROMPTS.to_vec(),
-    }
 }
 
 async fn request_once(client: &Client, request: RequestSpec<'_>) -> Result<RequestResult> {
@@ -327,6 +340,8 @@ async fn request_once(client: &Client, request: RequestSpec<'_>) -> Result<Reque
     Ok(RequestResult {
         index: request.index,
         prompt: request.prompt.to_owned(),
+        expected_input_tokens: request.expected_input_tokens,
+        requested_output_tokens: request.output_len,
         latency_seconds,
         ttft_seconds: token_times.first().copied().unwrap_or(latency_seconds),
         mean_inter_token_seconds: mean(&intervals),
@@ -426,6 +441,7 @@ fn splitmix64(state: &mut u64) -> u64 {
 }
 
 fn summarize(results: &[RequestResult], wall_seconds: f64) -> Summary {
+    let prompt_tokens = results.iter().map(|r| r.prompt_tokens).sum();
     let completion_tokens = results.iter().map(|r| r.completion_tokens).sum();
     let latencies = results
         .iter()
@@ -439,10 +455,13 @@ fn summarize(results: &[RequestResult], wall_seconds: f64) -> Summary {
         .collect::<Vec<_>>();
     Summary {
         requests: results.len(),
+        prompt_tokens,
         completion_tokens,
         wall_seconds,
         request_throughput: results.len() as f64 / wall_seconds,
+        prompt_tokens_per_second: prompt_tokens as f64 / wall_seconds,
         completion_tokens_per_second: completion_tokens as f64 / wall_seconds,
+        total_tokens_per_second: (prompt_tokens + completion_tokens) as f64 / wall_seconds,
         request_latency_seconds: distribution(&latencies),
         ttft_seconds: distribution(&ttfts),
         inter_token_seconds: distribution(&inter_tokens),

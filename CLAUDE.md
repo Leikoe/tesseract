@@ -1195,3 +1195,6 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 ```text
 bench command should NOT require CUDA. it merely uses reqwests to make requests to the server. you can copy the args of sglang's bench or vllm's
 ```
+```text
+you might want to look at how random dataset works in vllm bench
+```

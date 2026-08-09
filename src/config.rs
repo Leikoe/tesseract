@@ -39,6 +39,12 @@ pub struct BenchmarkConfig {
     #[arg(long, env = "TESSERACT_MODEL", default_value = DEFAULT_MODEL_ID)]
     pub model: String,
 
+    #[arg(long, value_enum, default_value_t = BenchmarkDataset::Random)]
+    pub dataset: BenchmarkDataset,
+
+    #[arg(long, help = "Tokenizer JSON used to construct token-length workloads")]
+    pub tokenizer: Option<PathBuf>,
+
     #[arg(long, default_value_t = 1000)]
     pub num_prompts: usize,
 
@@ -50,6 +56,19 @@ pub struct BenchmarkConfig {
 
     #[arg(long, default_value_t = 128)]
     pub output_len: usize,
+
+    #[arg(long, default_value_t = 1024)]
+    pub input_len: usize,
+
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        help = "Symmetric input/output length variation in [0, 1)"
+    )]
+    pub length_variation: f64,
+
+    #[arg(long, default_value_t = 0)]
+    pub shared_prefix_len: usize,
 
     #[arg(long, default_value_t = 1)]
     pub warmup_requests: usize,
@@ -74,6 +93,21 @@ pub struct BenchmarkConfig {
 pub enum BenchmarkApi {
     ChatCompletions,
     Completions,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum BenchmarkDataset {
+    Random,
+    Builtin,
+}
+
+impl BenchmarkDataset {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Random => "random",
+            Self::Builtin => "builtin",
+        }
+    }
 }
 
 impl BenchmarkApi {
