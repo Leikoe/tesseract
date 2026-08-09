@@ -418,7 +418,7 @@ mod kernels {
         beta_ptr: *mut bf16,
         chunk_starts: &Tensor<i32, { [-1] }>,
         chunk_lengths: &Tensor<i32, { [-1] }>,
-        inverse: &mut Tensor<bf16, { [1, 1, 16, 16] }>,
+        inverse: &mut Tensor<bf16, { [1, 1, 256] }>,
     ) {
         const EPSILON: f32 = 1.0e-6;
         const ONE: f32 = 1.0;
@@ -443,9 +443,10 @@ mod kernels {
 
         let row: Tile<i32, { [16, 1] }> = iota(const_shape![16]).reshape(const_shape![16, 1]);
         let column: Tile<i32, { [1, 128] }> = iota(const_shape![128]).reshape(const_shape![1, 128]);
-        let key_offset = ((start.broadcast(const_shape![16, 1]) + row) * 8192i32
-            + (key_head + 16i32) * 128i32)
-            .broadcast(const_shape![16, 128])
+        let row_shape = const_shape![16, 1];
+        let key_offset = ((start.broadcast(row_shape) + row) * 8192i32.broadcast(row_shape)
+            + ((key_head + 16i32) * 128i32).broadcast(row_shape))
+        .broadcast(const_shape![16, 128])
             + column.broadcast(const_shape![16, 128]);
         let key_base: PointerTile<*mut bf16, { [] }> = pointer_to_tile(mixed_qkv_ptr);
         let key_base: PointerTile<*mut bf16, { [1, 1] }> = key_base.reshape(const_shape![1, 1]);
@@ -474,7 +475,8 @@ mod kernels {
         let zero_matrix: Tile<f32, { [16, 16] }> = broadcast_scalar(ZERO, const_shape![16, 16]);
         let kkt: Tile<f32, { [16, 16] }> = mma(key, key.transpose(), zero_matrix);
 
-        let head_offset = (start.broadcast(const_shape![16, 1]) + row) * 32i32 + value_head;
+        let head_offset = (start.broadcast(row_shape) + row) * 32i32.broadcast(row_shape)
+            + value_head.broadcast(row_shape);
         let log_base: PointerTile<*mut f32, { [] }> = pointer_to_tile(log_decay_cumsum_ptr);
         let log_base: PointerTile<*mut f32, { [1, 1] }> = log_base.reshape(const_shape![1, 1]);
         let log_base: PointerTile<*mut f32, { [16, 1] }> = log_base.broadcast(const_shape![16, 1]);
@@ -531,12 +533,12 @@ mod kernels {
                 0i32,
             );
             let before_row = lt_tile(causal_column, solved_row.broadcast(const_shape![1, 16]));
-            let row_is_valid = lt_tile(
-                solved_row.broadcast(const_shape![]),
-                len.broadcast(const_shape![]),
+            let row_is_valid: Tile<bool, { [1, 16] }> = lt_tile(
+                solved_row.broadcast(const_shape![1, 16]),
+                len.broadcast(const_shape![1, 16]),
             );
             next_row = select(
-                before_row & row_is_valid.broadcast(const_shape![1, 16]),
+                before_row & row_is_valid,
                 next_row,
                 broadcast_scalar(ZERO, const_shape![1, 16]),
             );
@@ -562,8 +564,8 @@ mod kernels {
             solved + select(diagonal, one_matrix, zero_matrix),
             zero_matrix,
         );
-        let solved: Tile<bf16, { [1, 1, 16, 16] }> = ftof(
-            solved.reshape(const_shape![1, 1, 16, 16]),
+        let solved: Tile<bf16, { [1, 1, 256] }> = ftof(
+            solved.reshape(const_shape![1, 1, 256]),
             rounding::NearestEven,
         );
         inverse.store(solved);
@@ -874,7 +876,7 @@ fn solve_prefill_kkt(
         return Err(ModelError::Cuda("invalid GDN prefill KKT geometry".into()));
     }
     let mut inverse =
-        api::zeros::<bf16>(&[plan.chunks(), VALUE_HEADS, PREFILL_CHUNK, PREFILL_CHUNK])
+        api::zeros::<bf16>(&[plan.chunks(), VALUE_HEADS, PREFILL_CHUNK * PREFILL_CHUNK])
             .sync_on(stream)
             .map_err(|error| {
                 ModelError::Cuda(format!("allocate GDN prefill inverse: {error:?}"))
@@ -886,7 +888,7 @@ fn solve_prefill_kkt(
             gates.beta.device_pointer(),
             plan.chunk_starts.clone(),
             plan.chunk_lengths.clone(),
-            (&mut inverse).partition([1, 1, PREFILL_CHUNK, PREFILL_CHUNK]),
+            (&mut inverse).partition([1, 1, PREFILL_CHUNK * PREFILL_CHUNK]),
         )
     }
     .sync_on(stream)
