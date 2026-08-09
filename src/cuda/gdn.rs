@@ -303,9 +303,84 @@ mod kernels {
             Latency::<0>,
         );
     }
+
+    #[cutile::entry()]
+    fn qwen_gdn_output_gate(
+        input: &Tensor<bf16, { [-1, 32, 128] }>,
+        gate: &Tensor<bf16, { [-1, 32, 128] }>,
+        weight: &Tensor<bf16, { [128] }>,
+        epsilon: f32,
+        output: &mut Tensor<bf16, { [1, 1, 128] }>,
+    ) {
+        let pid = get_tile_block_id();
+        let input: Tile<f32, { [128] }> = convert_tile(
+            input
+                .partition(const_shape![1, 1, 128])
+                .load([pid.0, pid.1, 0i32])
+                .reshape(const_shape![128]),
+        );
+        let gate: Tile<f32, { [128] }> = convert_tile(
+            gate.partition(const_shape![1, 1, 128])
+                .load([pid.0, pid.1, 0i32])
+                .reshape(const_shape![128]),
+        );
+        let weight: Tile<f32, { [128] }> =
+            convert_tile(weight.partition(const_shape![128]).load([0i32]));
+        let square_sum: Tile<f32, { [1] }> = reduce_sum(input * input, 0i32);
+        let square_sum: Tile<f32, { [] }> = square_sum.reshape(const_shape![]);
+        const WIDTH: f32 = 128.0;
+        let width: Tile<f32, { [] }> = broadcast_scalar(WIDTH, const_shape![]);
+        let epsilon: Tile<f32, { [] }> = scalar_to_tile(epsilon);
+        let inverse: Tile<f32, { [] }> =
+            rsqrt(true_div(square_sum, width) + epsilon, ftz::Disabled);
+        let inverse: Tile<f32, { [1] }> = inverse.reshape(const_shape![1]);
+        let inverse: Tile<f32, { [128] }> = inverse.broadcast(const_shape![128]);
+        const ONE: f32 = 1.0;
+        const ZERO: f32 = 0.0;
+        let one: Tile<f32, { [128] }> = broadcast_scalar(ONE, const_shape![128]);
+        let zero: Tile<f32, { [128] }> = broadcast_scalar(ZERO, const_shape![128]);
+        let gated = input * inverse * weight * gate * true_div(one, one + exp(zero - gate));
+        let gated: Tile<bf16, { [1, 1, 128] }> = ftof(
+            gated.reshape(const_shape![1, 1, 128]),
+            rounding::NearestEven,
+        );
+        output.store(gated);
+    }
 }
 
-use kernels::{qwen_gdn_conv_decode, qwen_gdn_decode};
+use kernels::{qwen_gdn_conv_decode, qwen_gdn_decode, qwen_gdn_output_gate};
+
+pub(crate) fn output_gate(
+    input: Arc<Tensor<bf16>>,
+    gate: Arc<Tensor<bf16>>,
+    weight: Arc<Tensor<bf16>>,
+    epsilon: f32,
+    rows: usize,
+    stream: &Arc<Stream>,
+) -> Result<Tensor<bf16>, ModelError> {
+    if input.shape() != [rows as i32, VALUE_HEADS as i32, HEAD_DIM as i32]
+        || gate.shape() != input.shape()
+        || weight.shape() != [HEAD_DIM as i32]
+        || !epsilon.is_finite()
+        || epsilon <= 0.0
+    {
+        return Err(ModelError::Cuda("invalid GDN output gate geometry".into()));
+    }
+    let mut output = api::zeros::<bf16>(&[rows, VALUE_HEADS, HEAD_DIM])
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("allocate GDN gated output: {error:?}")))?;
+    let (_, _, _, _, output_partition) = qwen_gdn_output_gate(
+        input,
+        gate,
+        weight,
+        epsilon,
+        (&mut output).partition([1, 1, HEAD_DIM]),
+    )
+    .sync_on(stream)
+    .map_err(|error| ModelError::Cuda(format!("execute GDN output gate: {error:?}")))?;
+    drop(output_partition);
+    Ok(output)
+}
 
 pub(crate) struct RecurrentState {
     conv: Tensor<bf16>,
@@ -424,6 +499,7 @@ pub(crate) struct GdnProbe {
 
 pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
     let conv_max_abs_error = probe_conv(stream)?;
+    let output_gate_max_abs_error = probe_output_gate(stream)?;
     let rows = 2usize;
     let query_host = host_bf16(rows * KEY_HEADS * HEAD_DIM, 17, 8.0);
     let key_host = host_bf16(rows * KEY_HEADS * HEAD_DIM, 19, 9.0);
@@ -474,7 +550,7 @@ pub(crate) fn probe(stream: &Arc<Stream>) -> Result<GdnProbe, ModelError> {
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("download GDN probe: {error:?}")))?;
-    let mut max_abs_error = conv_max_abs_error;
+    let mut max_abs_error = conv_max_abs_error.max(output_gate_max_abs_error);
     for row in 0..rows {
         for value_head in 0..VALUE_HEADS {
             let key_head = value_head / 2;
@@ -568,6 +644,54 @@ fn probe_conv(stream: &Arc<Stream>) -> Result<f32, ModelError> {
                 "GDN convolution differential mismatch at {index}: {} != {expected}",
                 actual[index].to_f32()
             )));
+        }
+    }
+    Ok(max_abs_error)
+}
+
+fn probe_output_gate(stream: &Arc<Stream>) -> Result<f32, ModelError> {
+    let rows = 2usize;
+    let input_host = host_bf16(rows * VALUE_HEADS * HEAD_DIM, 31, 13.0);
+    let gate_host = host_bf16(rows * VALUE_HEADS * HEAD_DIM, 37, 17.0);
+    let weight_host = host_bf16(HEAD_DIM, 19, 11.0);
+    const EPSILON: f32 = 1.0e-6;
+    let output = output_gate(
+        upload_bf16(&input_host, &[rows, VALUE_HEADS, HEAD_DIM], stream)?,
+        upload_bf16(&gate_host, &[rows, VALUE_HEADS, HEAD_DIM], stream)?,
+        upload_bf16(&weight_host, &[HEAD_DIM], stream)?,
+        EPSILON,
+        rows,
+        stream,
+    )?;
+    let actual: Vec<bf16> = output
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("download GDN output gate probe: {error:?}")))?;
+    let mut max_abs_error = 0.0f32;
+    for row_head in 0..rows * VALUE_HEADS {
+        let start = row_head * HEAD_DIM;
+        let square_mean = input_host[start..start + HEAD_DIM]
+            .iter()
+            .map(|element| element.to_f32().powi(2))
+            .sum::<f32>()
+            / HEAD_DIM as f32;
+        let inverse = 1.0 / (square_mean + EPSILON).sqrt();
+        for element in 0..HEAD_DIM {
+            let index = start + element;
+            let input = input_host[index].to_f32();
+            let gate = gate_host[index].to_f32();
+            let expected = bf16::from_f32(
+                input * inverse * weight_host[element].to_f32() * gate / (1.0 + (-gate).exp()),
+            )
+            .to_f32();
+            let error = (actual[index].to_f32() - expected).abs();
+            max_abs_error = max_abs_error.max(error);
+            if error > 0.01 || !actual[index].to_f32().is_finite() {
+                return Err(ModelError::Cuda(format!(
+                    "GDN output gate differential mismatch at {index}: {} != {expected}",
+                    actual[index].to_f32()
+                )));
+            }
         }
     }
     Ok(max_abs_error)
