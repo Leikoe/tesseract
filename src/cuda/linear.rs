@@ -11,8 +11,7 @@ use cuda_core::{IntoResult, Stream};
 use cutile::{
     api,
     core::bf16,
-    tensor::{IntoPartition, Reshape, Tensor, ToHostVec},
-    tile_kernel::TileKernel,
+    tensor::{Reshape, Tensor, ToHostVec},
 };
 
 use crate::{
@@ -54,9 +53,12 @@ mod kernels {
             let high = (packed / sixteen).reshape(const_shape![16, 8, 1]);
             let nibbles: Tile<u8, { [16, 8, 2] }> = cat(low, high, 2);
             let weight = decode_fp4(nibbles.reshape(const_shape![16, 16]));
-            let scale = weight_scale
-                .load([pid.1, k_tile])
-                .broadcast(const_shape![16, 16]);
+            let scale: Tile<f32, { [16, 16] }> = ftof(
+                weight_scale
+                    .load([pid.1, k_tile])
+                    .broadcast(const_shape![16, 16]),
+                rounding::NearestEven,
+            );
             let global = broadcast_scalar(weight_global_scale, const_shape![16, 16]);
             let weight: Tile<bf16, { [16, 16] }> =
                 ftof(weight * scale * global, rounding::NearestEven);
@@ -105,10 +107,13 @@ mod kernels {
                 let high = (packed / sixteen).reshape(const_shape![16, 8, 1]);
                 let nibbles: Tile<u8, { [16, 8, 2] }> = cat(low, high, 2);
                 let weight = decode_fp4(nibbles.reshape(const_shape![16, 16]));
-                let scale = weight_scale
-                    .load([expert, column_tile, k_tile])
-                    .reshape(const_shape![16, 1])
-                    .broadcast(const_shape![16, 16]);
+                let scale: Tile<f32, { [16, 16] }> = ftof(
+                    weight_scale
+                        .load([expert, column_tile, k_tile])
+                        .reshape(const_shape![16, 1])
+                        .broadcast(const_shape![16, 16]),
+                    rounding::NearestEven,
+                );
                 let weight: Tile<bf16, { [16, 16] }> =
                     ftof(weight * scale * global, rounding::NearestEven);
                 accumulator = mma(activation, weight.transpose(), accumulator);
@@ -306,7 +311,7 @@ impl Nvfp4W4A16Linear {
         let output = api::zeros::<bf16>(&[rows, self.output_size])
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("allocate NVFP4 output: {error:?}")))?
-            .into_partition([TILE_M, TILE_N]);
+            .partition([TILE_M, TILE_N]);
         let (output, ..) = nvfp4_w4a16(
             output,
             input,
@@ -449,7 +454,7 @@ impl GroupedNvfp4W4A16 {
         let output = api::zeros::<bf16>(&[rows, self.output_size])
             .sync_on(stream)
             .map_err(|error| ModelError::Cuda(format!("allocate grouped output: {error:?}")))?
-            .into_partition([TILE_M, TILE_N]);
+            .partition([TILE_M, TILE_N]);
         let logical_tiles = (rows / TILE_M)
             .checked_mul(self.output_size / TILE_N)
             .ok_or_else(|| ModelError::Cuda("grouped output tile count overflowed".into()))?;
