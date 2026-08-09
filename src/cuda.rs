@@ -9,7 +9,7 @@ use cuda_async::device_operation::DeviceOp;
 use cuda_async::{cuda_graph::CudaGraph, error::DeviceError};
 use cuda_core::{Device, f4e2m1fnx2, f8e4m3fn};
 use cutile::{
-    api,
+    api::{self, DeviceOpReshape},
     core::bf16,
     tensor::{PartitionMut, Reshape, ToHostVec},
 };
@@ -137,7 +137,7 @@ pub enum CudaError {
 /// every output numerically. An unsupported compiler/runtime path is reported
 /// as a capability result rather than inferred from the GPU model name.
 pub fn probe_nvfp4_scaled_mma(device_id: usize) -> Result<Nvfp4ScaledMmaReport, CudaError> {
-    use cutile::tile_kernel::{PartitionOp, TileKernel};
+    use cutile::tile_kernel::TileKernel;
 
     const TILE: usize = 16;
     const K: usize = 128;
