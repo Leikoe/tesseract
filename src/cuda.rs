@@ -83,9 +83,127 @@ mod nvfp4_probe_kernels {
         }
         out.store(accumulator);
     }
+
+    /// SM80-compatible fallback: keep checkpoint storage byte-addressable,
+    /// decode FP4 and E4M3 in Tile IR, then use ordinary BF16 tensor-core MMA.
+    /// This fixed validation tile exercises every primitive needed by the
+    /// shape-generic production kernel without claiming performance parity.
+    #[cutile::entry()]
+    fn byte_decode_mma(
+        out: &mut Tensor<f32, { [16, 16] }>,
+        lhs_packed: &Tensor<u8, { [-1, -1] }>,
+        rhs_packed: &Tensor<u8, { [-1, -1] }>,
+        lhs_scale_bytes: &Tensor<u8, { [-1, -1] }>,
+        rhs_scale_bytes: &Tensor<u8, { [-1, -1] }>,
+    ) {
+        let lhs_packed = lhs_packed.load_tile(const_shape![16, 64], [0, 0]);
+        let rhs_packed = rhs_packed.load_tile(const_shape![16, 64], [0, 0]);
+        let sixteen = constant(16u8, const_shape![16, 64]);
+
+        let lhs_low = (lhs_packed % sixteen).reshape(const_shape![16, 64, 1]);
+        let lhs_high = (lhs_packed / sixteen).reshape(const_shape![16, 64, 1]);
+        let lhs_nibbles: Tile<u8, { [16, 64, 2] }> = cat(lhs_low, lhs_high, 2);
+        let lhs_nibbles = lhs_nibbles.reshape(const_shape![16, 128]);
+
+        let rhs_low = (rhs_packed % sixteen).reshape(const_shape![16, 64, 1]);
+        let rhs_high = (rhs_packed / sixteen).reshape(const_shape![16, 64, 1]);
+        let rhs_nibbles: Tile<u8, { [16, 64, 2] }> = cat(rhs_low, rhs_high, 2);
+        let rhs_nibbles = rhs_nibbles.reshape(const_shape![16, 128]);
+
+        let lhs = decode_fp4(lhs_nibbles);
+        let rhs = decode_fp4(rhs_nibbles);
+        let lhs_scales = decode_e4m3(lhs_scale_bytes.load_tile(const_shape![16, 8], [0, 0]))
+            .reshape(const_shape![16, 8, 1])
+            .broadcast(const_shape![16, 8, 16])
+            .reshape(const_shape![16, 128]);
+        let rhs_scales = decode_e4m3(rhs_scale_bytes.load_tile(const_shape![16, 8], [0, 0]))
+            .reshape(const_shape![16, 8, 1])
+            .broadcast(const_shape![16, 8, 16])
+            .reshape(const_shape![16, 128]);
+
+        let lhs: Tile<bf16, { [16, 128] }> = ftof(lhs * lhs_scales, rounding::NearestEven);
+        let rhs: Tile<bf16, { [128, 16] }> =
+            ftof(rhs * rhs_scales, rounding::NearestEven).transpose();
+        let accumulator = constant(0.0f32, const_shape![16, 16]);
+        out.store(mmaf(lhs, rhs, accumulator));
+    }
+
+    fn decode_fp4(nibbles: Tile<u8, { [16, 128] }>) -> Tile<f32, { [16, 128] }> {
+        let eight = constant(8u8, const_shape![16, 128]);
+        let magnitude = nibbles % eight;
+        let sign = nibbles / eight;
+        let mut value = constant(0.0f32, const_shape![16, 128]);
+        value = select(
+            eq_tile(magnitude, constant(1u8, const_shape![16, 128])),
+            constant(0.5f32, const_shape![16, 128]),
+            value,
+        );
+        value = select(
+            eq_tile(magnitude, constant(2u8, const_shape![16, 128])),
+            constant(1.0f32, const_shape![16, 128]),
+            value,
+        );
+        value = select(
+            eq_tile(magnitude, constant(3u8, const_shape![16, 128])),
+            constant(1.5f32, const_shape![16, 128]),
+            value,
+        );
+        value = select(
+            eq_tile(magnitude, constant(4u8, const_shape![16, 128])),
+            constant(2.0f32, const_shape![16, 128]),
+            value,
+        );
+        value = select(
+            eq_tile(magnitude, constant(5u8, const_shape![16, 128])),
+            constant(3.0f32, const_shape![16, 128]),
+            value,
+        );
+        value = select(
+            eq_tile(magnitude, constant(6u8, const_shape![16, 128])),
+            constant(4.0f32, const_shape![16, 128]),
+            value,
+        );
+        value = select(
+            eq_tile(magnitude, constant(7u8, const_shape![16, 128])),
+            constant(6.0f32, const_shape![16, 128]),
+            value,
+        );
+        select(
+            eq_tile(sign, constant(1u8, const_shape![16, 128])),
+            constant(0.0f32, const_shape![16, 128]) - value,
+            value,
+        )
+    }
+
+    fn decode_e4m3(bytes: Tile<u8, { [16, 8] }>) -> Tile<f32, { [16, 8] }> {
+        let eight = constant(8u8, const_shape![16, 8]);
+        let sixteen = constant(16u8, const_shape![16, 8]);
+        let exponent = (bytes / eight) % sixteen;
+        let mantissa = bytes % eight;
+        let exponent_f: Tile<f32, { [16, 8] }> = itof(exponent, rounding::NearestEven);
+        let mantissa_f: Tile<f32, { [16, 8] }> = itof(mantissa, rounding::NearestEven);
+        let normal = (constant(1.0f32, const_shape![16, 8])
+            + mantissa_f / constant(8.0f32, const_shape![16, 8]))
+            * pow(
+                constant(2.0f32, const_shape![16, 8]),
+                exponent_f - constant(7.0f32, const_shape![16, 8]),
+            );
+        let subnormal = mantissa_f / constant(512.0f32, const_shape![16, 8]);
+        let unsigned = select(
+            eq_tile(exponent, constant(0u8, const_shape![16, 8])),
+            subnormal,
+            normal,
+        );
+        let sign = bytes / constant(128u8, const_shape![16, 8]);
+        select(
+            eq_tile(sign, constant(1u8, const_shape![16, 8])),
+            constant(0.0f32, const_shape![16, 8]) - unsigned,
+            unsigned,
+        )
+    }
 }
 
-use nvfp4_probe_kernels::scaled_mma;
+use nvfp4_probe_kernels::{byte_decode_mma, scaled_mma};
 use smoke_kernels::add_bf16;
 
 const SMOKE_ELEMENTS: usize = 4096;
@@ -99,15 +217,16 @@ pub struct Bf16SmokeReport {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Nvfp4ScaledMmaStatus {
+pub enum CudaKernelCapability {
     Available { max_abs_error: f32 },
     Unavailable { detail: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Nvfp4ScaledMmaReport {
+pub struct Nvfp4CapabilityReport {
     pub device_id: usize,
-    pub status: Nvfp4ScaledMmaStatus,
+    pub scaled_mma: CudaKernelCapability,
+    pub byte_decode_mma: CudaKernelCapability,
 }
 
 #[derive(Debug, Error)]
@@ -123,8 +242,11 @@ pub enum CudaError {
     },
     #[error("BF16 cuTile validation produced {actual} at element {index}; expected 2")]
     WrongValue { index: usize, actual: f32 },
-    #[error("cuTile scaled NVFP4 MMA produced {actual} at element {index}; expected {expected}")]
+    #[error(
+        "cuTile NVFP4 validation failed in {operation}: produced {actual} at element {index}; expected {expected}"
+    )]
     WrongNvfp4Value {
+        operation: &'static str,
         index: usize,
         actual: f32,
         expected: f32,
@@ -133,10 +255,10 @@ pub enum CudaError {
     Cublas(#[from] cublas::CublasError),
 }
 
-/// Attempts cuTile's scaled NVFP4 MMA on the requested device and validates
-/// every output numerically. An unsupported compiler/runtime path is reported
-/// as a capability result rather than inferred from the GPU model name.
-pub fn probe_nvfp4_scaled_mma(device_id: usize) -> Result<Nvfp4ScaledMmaReport, CudaError> {
+/// Attempts both cuTile's scaled NVFP4 MMA and its byte-decoded BF16 fallback,
+/// validating every output numerically. Unsupported compiler/runtime paths are
+/// reported as capability results rather than inferred from the GPU name.
+pub fn probe_nvfp4(device_id: usize) -> Result<Nvfp4CapabilityReport, CudaError> {
     use cutile::tile_kernel::TileKernel;
 
     const TILE: usize = 16;
@@ -194,30 +316,81 @@ pub fn probe_nvfp4_scaled_mma(device_id: usize) -> Result<Nvfp4ScaledMmaReport, 
             (K_TILE / 16).to_string(),
         ])
         .sync_on(&stream);
-    let (out, ..) = match launch {
-        Ok(outputs) => outputs,
-        Err(error) => {
-            return Ok(Nvfp4ScaledMmaReport {
-                device_id,
-                status: Nvfp4ScaledMmaStatus::Unavailable {
-                    detail: format!("{error:?}"),
-                },
-            });
+    let scaled_mma = match launch {
+        Ok((out, ..)) => {
+            drop(out);
+            validate_nvfp4_output(out_tensor, &stream, "scaled MMA", K as f32)?
         }
+        Err(error) => CudaKernelCapability::Unavailable {
+            detail: format!("{error:?}"),
+        },
     };
-    drop(out);
 
-    let host: Vec<f32> = out_tensor
-        .to_host_vec()
+    let packed_one = 0x22u8;
+    let scale_one = 0x38u8;
+    let lhs: Arc<Tensor<u8>> =
+        api::copy_host_vec_to_device(&Arc::new(vec![packed_one; TILE * K / 2]))
+            .reshape(&[TILE, K / 2])
+            .sync_on(&stream)
+            .map_err(|error| nvfp4_kernel_error("upload byte lhs", error))?
+            .into();
+    let rhs: Arc<Tensor<u8>> =
+        api::copy_host_vec_to_device(&Arc::new(vec![packed_one; TILE * K / 2]))
+            .reshape(&[TILE, K / 2])
+            .sync_on(&stream)
+            .map_err(|error| nvfp4_kernel_error("upload byte rhs", error))?
+            .into();
+    let lhs_scales: Arc<Tensor<u8>> =
+        api::copy_host_vec_to_device(&Arc::new(vec![scale_one; TILE * K / 16]))
+            .reshape(&[TILE, K / 16])
+            .sync_on(&stream)
+            .map_err(|error| nvfp4_kernel_error("upload byte lhs scales", error))?
+            .into();
+    let rhs_scales: Arc<Tensor<u8>> =
+        api::copy_host_vec_to_device(&Arc::new(vec![scale_one; TILE * K / 16]))
+            .reshape(&[TILE, K / 16])
+            .sync_on(&stream)
+            .map_err(|error| nvfp4_kernel_error("upload byte rhs scales", error))?
+            .into();
+    let mut out_tensor = api::zeros::<f32>(&[TILE, TILE])
         .sync_on(&stream)
+        .map_err(|error| nvfp4_kernel_error("allocate byte fallback output", error))?;
+    let out = (&mut out_tensor).partition([TILE, TILE]);
+    let byte_decode_mma =
+        match byte_decode_mma(out, lhs, rhs, lhs_scales, rhs_scales).sync_on(&stream) {
+            Ok((out, ..)) => {
+                drop(out);
+                validate_nvfp4_output(out_tensor, &stream, "byte-decode MMA", K as f32)?
+            }
+            Err(error) => CudaKernelCapability::Unavailable {
+                detail: format!("{error:?}"),
+            },
+        };
+
+    Ok(Nvfp4CapabilityReport {
+        device_id,
+        scaled_mma,
+        byte_decode_mma,
+    })
+}
+
+fn validate_nvfp4_output(
+    out: Tensor<f32>,
+    stream: &Arc<cuda_core::Stream>,
+    operation: &'static str,
+    expected: f32,
+) -> Result<CudaKernelCapability, CudaError> {
+    let host: Vec<f32> = out
+        .to_host_vec()
+        .sync_on(stream)
         .map_err(|error| nvfp4_kernel_error("copy output to host", error))?;
-    let expected = K as f32;
     let mut max_abs_error = 0.0f32;
     for (index, actual) in host.into_iter().enumerate() {
         let error = (actual - expected).abs();
         max_abs_error = max_abs_error.max(error);
         if !actual.is_finite() || error > 1.0e-3 {
             return Err(CudaError::WrongNvfp4Value {
+                operation,
                 index,
                 actual,
                 expected,
@@ -225,10 +398,7 @@ pub fn probe_nvfp4_scaled_mma(device_id: usize) -> Result<Nvfp4ScaledMmaReport, 
         }
     }
 
-    Ok(Nvfp4ScaledMmaReport {
-        device_id,
-        status: Nvfp4ScaledMmaStatus::Available { max_abs_error },
-    })
+    Ok(CudaKernelCapability::Available { max_abs_error })
 }
 
 /// Enables cuTile's process-wide persistent CUBIN cache.
