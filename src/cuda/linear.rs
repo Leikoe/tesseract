@@ -12,6 +12,7 @@ use cutile::{
     api,
     core::bf16,
     tensor::{PartitionMut, Reshape, Tensor, ToHostVec},
+    tile_kernel::TileKernel,
 };
 
 use crate::{
@@ -31,19 +32,18 @@ mod kernels {
     use cutile::core::*;
 
     #[cutile::entry()]
-    fn nvfp4_w4a16(
+    fn nvfp4_w4a16<const K_TILES: i32>(
         output: &mut Tensor<bf16, { [16, 16] }>,
         input: &Tensor<bf16, { [-1, -1] }>,
         packed_weight: &Tensor<u8, { [-1, -1] }>,
         weight_scale: &Tensor<bf16, { [-1, -1] }>,
         weight_global_scale: f32,
-        k_tiles: i32,
     ) {
         let pid = get_tile_block_id();
         let sixteen: Tile<u8, { [16, 8] }> = constant(16u8, const_shape![16, 8]);
         let mut accumulator = constant(0.0f32, const_shape![16, 16]);
 
-        for k_tile in 0i32..k_tiles {
+        for k_tile in 0i32..K_TILES {
             let activation = input.load_tile(const_shape![16, 16], [pid.0, k_tile]);
             let packed = packed_weight.load_tile(const_shape![16, 8], [pid.1, k_tile]);
             let low = (packed % sixteen).reshape(const_shape![16, 8, 1]);
@@ -70,14 +70,13 @@ mod kernels {
     /// no output tile crosses an expert boundary and no per-expert launch is
     /// required.
     #[cutile::entry(unchecked_accesses = false)]
-    fn grouped_nvfp4_w4a16(
+    fn grouped_nvfp4_w4a16<const K_TILES: i32>(
         mut output: MappedPartitionMut<bf16, { [16, 16] }, { [8, 1] }>,
         dispatched: &Tensor<bf16, { [-1, -1] }>,
         expert_by_row_tile: &Tensor<i32, { [-1] }>,
         packed_weight: &Tensor<u8, { [-1, -1, -1] }>,
         weight_scale: &Tensor<bf16, { [-1, -1, -1] }>,
         weight_global_scale: &Tensor<f32, { [-1] }>,
-        k_tiles: i32,
     ) {
         let sixteen: Tile<u8, { [1, 16, 8] }> = constant(16u8, const_shape![1, 16, 8]);
 
@@ -94,7 +93,7 @@ mod kernels {
                 .broadcast(const_shape![16, 16]);
             let mut accumulator = constant(0.0f32, const_shape![16, 16]);
 
-            for k_tile in 0i32..k_tiles {
+            for k_tile in 0i32..K_TILES {
                 let activation = dispatched.load_tile(const_shape![16, 16], [row_tile, k_tile]);
                 let packed =
                     packed_weight.load_tile(const_shape![1, 16, 8], [expert, column_tile, k_tile]);
@@ -312,9 +311,8 @@ impl Nvfp4W4A16Linear {
             self.packed_weight.clone(),
             self.weight_scale.clone(),
             self.weight_global_scale,
-            i32::try_from(self.input_size / GROUP_K)
-                .map_err(|_| ModelError::Cuda("NVFP4 K tile count overflowed i32".into()))?,
         )
+        .generics(vec![(self.input_size / GROUP_K).to_string()])
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("execute NVFP4 W4A16: {error:?}")))?;
         Ok(output)
@@ -467,10 +465,8 @@ impl GroupedNvfp4W4A16 {
             self.packed_weight.clone(),
             self.weight_scale.clone(),
             self.weight_global_scale.clone(),
-            i32::try_from(self.input_size / GROUP_K).map_err(|_| {
-                ModelError::Cuda("grouped NVFP4 K tile count overflowed i32".into())
-            })?,
         )
+        .generics(vec![(self.input_size / GROUP_K).to_string()])
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("execute grouped NVFP4 W4A16: {error:?}")))?;
         Ok(output)
