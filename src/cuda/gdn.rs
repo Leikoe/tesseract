@@ -1005,12 +1005,13 @@ mod kernels {
                 + output_column.broadcast(const_shape![16, 32]);
             let output_pointer: PointerTile<*mut bf16, { [16, 32] }> =
                 output_base.offset_tile(output_offset);
+            let valid_output: Tile<bool, { [16, 32] }> = valid_row.broadcast(const_shape![16, 32]);
             let _output_store = store_ptr_tko(
                 output_pointer,
                 result,
                 ordering::Weak,
                 None::<scope::TileBlock>,
-                Some(valid_row.broadcast(const_shape![16, 32])),
+                Some(valid_output),
                 None,
                 Latency::<0>,
             );
