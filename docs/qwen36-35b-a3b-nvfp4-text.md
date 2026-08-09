@@ -80,6 +80,18 @@ Loading must fail during construction if a projection has no compatible SM80
 implementation; implicit whole-weight dequantization is not an acceptable
 fallback.
 
+This policy is based on execution, not the architecture table alone. With the
+pinned cuTile revision and CUDA 13.3, Tesseract forces the tutorial's typed
+`f4e2m1fnx2`/`f8e4m3fn` `mmaf_scaled` path through `tileiras --gpu-name sm_80`.
+Compilation rejects `f8E4M3FN`; cuTile does not emulate that typed operation on
+SM80. A second probe keeps both packed FP4 values and E4M3 scales as `u8`,
+decodes one complete 16-element scale group in Tile IR, converts to BF16, and
+executes ordinary tensor-core MMA. All 256 outputs equal 16 with zero absolute
+error on the A100. This proves the primitives for an in-cuTile W4A16 fallback,
+but not the performance or correctness of the still-required full projection.
+The retained evidence is in
+`docs/validation/2026-08-08-sm80-nvfp4-capabilities.md`.
+
 ## Required reusable boundaries
 
 The model is the concrete acceptance test for the engine design:

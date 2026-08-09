@@ -46,3 +46,10 @@ shards and reported 124,468 source tensors, 40 layers, and `validation=ok` in
 6.38 seconds with 557,432 KiB peak resident memory. This is real checkpoint
 validation; CUDA execution remains explicitly unavailable until the hybrid and
 SM80 quantized programs land.
+
+The subsequent SM80 capability probe established that cuTile/CUDA 13.3 rejects
+the tutorial's typed `mmaf_scaled` path on A100 (`f8E4M3FN` is unsupported),
+while a byte-stored FP4/E4M3 decode followed by BF16 `mma` executes with zero
+error for one complete scale group. See
+`2026-08-08-sm80-nvfp4-capabilities.md`. This validates the fallback's primitive
+operations, not the pending full Qwen projection or forward pass.
