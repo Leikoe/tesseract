@@ -15,6 +15,7 @@ pub(crate) struct CudaBatch {
     pub current_slots: Vec<u32>,
     pub request_indices: Vec<u32>,
     pub recurrent_slots: Vec<Option<u32>>,
+    pub query_start_offsets: Vec<u32>,
     pub context_lengths: Vec<i32>,
     pub(super) context_storage: Vec<Vec<u32>>,
     pub(super) num_requests: usize,
@@ -31,6 +32,7 @@ impl CudaBatch {
         self.current_slots.clear();
         self.request_indices.clear();
         self.recurrent_slots.clear();
+        self.query_start_offsets.clear();
         self.context_lengths.clear();
         self.sample_rows.clear();
         self.samples.clear();
@@ -39,6 +41,8 @@ impl CudaBatch {
         self.current_slots.reserve(batch.num_tokens());
         self.request_indices.reserve(batch.num_tokens());
         self.recurrent_slots.reserve(batch.len());
+        self.query_start_offsets
+            .reserve(batch.query_start_offsets().len());
         self.context_lengths.reserve(batch.num_tokens());
         if self.context_storage.len() < batch.len() {
             self.context_storage.resize_with(batch.len(), Vec::new);
@@ -49,6 +53,12 @@ impl CudaBatch {
         self.num_requests = batch.len();
         self.all_samples_greedy = true;
         self.num_prefill_tokens = batch.num_prefill_tokens();
+        for offset in batch.query_start_offsets() {
+            self.query_start_offsets.push(
+                u32::try_from(offset.get())
+                    .map_err(|_| BatchLoweringError::QueryOffsetOutOfRange)?,
+            );
+        }
 
         for (request_index, sequence) in batch.sequences().iter().enumerate() {
             let request_id = sequence.request_id();
@@ -156,6 +166,7 @@ mod tests {
         assert_eq!(lowered.current_slots, [0, 1, 4]);
         assert_eq!(lowered.request_indices, [0, 0, 1]);
         assert_eq!(lowered.recurrent_slots, [None, None]);
+        assert_eq!(lowered.query_start_offsets, [0, 2, 3]);
         assert_eq!(lowered.context_lengths, [1, 2, 3]);
         assert_eq!(lowered.contexts(), [vec![0, 1], vec![2, 3, 4]]);
         assert_eq!(lowered.sample_rows, [2]);
@@ -220,6 +231,7 @@ mod tests {
         assert_eq!(lowered.current_slots, [3]);
         assert_eq!(lowered.request_indices, [0]);
         assert_eq!(lowered.recurrent_slots, [None]);
+        assert_eq!(lowered.query_start_offsets, [0, 1]);
         assert_eq!(lowered.context_lengths, [1]);
         assert_eq!(lowered.contexts(), [vec![3]]);
         assert_eq!(lowered.sample_rows, [0]);

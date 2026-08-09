@@ -152,6 +152,7 @@ mod tests {
             current_slots: vec![0; samples],
             request_indices: (0..samples as u32).collect(),
             recurrent_slots: vec![None; samples],
+            query_start_offsets: (0..=samples as u32).collect(),
             context_lengths: vec![1; samples],
             context_storage: vec![vec![0]; samples],
             num_requests: samples,

@@ -96,6 +96,8 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 
 when u need scalar consts, create them the line above the constant() tile. `const X: f32 = 1.0/512.0;`
 
+this might interest you https://veitner.bearblog.dev/simple-math-to-speed-up-gdn-prefill/
+
 ## User
 
 <codex_internal_context source="goal">

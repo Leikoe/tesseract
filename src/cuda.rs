@@ -20,6 +20,7 @@ pub(crate) mod batch;
 pub(crate) mod cublas;
 pub(crate) mod dense_decoder;
 pub(crate) mod executor;
+pub(crate) mod gdn;
 pub(crate) mod kernel_plan;
 pub(crate) mod kernels;
 pub(crate) mod linear;
@@ -203,6 +204,7 @@ pub struct QuantizedLinearCapabilityReport {
     pub w4a16_linear: CudaKernelCapability,
     pub grouped_w4a16: CudaKernelCapability,
     pub moe_routing: CudaKernelCapability,
+    pub gdn_decode: CudaKernelCapability,
 }
 
 #[derive(Debug, Error)]
@@ -358,6 +360,9 @@ pub fn probe_quantized_linears(
     let routing = moe::probe(&stream).map_err(|error| CudaError::QuantizedLinear {
         message: error.to_string(),
     })?;
+    let gdn = gdn::probe(&stream).map_err(|error| CudaError::QuantizedLinear {
+        message: error.to_string(),
+    })?;
 
     Ok(QuantizedLinearCapabilityReport {
         device_id,
@@ -374,6 +379,9 @@ pub fn probe_quantized_linears(
         },
         moe_routing: CudaKernelCapability::Available {
             max_abs_error: routing.max_weight_sum_error,
+        },
+        gdn_decode: CudaKernelCapability::Available {
+            max_abs_error: gdn.max_abs_error,
         },
     })
 }

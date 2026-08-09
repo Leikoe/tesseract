@@ -18,6 +18,8 @@ pub enum BatchLoweringError {
     ContextLengthOutOfRange(RequestId),
     #[error("sample row does not fit device metadata for request {0}")]
     SampleRowOutOfRange(RequestId),
+    #[error("query start offset does not fit device metadata")]
+    QueryOffsetOutOfRange,
 }
 
 #[derive(Debug, Error)]
