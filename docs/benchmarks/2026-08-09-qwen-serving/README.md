@@ -74,6 +74,43 @@ discarding that request as noise.
 <!-- The half-window row and queue-aware open-loop table are filled after those
      retained runs complete. -->
 
+The exact half-window run was interrupted by the announced spot-node shutdown
+before its first token. At the final captured sample it had completed 120,832
+of 131,072 prompt positions (92.1875%) in 65m33s, across 237 serial 512-token
+engine steps. It had generated zero tokens and recorded zero failures. This is
+retained as [`half-window-partial.json`](half-window-partial.json), explicitly
+as partial progress evidence rather than a completed TTFT or throughput result.
+
+The two open-loop files were produced before client queue time was added to the
+report schema. They are retained because the node was being reclaimed, but
+their service-time E2E values must not be interpreted as scheduled E2E under
+overload. The 2 req/s case reached only 1.366 req/s with peak client concurrency
+16, which demonstrates saturation; a future rerun must use the queue-aware
+client from `7a7aa31`.
+
+## Long-context interpretation
+
+The current full-attention kernel is structurally unsuitable for long prefill.
+`ragged_attention_bf16` assigns one tile block to one query row and query head
+(`BM = 1`) and loops over the entire context inside that tile block in blocks of
+only 16 keys. At 131,072 tokens, every query/head tile therefore performs up to
+8,192 serial key-block iterations. The model contains 10 full-attention layers,
+so this dominates the nonlinear TTFT increase even though its other 30 layers
+use linear attention.
+
+The layer path also allocates and synchronizes query, attention, and gated
+output tensors around each attention invocation. Those synchronization points
+prevent the executor stream from overlapping the surrounding work. During the
+half-window run `nvidia-smi` consistently reported 99–100% activity but only
+about 209–212 W, which is consistent with a GPU kept busy by an inefficient,
+serial-key schedule rather than a well-saturated FlashAttention-style kernel.
+
+The production fix is not a benchmark-flag change. It requires a tiled causal
+prefill attention kernel that parallelizes and reduces over the key dimension,
+plus stream-owned reusable workspace and asynchronous enqueueing. Prefill chunk
+size should then be swept for fairness versus throughput; changing it alone
+cannot repair the current kernel's serial inner loop.
+
 ## Benchmark finding: disconnected prefill
 
 During the first half-window attempt, the benchmark timeout was discovered to

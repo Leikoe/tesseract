@@ -1203,4 +1203,6 @@ can we have serious benchmarks ?
 ```
 ```text
 long context is more like 50%+ of the context of the model
+
+save everything, the A100 node is gonna shutdown
 ```
