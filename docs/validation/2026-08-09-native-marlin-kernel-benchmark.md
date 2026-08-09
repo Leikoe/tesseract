@@ -155,3 +155,27 @@ captured from this exact model and representative prompts is still required to
 set and validate the production crossover policy. Cold-weight cache rotation
 is also pending. The measurements establish the kernel-level choice but do not
 yet claim end-to-end server parity.
+
+## Integrated model validation
+
+Revision `a43b0c0` applies the measured policy in the Qwen routed MLP:
+
+- grouped Marlin for down at every dispatched size;
+- fused cuTile gate/up+SwiGLU below 768 padded dispatched rows;
+- two independent grouped Marlin gate/up launches plus BF16 SiLU at or above
+  768 rows.
+
+Both gate/up layouts are retained because they have different packed formats
+and because sharing one Marlin global scale would violate the checkpoint's two
+independent scale domains. The complete checkpoint loaded on A100 with
+22,206,910,976 accounted model bytes. Load-time repacking took 98.45 seconds
+and peaked at 20,965,436 KiB host RSS; it did not exhaust the 80GB device.
+
+A real five-token next-token check returned token 11751 (`" Paris"`) for
+`"The capital of France is"`. A server-level built-in random request then
+processed 522 prompt tokens after chat templating and generated one token,
+exercising the large-dispatch Marlin gate/up branch across the complete model.
+The request completed successfully with 9,433.11 ms TTFT. That TTFT is an
+operability result, not a final performance claim: GDN's host/device barrier
+waterfall and the per-layer workspace synchronization remain higher-priority
+end-to-end bottlenecks.
