@@ -161,6 +161,10 @@ this https://github.com/NVIDIA/cutile-python/tree/main/samples and https://githu
 ```
 
 ```text
+you can use latest cutile-rs without worries I think
+```
+
+```text
 you should verify what actually works and what does. cutile might just as well do emulation correctly on sm80
 ```
 
