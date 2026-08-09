@@ -1685,6 +1685,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires an NVIDIA GPU and CUDA 13.2+"]
+    fn dense_quantized_linears_match_the_reference() {
+        let device = Device::new(0).expect("initialize CUDA device");
+        let stream = device.new_stream().expect("create CUDA stream");
+        let probe = super::probe_quantized_linears(&stream).expect("run quantized linear probes");
+        assert!(probe.fp8_max_abs_error.is_finite());
+        assert!(probe.max_abs_error.is_finite());
+        assert!(probe.grouped_max_abs_error.is_finite());
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU and CUDA 13.2+"]
     fn fused_grouped_gate_up_matches_the_reference() {
         let device = Device::new(0).expect("initialize CUDA device");
         let stream = device.new_stream().expect("create CUDA stream");
