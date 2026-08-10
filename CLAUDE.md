@@ -246,6 +246,14 @@ continue
 ```
 
 ```text
+can't we do the same bit tricks than marlin does ? like exactly the saem
+```
+
+```text
+do the same then.
+```
+
+```text
 did you read sglang's kernels ? (or tokenspeed's)
 ```
 
@@ -1301,3 +1309,4 @@ Do not call update_goal unless the goal is complete or the strict blocked audit 
 
 </codex_internal_context>
 ```
+can we save everything back to local machine ? A100 node is going to shut down

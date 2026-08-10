@@ -81,6 +81,13 @@ Intermediate artifacts in the same directory preserve each schedule change.
 - A hand-authored blocked weight layout failed the differential oracle and was
   fully removed. No layout repack should return without a permanent pack/load
   property test.
+- Tile IR's generic packed `i4` `unpack` operation was numerically exact but
+  did not reproduce Marlin's fragment behavior on `sm_80`. At 512 rows it was
+  flat for gate/up (0.088 ms) and regressed the best down schedule to 0.061 ms.
+  At 8192 rows its best gate/up and down medians were 0.721 ms and 0.591 ms,
+  versus Marlin's 0.345 ms and 0.362 ms. The implementation was reverted; the
+  raw results remain in `cutile-tile-ir-unpack-512-rejected.json` and
+  `cutile-tile-ir-unpack-8192-rejected.json`.
 
 ## Status and next gate
 
@@ -88,8 +95,10 @@ cuTile now matches or beats Marlin at 512 routed rows, but it has not matched
 Marlin for throughput-sized batches. Production therefore retains the existing
 load-time-selected Marlin fallback above its row threshold.
 
-The next production candidate should be a K32 fused gate+up kernel with a lower
-live-state schedule, followed by a storage-preserving, property-tested packed
-layout designed for coalesced K×N fragment loads. Promotion requires numerical
-parity and no regression on both 512 and 8192 rows for uniform and skewed
-routing.
+The next production candidate should give cuTile and Marlin a shared,
+property-tested prepared-NVFP4 artifact: checkpoint-native storage remains the
+source of truth, while load-time preparation produces Marlin's exact blocked
+weight and scale layout. The cuTile consumer must then preserve those packed
+words through its fragment load instead of applying generic logical nibble
+unpacking. Promotion requires numerical parity and no regression on both 512
+and 8192 rows for uniform and skewed routing.

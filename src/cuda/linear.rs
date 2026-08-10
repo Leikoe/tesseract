@@ -1839,8 +1839,8 @@ fn probe_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<(f32, f32), ModelError> {
 
 fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     const EXPERTS: usize = 2;
-    let input_size = GROUPED_TILE_K;
-    let output_size = GROUPED_TILE_N;
+    let input_size = GROUPED_TILE_K * 2;
+    let output_size = GROUPED_TILE_N * 2;
     let packed = (0..EXPERTS * output_size * input_size / 2)
         .map(|index| {
             let expert = index / (output_size * input_size / 2);
@@ -1937,6 +1937,30 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         output_buffer,
         &mut execution,
     )?);
+    let k32_n64_buffer = execution.enqueue(
+        api::zeros::<bf16>(&[rows, output_size]),
+        "allocate N64 K32 grouped probe output",
+    )?;
+    let k32_n64_output = Arc::new(grouped.enqueue_device_plan_into_with_schedule(
+        input.clone(),
+        rows,
+        expert_by_row_tile_device.clone(),
+        k32_n64_buffer,
+        GroupedCutileSchedule::K32N64 { occupancy: 1 },
+        &mut execution,
+    )?);
+    let k32_n128_buffer = execution.enqueue(
+        api::zeros::<bf16>(&[rows, output_size]),
+        "allocate N128 K32 grouped probe output",
+    )?;
+    let k32_n128_output = Arc::new(grouped.enqueue_device_plan_into_with_schedule(
+        input.clone(),
+        rows,
+        expert_by_row_tile_device.clone(),
+        k32_n128_buffer,
+        GroupedCutileSchedule::K32N128 { occupancy: 1 },
+        &mut execution,
+    )?);
     let fused_output = execution.enqueue(
         api::zeros::<bf16>(&[rows, output_size]),
         "allocate fused grouped probe output",
@@ -1953,6 +1977,14 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
         .to_host_vec()
         .sync_on(stream)
         .map_err(|error| ModelError::Cuda(format!("copy grouped test output: {error:?}")))?;
+    let k32_n64_actual: Vec<bf16> = k32_n64_output
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("copy N64 K32 grouped output: {error:?}")))?;
+    let k32_n128_actual: Vec<bf16> = k32_n128_output
+        .to_host_vec()
+        .sync_on(stream)
+        .map_err(|error| ModelError::Cuda(format!("copy N128 K32 grouped output: {error:?}")))?;
     let fused_actual: Vec<bf16> = fused_output
         .to_host_vec()
         .sync_on(stream)
@@ -1963,10 +1995,11 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
     for row in 0..rows {
         let expert = expert_by_row_tile[row / GROUPED_LARGE_TILE_M] as usize;
         for column in 0..output_size {
-            let scale_index = (expert * output_size + column) * (input_size / GROUP_K);
-            let scale = decode_e4m3fn(scale_bytes[scale_index]) * global_scales[expert];
             let mut expected = 0.0f32;
             for k in 0..input_size {
+                let scale_index =
+                    (expert * output_size + column) * (input_size / GROUP_K) + k / GROUP_K;
+                let scale = decode_e4m3fn(scale_bytes[scale_index]) * global_scales[expert];
                 let byte_index = (expert * output_size + column) * (input_size / 2) + k / 2;
                 let byte = packed[byte_index];
                 let nibble = if k % 2 == 0 { byte & 0x0f } else { byte >> 4 };
@@ -1975,18 +2008,31 @@ fn probe_grouped_nvfp4_w4a16(stream: &Arc<Stream>) -> Result<f32, ModelError> {
             }
             let expected_accumulator = expected;
             let expected = bf16::from_f32(expected).to_f32();
-            let actual = actual[row * output_size + column].to_f32();
-            max_abs_error = max_abs_error.max((actual - expected).abs());
-            if !actual.is_finite() || (actual - expected).abs() > 0.25 {
-                return Err(ModelError::Cuda(format!(
-                    "grouped NVFP4 mismatch at ({row}, {column}), expert {expert}: {actual} != {expected}"
-                )));
+            for (implementation, actual) in [
+                ("K16", actual[row * output_size + column].to_f32()),
+                (
+                    "K32/N64",
+                    k32_n64_actual[row * output_size + column].to_f32(),
+                ),
+                (
+                    "K32/N128",
+                    k32_n128_actual[row * output_size + column].to_f32(),
+                ),
+            ] {
+                max_abs_error = max_abs_error.max((actual - expected).abs());
+                if !actual.is_finite() || (actual - expected).abs() > 0.25 {
+                    return Err(ModelError::Cuda(format!(
+                        "{implementation} grouped NVFP4 mismatch at ({row}, {column}), expert {expert}: {actual} != {expected}"
+                    )));
+                }
             }
 
-            let up_scale_index = (expert * output_size + column) * (input_size / GROUP_K);
-            let up_scale = decode_e4m3fn(up_scale_bytes[up_scale_index]) * up_global_scales[expert];
             let mut expected_up = 0.0f32;
             for k in 0..input_size {
+                let up_scale_index =
+                    (expert * output_size + column) * (input_size / GROUP_K) + k / GROUP_K;
+                let up_scale =
+                    decode_e4m3fn(up_scale_bytes[up_scale_index]) * up_global_scales[expert];
                 let byte_index = (expert * output_size + column) * (input_size / 2) + k / 2;
                 let byte = up_packed[byte_index];
                 let nibble = if k % 2 == 0 { byte & 0x0f } else { byte >> 4 };
