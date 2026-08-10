@@ -240,6 +240,12 @@ continue
 ```
 
 ```text
+we should use cutile-based kernels and match marlin. I think you you search hard in the cutile-rs, cutile (py), cutile (mlir base repo), tile gym repos you will find clues on how to do such things. cutile should also be well documented online (I think the docs are part of each repo)
+
+continue
+```
+
+```text
 did you read sglang's kernels ? (or tokenspeed's)
 ```
 

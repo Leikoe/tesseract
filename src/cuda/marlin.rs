@@ -16,8 +16,8 @@ use crate::cuda::{
     execution::StreamExecution,
     kernels,
     linear::{
-        ExpertProjection, Fp8W8A16Linear, GroupedNvfp4W4A16, Nvfp4W4A16Linear,
-        parse_nvfp4_projection,
+        ExpertProjection, Fp8W8A16Linear, GroupedCutileSchedule, GroupedNvfp4W4A16,
+        Nvfp4W4A16Linear, parse_nvfp4_projection,
     },
 };
 use crate::{
@@ -896,19 +896,49 @@ fn benchmark_grouped_nvfp4_shape(
             }
             let expert_map = upload(expert_map, stream, "upload grouped benchmark expert map")?;
             let input = benchmark_input(rows, input_size, stream)?;
-            samples.push(time_cutile_grouped(
-                &cutile,
-                input.clone(),
-                expert_map.clone(),
-                rows,
-                input_size,
-                output_size,
-                block_rows,
-                pattern,
-                warmup,
-                iterations,
-                stream,
-            )?);
+            for (implementation, schedule) in [
+                ("cutile_grouped_k16", GroupedCutileSchedule::K16),
+                (
+                    "cutile_grouped_k32_n64_w8_occ1",
+                    GroupedCutileSchedule::K32N64 { occupancy: 1 },
+                ),
+                (
+                    "cutile_grouped_k32_n64_w8_occ2",
+                    GroupedCutileSchedule::K32N64 { occupancy: 2 },
+                ),
+                (
+                    "cutile_grouped_k32_n64_w8_occ4",
+                    GroupedCutileSchedule::K32N64 { occupancy: 4 },
+                ),
+                (
+                    "cutile_grouped_k32_n128_w8_occ1",
+                    GroupedCutileSchedule::K32N128 { occupancy: 1 },
+                ),
+                (
+                    "cutile_grouped_k32_n128_w8_occ2",
+                    GroupedCutileSchedule::K32N128 { occupancy: 2 },
+                ),
+                (
+                    "cutile_grouped_k32_n128_w8_occ4",
+                    GroupedCutileSchedule::K32N128 { occupancy: 4 },
+                ),
+            ] {
+                samples.push(time_cutile_grouped(
+                    &cutile,
+                    input.clone(),
+                    expert_map.clone(),
+                    rows,
+                    input_size,
+                    output_size,
+                    block_rows,
+                    pattern,
+                    implementation,
+                    schedule,
+                    warmup,
+                    iterations,
+                    stream,
+                )?);
+            }
             samples.push(time_marlin_grouped(
                 &marlin,
                 input.clone(),
@@ -1082,6 +1112,8 @@ fn time_cutile_grouped(
     output_size: usize,
     block_rows: usize,
     routing_pattern: &'static str,
+    implementation: &'static str,
+    schedule: GroupedCutileSchedule,
     warmup: usize,
     iterations: usize,
     stream: &Arc<Stream>,
@@ -1093,11 +1125,12 @@ fn time_cutile_grouped(
         })?;
     for _ in 0..warmup {
         let mut execution = StreamExecution::new(stream);
-        output = linear.enqueue_device_plan_into(
+        output = linear.enqueue_device_plan_into_with_schedule(
             input.clone(),
             rows,
             expert_map.clone(),
             output,
+            schedule,
             &mut execution,
         )?;
         execution.synchronize("warm grouped cuTile comparison")?;
@@ -1108,11 +1141,12 @@ fn time_cutile_grouped(
         let end = TimingEvent::new(stream)?;
         start.record(stream)?;
         let mut execution = StreamExecution::new(stream);
-        output = linear.enqueue_device_plan_into(
+        output = linear.enqueue_device_plan_into_with_schedule(
             input.clone(),
             rows,
             expert_map.clone(),
             output,
+            schedule,
             &mut execution,
         )?;
         end.record(stream)?;
@@ -1120,7 +1154,7 @@ fn time_cutile_grouped(
         execution.mark_synchronized();
     }
     Ok(summarize_grouped(
-        "cutile_grouped",
+        implementation,
         rows,
         output_size,
         input_size,
